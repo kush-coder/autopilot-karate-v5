@@ -1,0 +1,1047 @@
+/*
+ * The MIT License
+ *
+ * Copyright 2025 Karate Labs Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package io.karatelabs.parser;
+
+import io.karatelabs.common.Resource;
+
+import java.util.ArrayDeque;
+import java.util.List;
+import java.util.Set;
+
+import static io.karatelabs.parser.TokenType.*;
+
+/**
+ * Hand-rolled lexer for JavaScript. This implementation is designed to be
+ * portable to other languages (JS, Rust) and serves as the canonical spec.
+ */
+public class JsLexer extends BaseLexer {
+
+    private boolean regexAllowed = true;
+    private final ArrayDeque<LexerState> stateStack = new ArrayDeque<>();
+
+    protected enum LexerState {
+        INITIAL, TEMPLATE, PLACEHOLDER
+    }
+
+    public JsLexer(Resource resource) {
+        super(resource);
+        stateStack.push(LexerState.INITIAL);
+    }
+
+    public static List<Token> getTokens(Resource resource) {
+        return tokenize(new JsLexer(resource));
+    }
+
+    // ========== Public API ==========
+
+    @Override
+    public Token nextToken() {
+        tokenStart = pos;
+        tokenLine = line;
+        tokenCol = col;
+        TokenType type = scanToken();
+        int length = pos - tokenStart;
+        if (type.regexAllowed != null) {
+            regexAllowed = type.regexAllowed;
+        }
+        return new Token(buffer, type, tokenStart, tokenLine, tokenCol, length);
+    }
+
+    // ========== State Management ==========
+
+    protected LexerState currentState() {
+        return stateStack.peek();
+    }
+
+    protected void pushState(LexerState state) {
+        stateStack.push(state);
+    }
+
+    protected LexerState popState() {
+        if (stateStack.size() > 1) {
+            return stateStack.pop();
+        }
+        return stateStack.peek();
+    }
+
+    // ========== Main Scanner ==========
+
+    @Override
+    protected TokenType scanToken() {
+        if (isAtEnd()) {
+            return EOF;
+        }
+
+        LexerState state = currentState();
+        if (state == LexerState.TEMPLATE) {
+            return scanTemplateContent();
+        }
+
+        char c = source.charAt(pos);
+
+        // Whitespace (most common in typical code) + the rarer spec-mandated forms:
+        // ES2021 §11.2 (VT, FF, NBSP, FEFF) and §11.3 line terminators (LS, PS).
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n'
+                || c == '\u000B' || c == '\u000C' || c == '\u00A0' || c == '\uFEFF'
+                || c == '\u2028' || c == '\u2029'
+                || (c > 127 && Character.getType(c) == Character.SPACE_SEPARATOR)) {
+            // the getType check admits the rest of <USP> — spec WhiteSpace is
+            // every Zs code point (U+1680, U+2000-200A, U+202F, U+205F, U+3000)
+            return scanWhitespace();
+        }
+
+        // Comments and slash
+        if (c == '/') {
+            return scanSlash();
+        }
+
+        // Strings
+        if (c == '"') {
+            return scanDoubleString();
+        }
+        if (c == '\'') {
+            return scanSingleString();
+        }
+
+        // Template literal
+        if (c == '`') {
+            advance();
+            pushState(LexerState.TEMPLATE);
+            return BACKTICK;
+        }
+
+        // Identifiers and keywords (very common - check before numbers)
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '$') {
+            return scanIdentifier();
+        }
+
+        // Numbers
+        if ((c >= '0' && c <= '9') || (c == '.' && pos + 1 < length && isDigit(source.charAt(pos + 1)))) {
+            return scanNumber();
+        }
+
+        // ES2023 HashbangComment — legal only as the very first two characters of
+        // the source; anywhere else `#` can only start a private name.
+        if (c == '#') {
+            if (pos == 0 && peek(1) == '!') {
+                return scanLineComment();
+            }
+            return scanPrivateName();
+        }
+
+        // Unicode identifiers (rare)
+        if (c > 127 && Character.isJavaIdentifierStart(c) && c != VERTICAL_TILDE
+                || c == '\\' && peek(1) == 'u'
+                || Character.isHighSurrogate(c) && isIdentifierCodePoint(source.codePointAt(pos), true)) {
+            return scanIdentifier();
+        }
+
+        // Operators and punctuation
+        return scanOperator();
+    }
+
+    // ========== Whitespace ==========
+
+    private TokenType scanWhitespace() {
+        // Fast path: consume spaces/tabs with minimal overhead. ES2021 §11.2 whitespace
+        // (VT, FF, NBSP, FEFF) is treated as non-newline; §11.3 line terminators (LF, CR,
+        // LS, PS) set hasNewline so ASI sees a line break.
+        boolean hasNewline = false;
+        while (pos < length) {
+            char c = source.charAt(pos);
+            if (c == ' ' || c == '\t' || c == '\u000B' || c == '\u000C'
+                    || c == '\u00A0' || c == '\uFEFF'
+                    || (c > 127 && Character.getType(c) == Character.SPACE_SEPARATOR)) {
+                pos++;
+                col++;
+            } else if (c == '\n' || c == '\u2028' || c == '\u2029') {
+                pos++;
+                line++;
+                col = 0;
+                hasNewline = true;
+            } else if (c == '\r') {
+                pos++;
+                col++;
+                hasNewline = true;
+            } else {
+                break;
+            }
+        }
+        return hasNewline ? WS_LF : WS;
+    }
+
+    // ========== Comments and Slash ==========
+
+    private TokenType scanSlash() {
+        advance(); // consume '/'
+        if (match('/')) {
+            return scanLineComment();
+        }
+        if (match('*')) {
+            return scanBlockComment();
+        }
+        if (regexAllowed) {
+            return scanRegex();
+        }
+        return match('=') ? SLASH_EQ : SLASH;
+    }
+
+    private TokenType scanLineComment() {
+        // Fast scan to end of line
+        while (pos < length) {
+            char c = source.charAt(pos);
+            if (c == '\n' || c == '\r') break;
+            pos++;
+            col++;
+        }
+        return L_COMMENT;
+    }
+
+    private TokenType scanBlockComment() {
+        while (pos < length) {
+            char c = source.charAt(pos);
+            if (c == '*' && pos + 1 < length && source.charAt(pos + 1) == '/') {
+                pos += 2;
+                col += 2;
+                break;
+            }
+            if (c == '\n') {
+                pos++;
+                line++;
+                col = 0;
+            } else {
+                pos++;
+                col++;
+            }
+        }
+        return B_COMMENT;
+    }
+
+    private TokenType scanRegex() {
+        // Already consumed initial '/'
+        // Scan until closing '/' handling escape sequences and character classes
+        boolean inCharClass = false;
+        while (!isAtEnd()) {
+            char c = peek();
+            if (c == '\n' || c == '\r') {
+                // Unterminated regex
+                break;
+            }
+            if (c == '\\') {
+                advance(); // consume backslash
+                if (!isAtEnd() && peek() != '\n' && peek() != '\r') {
+                    advance(); // consume escaped char
+                }
+                continue;
+            }
+            if (c == '[') {
+                inCharClass = true;
+                advance();
+                continue;
+            }
+            if (c == ']' && inCharClass) {
+                inCharClass = false;
+                advance();
+                continue;
+            }
+            if (c == '/' && !inCharClass) {
+                advance(); // consume closing '/'
+                // Scan flags
+                while (!isAtEnd() && isIdentifierPart(peek())) {
+                    advance();
+                }
+                break;
+            }
+            advance();
+        }
+        return REGEX;
+    }
+
+    // ========== Strings ==========
+
+    private TokenType scanDoubleString() {
+        pos++; col++; // consume opening "
+        while (pos < length) {
+            char c = source.charAt(pos);
+            if (c == '"') {
+                pos++; col++;
+                break;
+            }
+            if (c == '\\' && pos + 1 < length) {
+                // Skip escape sequence
+                char next = source.charAt(pos + 1);
+                if (next == '\n') {
+                    pos += 2;
+                    line++;
+                    col = 0;
+                } else {
+                    pos += 2;
+                    col += 2;
+                }
+                continue;
+            }
+            if (c == '\n') {
+                pos++;
+                line++;
+                col = 0;
+            } else {
+                pos++;
+                col++;
+            }
+        }
+        return D_STRING;
+    }
+
+    private TokenType scanSingleString() {
+        pos++; col++; // consume opening '
+        while (pos < length) {
+            char c = source.charAt(pos);
+            if (c == '\'') {
+                pos++; col++;
+                break;
+            }
+            if (c == '\\' && pos + 1 < length) {
+                // Skip escape sequence
+                char next = source.charAt(pos + 1);
+                if (next == '\n') {
+                    pos += 2;
+                    line++;
+                    col = 0;
+                } else {
+                    pos += 2;
+                    col += 2;
+                }
+                continue;
+            }
+            if (c == '\n') {
+                pos++;
+                line++;
+                col = 0;
+            } else {
+                pos++;
+                col++;
+            }
+        }
+        return S_STRING;
+    }
+
+    // ========== Template Literals ==========
+
+    private TokenType scanTemplateContent() {
+        // In TEMPLATE state, scan until we hit `, ${, or end
+        if (isAtEnd()) {
+            return EOF;
+        }
+
+        char c = peek();
+
+        // End of template
+        if (c == '`') {
+            advance();
+            popState();
+            return BACKTICK;
+        }
+
+        // Placeholder start
+        if (c == '$' && peek(1) == '{') {
+            advance(); // $
+            advance(); // {
+            pushState(LexerState.PLACEHOLDER);
+            return DOLLAR_L_CURLY;
+        }
+
+        // Template string content
+        while (!isAtEnd()) {
+            c = peek();
+            if (c == '`') {
+                break;
+            }
+            if (c == '$' && peek(1) == '{') {
+                break;
+            }
+            if (c == '\\') {
+                advance();
+                if (isAtEnd()) {
+                    break;
+                }
+                char esc = peek();
+                // Spec: in non-tagged template literals, malformed escape sequences are
+                // early errors. We have no way to tell tag vs no-tag at lex time, so we
+                // reject at lex time; tagged templates are not yet supported anyway.
+                // Invalid legacy octal: \1..\9 or \0 followed by a decimal digit.
+                if (esc >= '1' && esc <= '9') {
+                    throw new ParserException("invalid escape sequence in template literal: \\" + esc);
+                }
+                if (esc == '0' && peek(1) >= '0' && peek(1) <= '9') {
+                    throw new ParserException("invalid escape sequence in template literal: \\0" + peek(1));
+                }
+                // Hex escape backslash-x HH — require exactly two hex digits.
+                if (esc == 'x') {
+                    if (!isHexDigit(peek(1)) || !isHexDigit(peek(2))) {
+                        throw new ParserException("invalid hex escape sequence in template literal");
+                    }
+                }
+                // Unicode escape backslash-u HHHH or backslash-u {H...} — require proper form.
+                if (esc == 'u') {
+                    char next = peek(1);
+                    if (next == '{') {
+                        // backslash-u { codepoint } — one or more hex digits, closed by }
+                        int j = 2;
+                        if (!isHexDigit(peek(j))) {
+                            throw new ParserException("invalid unicode escape sequence in template literal");
+                        }
+                        int codepoint = 0;
+                        while (isHexDigit(peek(j))) {
+                            char h = peek(j);
+                            int v = (h >= '0' && h <= '9') ? h - '0'
+                                    : (h >= 'a' && h <= 'f') ? h - 'a' + 10
+                                    : h - 'A' + 10;
+                            codepoint = (codepoint << 4) | v;
+                            if (codepoint > 0x10FFFF) {
+                                throw new ParserException("unicode escape sequence out of range in template literal");
+                            }
+                            j++;
+                        }
+                        if (peek(j) != '}') {
+                            throw new ParserException("invalid unicode escape sequence in template literal");
+                        }
+                    } else {
+                        // backslash-u HHHH — four hex digits
+                        if (!isHexDigit(peek(1)) || !isHexDigit(peek(2))
+                                || !isHexDigit(peek(3)) || !isHexDigit(peek(4))) {
+                            throw new ParserException("invalid unicode escape sequence in template literal");
+                        }
+                    }
+                }
+                advance();
+                continue;
+            }
+            advance();
+        }
+        return T_STRING;
+    }
+
+    // ========== Numbers ==========
+
+    private TokenType scanNumber() {
+        char c = peek();
+
+        // Hex number
+        if (c == '0' && (peek(1) == 'x' || peek(1) == 'X')) {
+            advance(); // 0
+            advance(); // x
+            int hexStart = pos;
+            // Fast path: hex digits only, no separator
+            while (!isAtEnd() && isHexDigit(peek())) {
+                advance();
+            }
+            // Rare path: separator(s) inside hex literal — must follow a digit, not the prefix
+            if (!isAtEnd() && peek() == '_') {
+                if (pos == hexStart) {
+                    throw new ParserException("invalid numeric separator");
+                }
+                scanHexDigitsWithSeparators();
+            }
+            // Rare path: BigInt suffix — `0xff_ffn` is valid
+            if (!isAtEnd() && peek() == 'n') {
+                advance();
+                return BIGINT;
+            }
+            return NUMBER;
+        }
+
+        // Binary number (0b / 0B)
+        if (c == '0' && (peek(1) == 'b' || peek(1) == 'B')) {
+            advance(); // 0
+            advance(); // b
+            int binStart = pos;
+            while (!isAtEnd() && (peek() == '0' || peek() == '1')) {
+                advance();
+            }
+            if (pos == binStart) {
+                throw new ParserException("invalid binary literal");
+            }
+            if (!isAtEnd() && peek() == '_') {
+                scanBinaryDigitsWithSeparators();
+            }
+            if (!isAtEnd() && peek() == 'n') {
+                advance();
+                return BIGINT;
+            }
+            return NUMBER;
+        }
+
+        // Octal number (0o / 0O)
+        if (c == '0' && (peek(1) == 'o' || peek(1) == 'O')) {
+            advance(); // 0
+            advance(); // o
+            int octStart = pos;
+            while (!isAtEnd() && peek() >= '0' && peek() <= '7') {
+                advance();
+            }
+            if (pos == octStart) {
+                throw new ParserException("invalid octal literal");
+            }
+            if (!isAtEnd() && peek() == '_') {
+                scanOctalDigitsWithSeparators();
+            }
+            if (!isAtEnd() && peek() == 'n') {
+                advance();
+                return BIGINT;
+            }
+            return NUMBER;
+        }
+
+        boolean isInteger = true;
+
+        // Decimal number
+        // Integer part
+        if (c == '.') {
+            // Number starting with .
+            isInteger = false;
+            advance();
+        } else {
+            // Fast path: integer digits, no separator
+            while (!isAtEnd() && isDigit(peek())) {
+                advance();
+            }
+            // Rare path: separator(s) inside integer part
+            if (!isAtEnd() && peek() == '_') {
+                scanDigitsWithSeparators();
+            }
+            // Decimal part. The dot is taken even with no digit after it (`1.`, `1.e3`
+            // are DecimalLiterals) — but only ever ONE, so `1..toString()` still lexes
+            // as the literal `1.` followed by member access.
+            if (peek() == '.') {
+                isInteger = false;
+                advance(); // .
+            }
+        }
+
+        // Fractional part — fast path
+        while (!isAtEnd() && isDigit(peek())) {
+            advance();
+        }
+        // Rare path: separator(s) inside fractional part
+        if (!isAtEnd() && peek() == '_') {
+            scanDigitsWithSeparators();
+            isInteger = false; // separators implied a fractional part if we got here via `.`
+        }
+
+        // Exponent part — rare branch, doesn't fire on plain integers/decimals
+        char p = peek();
+        if (p == 'e' || p == 'E') {
+            isInteger = false;
+            advance();
+            if (peek() == '+' || peek() == '-') {
+                advance();
+            }
+            int expDigitsStart = pos;
+            while (!isAtEnd() && isDigit(peek())) {
+                advance();
+            }
+            if (!isAtEnd() && peek() == '_') {
+                if (pos == expDigitsStart) {
+                    throw new ParserException("invalid numeric separator");
+                }
+                scanDigitsWithSeparators();
+            } else if (pos == expDigitsStart) {
+                // `1e`, `1.e+` — the exponent marker requires at least one digit
+                throw new ParserException("missing exponent digits");
+            }
+        }
+
+        // Rare path: BigInt suffix — only valid on integer literals
+        if (isInteger && !isAtEnd() && peek() == 'n') {
+            advance();
+            return BIGINT;
+        }
+
+        return NUMBER;
+    }
+
+    // Slow path: number contained at least one `_` separator. Spec rules:
+    //   - `_` must appear between two digits (no leading, trailing, or doubled)
+    //   - the first `_` we see has already been validated (preceding char is a digit)
+    private void scanDigitsWithSeparators() {
+        while (!isAtEnd() && peek() == '_') {
+            advance(); // consume `_`
+            if (isAtEnd() || !isDigit(peek())) {
+                throw new ParserException("invalid numeric separator");
+            }
+            // gobble the run of digits that follows, then loop in case another `_` appears
+            while (!isAtEnd() && isDigit(peek())) {
+                advance();
+            }
+        }
+    }
+
+    private void scanHexDigitsWithSeparators() {
+        while (!isAtEnd() && peek() == '_') {
+            advance();
+            if (isAtEnd() || !isHexDigit(peek())) {
+                throw new ParserException("invalid numeric separator");
+            }
+            while (!isAtEnd() && isHexDigit(peek())) {
+                advance();
+            }
+        }
+    }
+
+    private void scanBinaryDigitsWithSeparators() {
+        while (!isAtEnd() && peek() == '_') {
+            advance();
+            if (isAtEnd() || !(peek() == '0' || peek() == '1')) {
+                throw new ParserException("invalid numeric separator");
+            }
+            while (!isAtEnd() && (peek() == '0' || peek() == '1')) {
+                advance();
+            }
+        }
+    }
+
+    private void scanOctalDigitsWithSeparators() {
+        while (!isAtEnd() && peek() == '_') {
+            advance();
+            if (isAtEnd() || peek() < '0' || peek() > '7') {
+                throw new ParserException("invalid numeric separator");
+            }
+            while (!isAtEnd() && peek() >= '0' && peek() <= '7') {
+                advance();
+            }
+        }
+    }
+
+    // ========== Identifiers and Keywords ==========
+
+    private TokenType scanIdentifier() {
+        boolean escaped = false;
+        // Fast path for ASCII identifiers (most common case)
+        while (pos < length) {
+            char c = source.charAt(pos);
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                (c >= '0' && c <= '9') || c == '_' || c == '$') {
+                pos++;
+                col++;
+            } else if (c > 127 && (c == '\u200C' || c == '\u200D'
+                    || (Character.isUnicodeIdentifierPart(c) && !Character.isIdentifierIgnorable(c) && c != VERTICAL_TILDE))) {
+                // Unicode identifier part — rare but must handle. Spec §12.7:
+                // IdentifierPart is ID_Continue plus ZWNJ/ZWJ (U+200C/U+200D);
+                // Java's isJavaIdentifierPart also admits ignorable Cf format
+                // chars (e.g. U+180E Mongolian vowel separator), which would
+                // fuse "var\u180Efoo" into one identifier instead of a
+                // SyntaxError.
+                pos++;
+                col++;
+            } else if (c == '\\' && peek(1) == 'u') {
+                scanIdentifierEscape(pos == tokenStart);
+                escaped = buffer.escapedIdentifiers = true;
+            } else if (Character.isHighSurrogate(c) && isIdentifierCodePoint(source.codePointAt(pos), pos == tokenStart)) {
+                pos += 2;
+                col += 2;
+            } else {
+                break;
+            }
+        }
+        // an escaped keyword is still an IdentifierName (a property name); JsParser rejects it elsewhere
+        return escaped ? IDENT : keywordOrIdent(tokenStart, pos - tokenStart);
+    }
+
+    // U+2E2F is Lm, so the JDK calls it identifier material, but it is Pattern_Syntax and so not ID_Start / ID_Continue
+    private static final char VERTICAL_TILDE = '\u2E2F';
+
+    static final Set<String> RESERVED_WORDS = Set.of(
+            "break", "case", "catch", "class", "const", "continue", "debugger", "default", "delete", "do",
+            "else", "enum", "export", "extends", "false", "finally", "for", "function", "if", "import", "in",
+            "instanceof", "new", "null", "return", "super", "switch", "this", "throw", "true", "try", "typeof",
+            "var", "void", "while", "with");
+
+    // backslash-u HHHH or backslash-u {H...} inside an IdentifierName; the decoded code point must itself be identifier material
+    private void scanIdentifierEscape(boolean start) {
+        int cp = -1;
+        if (peek(2) == '{') {
+            int j = 3;
+            long value = 0;
+            while (isHexDigit(peek(j)) && value <= 0x10FFFF) {
+                value = value * 16 + Character.digit(peek(j), 16);
+                j++;
+            }
+            if (j > 3 && peek(j) == '}' && value <= 0x10FFFF) {
+                cp = (int) value;
+                pos += j + 1;
+                col += j + 1;
+            }
+        } else if (isHexDigit(peek(2)) && isHexDigit(peek(3)) && isHexDigit(peek(4)) && isHexDigit(peek(5))) {
+            cp = Integer.parseInt(source.substring(pos + 2, pos + 6), 16);
+            pos += 6;
+            col += 6;
+        }
+        if (cp == -1 || !(cp == '$' || cp == '_' || isIdentifierCodePoint(cp, start))) {
+            throw new ParserException(String.format(
+                    "invalid escape sequence in identifier at %d:%d", tokenLine + 1, tokenCol + 1));
+        }
+    }
+
+    // ID_Start / ID_Continue (plus ZWNJ, ZWJ for a part). Unassigned code points pass: the JDK's
+    // Unicode tables can trail the spec's, and the lenient IDENT fallback treats them the same way.
+    private static boolean isIdentifierCodePoint(int cp, boolean start) {
+        if (cp == VERTICAL_TILDE) {
+            return false;
+        }
+        if (Character.getType(cp) == Character.UNASSIGNED) {
+            return true;
+        }
+        if (start) {
+            return Character.isUnicodeIdentifierStart(cp);
+        }
+        return cp == 0x200C || cp == 0x200D
+                || Character.isUnicodeIdentifierPart(cp) && !Character.isIdentifierIgnorable(cp);
+    }
+
+    /** The StringValue of an IdentifierName: its backslash-u escapes decoded. */
+    static String identifierName(String raw) {
+        if (raw.indexOf('\\') == -1) {
+            return raw;
+        }
+        StringBuilder sb = new StringBuilder(raw.length());
+        for (int i = 0; i < raw.length(); i++) {
+            char c = raw.charAt(i);
+            if (c != '\\') {
+                sb.append(c);
+            } else if (raw.charAt(i + 2) == '{') {
+                int end = raw.indexOf('}', i);
+                sb.appendCodePoint(Integer.parseInt(raw.substring(i + 3, end), 16));
+                i = end;
+            } else {
+                sb.append((char) Integer.parseInt(raw.substring(i + 2, i + 6), 16));
+                i += 5;
+            }
+        }
+        return sb.toString();
+    }
+
+    // `#` + IdentifierName, one token including the hash. A bare `#` has no other
+    // role in the grammar, so anything else is a hard error rather than the lenient
+    // IDENT fallback — a half-lexed `#x` would parse into silently wrong garbage.
+    private TokenType scanPrivateName() {
+        advance();
+        if (pos < length) {
+            char c = source.charAt(pos);
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '$'
+                    || (c > 127 && Character.isJavaIdentifierStart(c))) {
+                scanIdentifier();
+                return PRIVATE_NAME;
+            }
+        }
+        throw new ParserException(String.format(
+                "unexpected character '#' at %d:%d", tokenLine + 1, tokenCol + 1));
+    }
+
+    private TokenType keywordOrIdent(int start, int len) {
+        // Note: "this" is NOT a keyword in the lexer - it's an identifier that gets
+        // special handling in the parser/evaluator. "void" lexes as the VOID keyword
+        // so the parser can dispatch it as a unary operator.
+        // Fast path: switch on length first, then first char
+        if (len == 2) {
+            char c0 = source.charAt(start);
+            if (c0 == 'i') {
+                if (source.charAt(start + 1) == 'f') return IF;
+                if (source.charAt(start + 1) == 'n') return IN;
+            } else if (c0 == 'o' && source.charAt(start + 1) == 'f') {
+                return OF;
+            } else if (c0 == 'd' && source.charAt(start + 1) == 'o') {
+                return DO;
+            }
+        } else if (len == 3) {
+            char c0 = source.charAt(start);
+            if (c0 == 'v' && source.charAt(start + 1) == 'a' && source.charAt(start + 2) == 'r') return VAR;
+            if (c0 == 'l' && source.charAt(start + 1) == 'e' && source.charAt(start + 2) == 't') return LET;
+            if (c0 == 'n' && source.charAt(start + 1) == 'e' && source.charAt(start + 2) == 'w') return NEW;
+            if (c0 == 't' && source.charAt(start + 1) == 'r' && source.charAt(start + 2) == 'y') return TRY;
+            if (c0 == 'f' && source.charAt(start + 1) == 'o' && source.charAt(start + 2) == 'r') return FOR;
+        } else if (len == 4) {
+            char c0 = source.charAt(start);
+            if (c0 == 'n' && matchKeyword(start, "null")) return NULL;
+            if (c0 == 't' && matchKeyword(start, "true")) return TRUE;
+            if (c0 == 'e' && matchKeyword(start, "else")) return ELSE;
+            if (c0 == 'c' && matchKeyword(start, "case")) return CASE;
+            if (c0 == 'v' && matchKeyword(start, "void")) return VOID;
+        } else if (len == 5) {
+            char c0 = source.charAt(start);
+            if (c0 == 'f' && matchKeyword(start, "false")) return FALSE;
+            if (c0 == 'c') {
+                if (matchKeyword(start, "const")) return CONST;
+                if (matchKeyword(start, "catch")) return CATCH;
+                if (matchKeyword(start, "class")) return CLASS;
+            }
+            if (c0 == 't' && matchKeyword(start, "throw")) return THROW;
+            if (c0 == 'w' && matchKeyword(start, "while")) return WHILE;
+            if (c0 == 'b' && matchKeyword(start, "break")) return BREAK;
+            if (c0 == 's' && matchKeyword(start, "super")) return SUPER;
+        } else if (len == 6) {
+            char c0 = source.charAt(start);
+            if (c0 == 'r' && matchKeyword(start, "return")) return RETURN;
+            if (c0 == 't' && matchKeyword(start, "typeof")) return TYPEOF;
+            if (c0 == 'd' && matchKeyword(start, "delete")) return DELETE;
+            if (c0 == 's' && matchKeyword(start, "switch")) return SWITCH;
+        } else if (len == 7) {
+            char c0 = source.charAt(start);
+            if (c0 == 'f') {
+                if (matchKeyword(start, "finally")) return FINALLY;
+            }
+            if (c0 == 'd' && matchKeyword(start, "default")) return DEFAULT;
+            if (c0 == 'e' && matchKeyword(start, "extends")) return EXTENDS;
+        } else if (len == 8) {
+            char c0 = source.charAt(start);
+            if (c0 == 'f' && matchKeyword(start, "function")) return FUNCTION;
+            if (c0 == 'c' && matchKeyword(start, "continue")) return CONTINUE;
+        } else if (len == 10) {
+            if (source.charAt(start) == 'i' && matchKeyword(start, "instanceof")) return INSTANCEOF;
+        }
+        return IDENT;
+    }
+
+    private boolean matchKeyword(int start, String keyword) {
+        int len = keyword.length();
+        for (int i = 0; i < len; i++) {
+            if (source.charAt(start + i) != keyword.charAt(i)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // ========== Operators and Punctuation ==========
+
+    private TokenType scanOperator() {
+        char c = advance();
+
+        switch (c) {
+            case '{':
+                // When inside a template placeholder (${...}), a nested `{`
+                // (function body, object literal, block) pushes another
+                // PLACEHOLDER level so the matching `}` pops back to this
+                // depth instead of terminating the placeholder prematurely.
+                if (currentState() == LexerState.PLACEHOLDER) {
+                    pushState(LexerState.PLACEHOLDER);
+                }
+                return L_CURLY;
+            case '}':
+                if (currentState() == LexerState.PLACEHOLDER) {
+                    popState();
+                }
+                return R_CURLY;
+            case '[':
+                return L_BRACKET;
+            case ']':
+                return R_BRACKET;
+            case '(':
+                return L_PAREN;
+            case ')':
+                return R_PAREN;
+            case ',':
+                return COMMA;
+            case ':':
+                return COLON;
+            case ';':
+                return SEMI;
+            case '~':
+                return TILDE;
+
+            case '.':
+                if (match('.')) {
+                    if (match('.')) {
+                        return DOT_DOT_DOT;
+                    }
+                    // Two dots without third - back up and return single dot
+                    // This shouldn't happen in valid JS, but handle gracefully
+                }
+                return DOT;
+
+            case '?':
+                // `?.` is the optional-chaining punctuator UNLESS the next char is a
+                // decimal digit — per spec the lookahead `?. [lookahead ∉ DecimalDigit]`
+                // makes `1 ?.5 : 0` lex as `1 ? .5 : 0` rather than `1 ?. 5 : 0`.
+                if (peek() == '.' && !isDigit(peek(1))) {
+                    match('.');
+                    return QUES_DOT;
+                }
+                if (match('?')) {
+                    return match('=') ? QUES_QUES_EQ : QUES_QUES;
+                }
+                return QUES;
+
+            case '=':
+                if (match('=')) {
+                    return match('=') ? EQ_EQ_EQ : EQ_EQ;
+                }
+                if (match('>')) {
+                    return EQ_GT;
+                }
+                return EQ;
+
+            case '<':
+                if (match('<')) {
+                    return match('=') ? LT_LT_EQ : LT_LT;
+                }
+                return match('=') ? LT_EQ : LT;
+
+            case '>':
+                if (match('>')) {
+                    if (match('>')) {
+                        return match('=') ? GT_GT_GT_EQ : GT_GT_GT;
+                    }
+                    return match('=') ? GT_GT_EQ : GT_GT;
+                }
+                return match('=') ? GT_EQ : GT;
+
+            case '!':
+                if (match('=')) {
+                    return match('=') ? NOT_EQ_EQ : NOT_EQ;
+                }
+                return NOT;
+
+            case '|':
+                if (match('|')) {
+                    return match('=') ? PIPE_PIPE_EQ : PIPE_PIPE;
+                }
+                return match('=') ? PIPE_EQ : PIPE;
+
+            case '&':
+                if (match('&')) {
+                    return match('=') ? AMP_AMP_EQ : AMP_AMP;
+                }
+                return match('=') ? AMP_EQ : AMP;
+
+            case '^':
+                return match('=') ? CARET_EQ : CARET;
+
+            case '+':
+                if (match('+')) {
+                    return PLUS_PLUS;
+                }
+                return match('=') ? PLUS_EQ : PLUS;
+
+            case '-':
+                if (match('-')) {
+                    return MINUS_MINUS;
+                }
+                return match('=') ? MINUS_EQ : MINUS;
+
+            case '*':
+                if (match('*')) {
+                    return match('=') ? STAR_STAR_EQ : STAR_STAR;
+                }
+                return match('=') ? STAR_EQ : STAR;
+
+            case '%':
+                return match('=') ? PERCENT_EQ : PERCENT;
+
+            case '\\': // only an identifier's backslash-u escape may appear outside a literal
+                throw new ParserException(String.format(
+                        "unexpected character '\\' at %d:%d", tokenLine + 1, tokenCol + 1));
+
+            default:
+                // A non-ASCII char in a category that can never be identifier
+                // material or whitespace is a SyntaxError (§12.2) — e.g. U+180E
+                // Mongolian vowel separator (Cf; whitespace in old Unicode).
+                // Everything else keeps the lenient IDENT fallback: chars the
+                // JDK's Unicode tables don't classify yet (newer-Unicode
+                // ID_Start additions land as UNASSIGNED here) must still lex
+                // as identifiers.
+                if (c > 127) {
+                    int type = Character.getType(c);
+                    if (type == Character.FORMAT || type == Character.CONTROL || c == VERTICAL_TILDE
+                            || type == Character.LINE_SEPARATOR || type == Character.PARAGRAPH_SEPARATOR) {
+                        throw new ParserException(String.format(
+                                "unexpected character '\\u%04X' at %d:%d", (int) c, tokenLine + 1, tokenCol + 1));
+                    }
+                }
+                // Unknown character - return as IDENT (will likely cause parse error)
+                return IDENT;
+        }
+    }
+
+    /** StringValue of a string-literal interior: escape sequences decoded to
+     *  their characters. Shared by runtime evaluation (Interpreter) and the
+     *  parser's {@code __proto__}-key comparison (B.3.1 counts escaped
+     *  spellings). */
+    public static String unescapeStringLiteral(String s) {
+        if (s.indexOf('\\') == -1) {
+            return s; // no escapes, fast path
+        }
+        StringBuilder sb = new StringBuilder(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '\\' && i + 1 < s.length()) {
+                char next = s.charAt(i + 1);
+                switch (next) {
+                    case 'n' -> { sb.append('\n'); i++; }
+                    case 'r' -> { sb.append('\r'); i++; }
+                    case 't' -> { sb.append('\t'); i++; }
+                    case 'b' -> { sb.append('\b'); i++; }
+                    case 'f' -> { sb.append('\f'); i++; }
+                    case 'v' -> { sb.append((char) 0x0B); i++; }
+                    case '0' -> { sb.append('\0'); i++; }
+                    case '\\' -> { sb.append('\\'); i++; }
+                    case '\'' -> { sb.append('\''); i++; }
+                    case '"' -> { sb.append('"'); i++; }
+                    case 'x' -> {
+                        // Hex escape: backslash-x followed by exactly 2 hex digits
+                        if (i + 3 < s.length()) {
+                            try {
+                                int code = Integer.parseInt(s.substring(i + 2, i + 4), 16);
+                                sb.append((char) code);
+                                i += 3;
+                            } catch (NumberFormatException e) {
+                                sb.append(c); // invalid escape, keep backslash
+                            }
+                        } else {
+                            sb.append(c);
+                        }
+                    }
+                    case 'u' -> {
+                        // Unicode escape sequence (4 hex digits)
+                        if (i + 5 < s.length()) {
+                            try {
+                                int code = Integer.parseInt(s.substring(i + 2, i + 6), 16);
+                                sb.append((char) code);
+                                i += 5;
+                            } catch (NumberFormatException e) {
+                                sb.append(c); // invalid escape, keep as-is
+                            }
+                        } else {
+                            sb.append(c);
+                        }
+                    }
+                    default -> sb.append(c); // unknown escape, keep backslash
+                }
+            } else {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+}

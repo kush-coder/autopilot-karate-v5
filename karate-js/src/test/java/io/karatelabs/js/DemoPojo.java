@@ -1,0 +1,183 @@
+package io.karatelabs.js;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
+
+public class DemoPojo {
+
+    public DemoPojo() {
+
+    }
+
+    public DemoPojo(String s) {
+        this.stringValue = s;
+    }
+
+    public DemoPojo(String s, int i) {
+        this.stringValue = s;
+        this.intValue = i;
+    }
+
+    private boolean booleanValue;
+    private String stringValue;
+    private int intValue;
+    private double doubleValue;
+    private Integer[] integerArray;
+    private int[] intArray;
+
+    public final String instanceField = "instance-field";
+
+    public static String staticField = "static-field";
+
+    public boolean isBooleanValue() {
+        return booleanValue;
+    }
+
+    public int getIntValue() {
+        return intValue;
+    }
+
+    public String getStringValue() {
+        return stringValue;
+    }
+
+    public double getDoubleValue() {
+        return doubleValue;
+    }
+
+    public void setBooleanValue(boolean booleanValue) {
+        this.booleanValue = booleanValue;
+    }
+
+    public void setIntValue(int intValue) {
+        this.intValue = intValue;
+    }
+
+    public Integer[] getIntegerArray() {
+        return integerArray;
+    }
+
+    public void setIntegerArray(Integer[] integerArray) {
+        this.integerArray = integerArray;
+    }
+
+    public int[] getIntArray() {
+        return intArray;
+    }
+
+    public void setIntArray(int[] intArray) {
+        this.intArray = intArray;
+    }
+
+    // Binary return: a byte[] must cross into JS as a Uint8Array (not a generic List).
+    // Deliberately not a bean getter (no get* prefix) so it doesn't add a property to
+    // the introspected POJO surface that other tests pin.
+    public byte[] bytes() {
+        return new byte[]{1, 2, 3};
+    }
+
+    public void setStringValue(String stringValue) {
+        this.stringValue = stringValue;
+    }
+
+    public void setDoubleValue(double doubleValue) {
+        this.doubleValue = doubleValue;
+    }
+
+    public String doWork() {
+        return "hello";
+    }
+
+    public String doWork(String arg1) {
+        return "hello" + arg1;
+    }
+
+    public String doWork(String arg1, boolean arg2) {
+        return "hello" + arg1 + arg2;
+    }
+
+    public String doWorkException() {
+        throw new RuntimeException("failed");
+    }
+
+    public Object varArgs(Object[] args) {
+        return args[args.length - 1];
+    }
+
+    public String realVarArgs(String first, String... rest) {
+        StringBuilder sb = new StringBuilder(first);
+        for (String s : rest) {
+            sb.append(",").append(s);
+        }
+        return sb.toString();
+    }
+
+    public Integer[] doIntegerArray() {
+        return integerArray;
+    }
+
+    // For testing undefined → null conversion at JS/Java boundary
+    public Object echoValue(Object value) {
+        return value;
+    }
+
+    public String describeValue(Object value) {
+        if (value == null) {
+            return "null";
+        }
+        return value.getClass().getSimpleName() + ":" + value;
+    }
+
+    // For testing JsValue → Java conversion at JS/Java boundary
+    public String describeType(Object value) {
+        if (value == null) {
+            return "null";
+        }
+        return value.getClass().getName();
+    }
+
+    public long getDateMillis(java.util.Date date) {
+        return date.getTime();
+    }
+
+    public int getByteArrayLength(byte[] bytes) {
+        return bytes.length;
+    }
+
+    public byte getByteAt(byte[] bytes, int index) {
+        return bytes[index];
+    }
+
+    // Exercises a Java method with a Predicate parameter
+    public List<Map<String, Object>> filterRows(List<Map<String, Object>> rows, Predicate<Map<String, Object>> condition) {
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (Map<String, Object> row : rows) {
+            if (condition.test(row)) {
+                result.add(row);
+            }
+        }
+        return result;
+    }
+
+    public <T, R> R transform(T input, Function<T, R> fn) {
+        return fn.apply(input);
+    }
+
+    public void consumeValue(Object value, Consumer<Object> consumer) {
+        consumer.accept(value);
+    }
+
+    public Object produce(Supplier<Object> supplier) {
+        return supplier.get();
+    }
+
+    public void execute(Runnable task) {
+        task.run();
+    }
+
+}

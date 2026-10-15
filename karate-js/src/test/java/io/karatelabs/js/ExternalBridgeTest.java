@@ -1,0 +1,1716 @@
+package io.karatelabs.js;
+
+import org.junit.jupiter.api.Test;
+
+import java.math.BigDecimal;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+class ExternalBridgeTest extends EvalBase {
+
+    final ExternalBridge bridge = new ExternalBridge() {
+
+    };
+
+    @Override
+    Object eval(String text, String vars) {
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        return engine.eval(text);
+    }
+
+    @Test
+    void testDev() {
+
+    }
+
+    @Test
+    void testObjectLiteralWithFunctionProperty() {
+        // This replicates the karate-core test failure where foo.bar() fails
+        // when the external bridge is enabled
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        Object result = engine.eval("var foo = { bar: function(){ return 'baz' } }; foo.bar()");
+        assertEquals("baz", result);
+    }
+
+    @Test
+    void testObjectLiteralWithNestedFunctionProperty() {
+        // Chained property access: foo.bar.baz()
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        Object result = engine.eval("var foo = { bar: { baz: function(){ return 'deep' } } }; foo.bar.baz()");
+        assertEquals("deep", result);
+    }
+
+    @Test
+    void testObjectLiteralFunctionPropertyTwoSteps() {
+        // Mimics karate-core scenario where def and call are separate steps
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        // Step 1: def foo = { bar: function(){ return 'baz' } }
+        engine.eval("var foo = { bar: function(){ return 'baz' } }");
+        // Step 2: def result = foo.bar()
+        Object result = engine.eval("foo.bar()");
+        assertEquals("baz", result);
+    }
+
+    @Test
+    void testObjectLiteralFunctionPropertyViaGet() {
+        // Check what foo.bar returns when accessed
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        engine.eval("var foo = { bar: function(){ return 'baz' } }");
+        Object bar = engine.eval("foo.bar");
+        assertNotNull(bar, "foo.bar should not be null");
+        assertTrue(bar instanceof JsCallable, "foo.bar should be JsCallable but was: " + bar.getClass());
+    }
+
+    @Test
+    void testConstructAndCall() {
+        ExternalAccess type = bridge.forType("java.util.Properties");
+        Object o = type.construct(new Object[]{});
+        assertEquals("java.util.Properties", o.getClass().getName());
+        ExternalAccess instance = bridge.forInstance(o);
+        assertEquals(0, instance.invokeMethod("size", JavaUtils.EMPTY));
+        instance.invokeMethod("put", new Object[]{"foo", 5});
+        assertEquals(5, instance.invokeMethod("get", new Object[]{"foo"}));
+    }
+
+    @Test
+    void testGet() {
+        DemoPojo dp = new DemoPojo();
+        dp.setStringValue("foo");
+        dp.setIntValue(5);
+        dp.setBooleanValue(true);
+        ExternalAccess instance = bridge.forInstance(dp);
+        assertEquals("foo", instance.getProperty("stringValue"));
+        assertEquals(5, instance.getProperty("intValue"));
+        assertEquals(true, instance.getProperty("booleanValue"));
+        ObjectLike ol = (ObjectLike) instance;
+        NodeUtils.match(ol.toMap(), "{ stringValue: 'foo', integerArray: null, intValue: 5, instanceField: 'instance-field', booleanValue: true, doubleValue: 0.0, intArray: null }");
+    }
+
+    @Test
+    void testSet() {
+        DemoPojo dp = new DemoPojo();
+        ExternalAccess instance = bridge.forInstance(dp);
+        instance.setProperty("stringValue", "bar");
+        instance.setProperty("intValue", 10);
+        instance.setProperty("booleanValue", true);
+        assertEquals("bar", dp.getStringValue());
+        assertEquals(10, dp.getIntValue());
+        assertTrue(dp.isBooleanValue());
+    }
+
+    @Test
+    void testSetSpecial() {
+        DemoPojo dp = new DemoPojo();
+        ExternalAccess instance = bridge.forInstance(dp);
+        instance.setProperty("doubleValue", 10);
+        instance.setProperty("booleanValue", Boolean.TRUE);
+        assertEquals(10, dp.getDoubleValue());
+        assertTrue(dp.isBooleanValue());
+    }
+
+    @Test
+    void testVarArgs() {
+        DemoPojo dp = new DemoPojo();
+        ExternalAccess instance = bridge.forInstance(dp);
+        JavaInvokable method = instance.getMethod("varArgs");
+        assertEquals("foo", method.invoke(new Object[]{null, "foo"}));
+        assertEquals("bar", method.invoke(new Object[]{null, "foo", "bar"}));
+    }
+
+    @Test
+    void testRealVarArgsInstance() {
+        // Instance method with Java varargs (String... rest)
+        eval("var DemoPojo = Java.type('io.karatelabs.js.DemoPojo'); var b = new DemoPojo(); var c = b.realVarArgs('a', 'b', 'c')");
+        assertEquals("a,b,c", get("c"));
+        // with single vararg
+        eval("var DemoPojo = Java.type('io.karatelabs.js.DemoPojo'); var b = new DemoPojo(); var c = b.realVarArgs('a', 'b')");
+        assertEquals("a,b", get("c"));
+        // with zero varargs
+        eval("var DemoPojo = Java.type('io.karatelabs.js.DemoPojo'); var b = new DemoPojo(); var c = b.realVarArgs('a')");
+        assertEquals("a", get("c"));
+    }
+
+    @Test
+    void testRealVarArgsStatic() {
+        // Static method with Java varargs
+        eval("var DemoUtils = Java.type('io.karatelabs.js.DemoUtils'); var c = DemoUtils.withVarArgs('a', 'b', 'v1')");
+        assertEquals("a,b,v1", get("c"));
+        // multiple varargs
+        eval("var DemoUtils = Java.type('io.karatelabs.js.DemoUtils'); var c = DemoUtils.withVarArgs('a', 'b', 'v1', 'v2')");
+        assertEquals("a,b,v1,v2", get("c"));
+        // zero varargs
+        eval("var DemoUtils = Java.type('io.karatelabs.js.DemoUtils'); var c = DemoUtils.withVarArgs('a', 'b')");
+        assertEquals("a,b", get("c"));
+    }
+
+    @Test
+    void testMethodOverload() {
+        DemoPojo dp = new DemoPojo();
+        ExternalAccess instance = bridge.forInstance(dp);
+        JavaInvokable method = instance.getMethod("doWork");
+        assertEquals("hello", method.invoke(new Object[]{}));
+        assertEquals("hellofoo", method.invoke(new Object[]{"foo"}));
+        assertEquals("hellofootrue", method.invoke(new Object[]{"foo", true}));
+    }
+
+    @Test
+    void testArrayLengthAndMap() {
+        List<Object> list = NodeUtils.fromJson("['foo', 'bar']");
+        JsArray jl = new JsArray(list);
+        assertEquals(2, jl.getMember("length"));
+    }
+
+    @Test
+    void testJavaInterop() {
+        eval("var DemoUtils = Java.type('io.karatelabs.js.DemoUtils'); var b = DemoUtils.doWork()");
+        assertEquals("hello", get("b"));
+        eval("var DemoUtils = Java.type('io.karatelabs.js.DemoUtils'); var b = DemoUtils.doWork; var c = b()");
+        assertEquals("hello", get("c"));
+        eval("var DemoPojo = Java.type('io.karatelabs.js.DemoPojo'); var b = new DemoPojo(); var c = b.doWork()");
+        assertEquals("hello", get("c"));
+        eval("var DemoPojo = Java.type('io.karatelabs.js.DemoPojo'); var b = new DemoPojo(); b.stringValue = 'foo'; var c = b.stringValue");
+        assertEquals("foo", get("c"));
+        eval("var DemoPojo = Java.type('io.karatelabs.js.DemoPojo'); var b = new DemoPojo('foo'); var c = b.stringValue");
+        assertEquals("foo", get("c"));
+        eval("var DemoPojo = Java.type('io.karatelabs.js.DemoPojo'); var b = new DemoPojo('foo', 42); var c = b.stringValue; var d = b.intValue");
+        assertEquals("foo", get("c"));
+        assertEquals(42, get("d"));
+        eval("var DemoPojo = Java.type('io.karatelabs.js.DemoPojo'); var b = new DemoPojo(); var c = b.stringValue");
+        assertNull(get("c"));
+        eval("var DemoPojo = Java.type('io.karatelabs.js.DemoPojo'); var b = new DemoPojo('foo'); b.integerArray = [1, 2]; var c = b.integerArray; var d = b.integerArray[1]");
+        NodeUtils.match(get("c"), "[1, 2]");
+        assertEquals(2, get("d"));
+        eval("var DemoPojo = Java.type('io.karatelabs.js.DemoPojo'); var b = new DemoPojo('foo'); b.intArray = [1, 2]; var c = b.intArray; var d = b.intArray[1]");
+        NodeUtils.match(get("c"), "[1, 2]");
+        assertEquals(2, get("d"));
+        assertEquals("static-field", eval("var DemoPojo = Java.type('io.karatelabs.js.DemoPojo'); DemoPojo.staticField"));
+        assertEquals("static-field-changed", eval("var DemoPojo = Java.type('io.karatelabs.js.DemoPojo'); DemoPojo.staticField = 'static-field-changed'; DemoPojo.staticField"));
+        assertEquals("foo", eval("io.karatelabs.js.DemoPojo.staticField = 'foo'; var a = io.karatelabs.js.DemoPojo.staticField"));
+        assertEquals("foo", get("a"));
+        assertEquals("instance-field", eval("var DemoPojo = Java.type('io.karatelabs.js.DemoPojo'); var a = new DemoPojo(); a.instanceField"));
+        eval("var DemoPojo = Java.type('io.karatelabs.js.DemoPojo'); var b = new DemoPojo(); var c = b.doWork; var d = c()");
+        assertEquals("hello", get("d"));
+        eval("var DemoPojo = Java.type('io.karatelabs.js.DemoPojo'); var b = new DemoPojo('foo'); b.integerArray = [1, 2]; var c = b.doIntegerArray()");
+        NodeUtils.match(get("c"), "[1, 2]");
+    }
+
+    @Test
+    void testJavaByteArrayReturnsAsBinary() {
+        // A Java method returning byte[] must cross into JS as a Uint8Array (binary),
+        // so it round-trips back to byte[] at the external-call boundary instead of
+        // degrading to a generic List<Byte>. Other Java arrays (int[], String[], ...)
+        // still become Lists — only byte[] is special-cased as binary.
+        Object result = eval("var DemoPojo = Java.type('io.karatelabs.js.DemoPojo'); new DemoPojo().bytes()");
+        assertInstanceOf(byte[].class, result, "byte[] return should be a Uint8Array, unwrapping to byte[] at the boundary");
+        assertArrayEquals(new byte[]{1, 2, 3}, (byte[]) result);
+    }
+
+    @Test
+    void testJavaByteArrayHasUint8ArraySemanticsInJs() {
+        // In JS the byte[] return reads as a Uint8Array: array .length + numeric
+        // indexing (a generic Java List would expose neither in this form).
+        assertEquals(true, eval("var DemoPojo = Java.type('io.karatelabs.js.DemoPojo');"
+                + " var b = new DemoPojo().bytes(); b.length === 3 && b[0] === 1 && b[2] === 3"));
+    }
+
+    @Test
+    void testJavaIntArrayStillBecomesList() {
+        // Guard the carve-out: non-byte arrays keep their List mapping (unchanged).
+        Object result = eval("var DemoPojo = Java.type('io.karatelabs.js.DemoPojo'); var p = new DemoPojo(); p.intArray = [1, 2]; p.getIntArray()");
+        assertInstanceOf(List.class, result, "int[] return should remain a List");
+    }
+
+    @Test
+    void testJavaInteropException() {
+        // Exceptions from Java methods now surface with the original message (was: masked as TypeError).
+        // A JS try/catch can intercept them.
+        try {
+            eval("var DemoUtils = Java.type('io.karatelabs.js.DemoUtils'); var b = DemoUtils.doWorkException; var c = b()");
+            fail("expected exception");
+        } catch (Exception e) {
+            assertTrue(e.getMessage().contains("failed"), "expected 'failed' in: " + e.getMessage());
+        }
+        try {
+            eval("var DemoUtils = Java.type('io.karatelabs.js.DemoUtils'); var b = DemoUtils.doWorkException; var c = b().foo");
+            fail("expected exception");
+        } catch (Exception e) {
+            assertTrue(e.getMessage().contains("failed"), "expected 'failed' in: " + e.getMessage());
+        }
+        try {
+            eval("var DemoPojo = Java.type('io.karatelabs.js.DemoPojo'); var b = new DemoPojo(); var c = b.doWorkException()");
+            fail("expected exception");
+        } catch (Exception e) {
+            assertTrue(e.getMessage().contains("failed"), "expected 'failed' in: " + e.getMessage());
+        }
+        try {
+            eval("var DemoUtils = Java.type('io.karatelabs.js.DemoUtils'); var b = DemoUtils.doWorkException()");
+            fail("expected exception");
+        } catch (Exception e) {
+            assertTrue(e.getMessage().contains("failed"), "expected 'failed' in: " + e.getMessage());
+        }
+        try {
+            eval("var DemoSimpleObject = Java.type('io.karatelabs.js.DemoSimpleObject'); var b = new DemoSimpleObject(); var c = b.doWorkException()");
+            fail("expected exception");
+        } catch (Exception e) {
+            assertTrue(e.getMessage().contains("failed"));
+        }
+        try {
+            eval("var DemoSimpleObject = Java.type('io.karatelabs.js.DemoSimpleObject'); var b = new DemoSimpleObject(); var c = b.inner.doWorkException()");
+            fail("expected exception");
+        } catch (Exception e) {
+            assertTrue(e.getMessage().contains("failed"));
+        }
+        // JS try/catch can now intercept the Java exception via e.message
+        assertEquals("caught:failed", eval(
+                "var DemoUtils = Java.type('io.karatelabs.js.DemoUtils');\n" +
+                        "try { DemoUtils.doWorkException() } catch (e) { 'caught:' + e.message }"));
+        assertEquals("caught:failed", eval(
+                "var DemoPojo = Java.type('io.karatelabs.js.DemoPojo');\n" +
+                        "var b = new DemoPojo();\n" +
+                        "try { b.doWorkException() } catch (e) { 'caught:' + e.message }"));
+    }
+
+    @Test
+    void testJavaToConversion() {
+        assertEquals(DemoUtils.class, eval("var DemoUtils = Java.type('io.karatelabs.js.DemoUtils'); Java.to(DemoUtils)"));
+    }
+
+    @Test
+    void testJavaInteropJdk() {
+        assertEquals("bar", eval("var props = new java.util.Properties(); props.put('foo', 'bar'); props.get('foo')"));
+        assertEquals(new BigDecimal(123123123123L), eval("new java.math.BigDecimal(123123123123)"));
+        assertEquals(String.CASE_INSENSITIVE_ORDER, eval("java.lang.String.CASE_INSENSITIVE_ORDER"));
+        assertInstanceOf(UUID.class, eval("java.util.UUID.randomUUID()"));
+    }
+
+    @Test
+    void testJavaInteropJdkSpecial() {
+        assertEquals("aGVsbG8=", eval("var Base64 = Java.type('java.util.Base64'); Base64.getEncoder().encodeToString('hello'.getBytes())"));
+    }
+
+    @Test
+    void testJavaStringConstructorWithByteArrayAndCharset() {
+        // V1 compatibility: new java.lang.String(byteArray, 'utf-8') should work
+        // This pattern is used in karate-demo request.feature to convert request body bytes to string
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        byte[] bytes = "hello".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        engine.put("requestBody", bytes);
+        Object result = engine.eval("new java.lang.String(requestBody, 'utf-8')");
+        assertEquals("hello", result);
+    }
+
+    @Test
+    void testStaticGetterPropertyAccess() {
+        // V1 compatibility: Base64.encoder should work like Base64.getEncoder()
+        assertEquals("aGVsbG8=", eval("var Base64 = Java.type('java.util.Base64'); Base64.encoder.encodeToString('hello'.getBytes())"));
+        // Base64.decode returns byte[], which crosses into JS as a Uint8Array and
+        // unwraps to byte[] at the boundary (not a List<Byte>).
+        Object result = eval("var Base64 = Java.type('java.util.Base64'); Base64.decoder.decode('aGVsbG8=')");
+        assertInstanceOf(byte[].class, result);
+        assertEquals("hello", new String((byte[]) result));
+    }
+
+    @Test
+    void testJavaInteropArrayListMethodCall() {
+        // This replicates the pattern used in V1's sort-array.js
+        // Test with fully qualified name (like Properties test above)
+        eval("var list = new java.util.ArrayList(); list.add('hello'); var size = list.size()");
+        assertEquals(1, get("size"));
+    }
+
+    @Test
+    void testJavaInteropArrayListViaJavaType() {
+        // Test with Java.type pattern (this is what V1's sort-array.js uses)
+        eval("var ArrayList = Java.type('java.util.ArrayList'); var list = new ArrayList(); list.add('hello'); var size = list.size()");
+        assertEquals(1, get("size"));
+    }
+
+    @Test
+    void testJavaInteropHashMapMethodCall() {
+        // Test Java method calls on HashMap - ensures Map types also fall through to external bridge
+        eval("var HashMap = Java.type('java.util.HashMap'); var map = new HashMap(); map.put('key', 'value'); var size = map.size()");
+        assertEquals(1, get("size"));
+    }
+
+    @Test
+    void testJavaInteropLinkedHashMapMethodCall() {
+        // Test with LinkedHashMap to ensure the external bridge works for Java Map implementations
+        eval("var map = new java.util.LinkedHashMap(); map.put('a', 1); map.put('b', 2); var size = map.size()");
+        assertEquals(2, get("size"));
+    }
+
+    @Test
+    void testImmutableListMethodCall() {
+        // Test that List.of() (which returns ImmutableCollections$ListN) can have methods called
+        // This is a regression test for module access restrictions on internal JDK classes
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        List<String> immutableList = List.of("a", "b", "c");
+        engine.put("list", immutableList);
+        // This should work - calling size() on an immutable list
+        Object size = engine.eval("list.size()");
+        assertEquals(3, size);
+    }
+
+    @Test
+    void testImmutableListLengthProperty() {
+        // Test that length property works on immutable lists (via JsArray wrapping)
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        List<String> immutableList = List.of("x", "y");
+        engine.put("list", immutableList);
+        // length should work via JsArray prototype
+        Object length = engine.eval("list.length");
+        assertEquals(2, length);
+    }
+
+    @Test
+    void testEmptyImmutableListMethodCall() {
+        // Test that List.of() with no args (empty immutable list) works
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        List<String> emptyList = List.of();
+        engine.put("list", emptyList);
+        Object size = engine.eval("list.size()");
+        assertEquals(0, size);
+    }
+
+    @Test
+    void testImmutableMapMethodCall() {
+        // Test that Map.of() (which returns ImmutableCollections$MapN) can have methods called
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        Map<String, Object> immutableMap = Map.of("a", 1, "b", 2);
+        engine.put("map", immutableMap);
+        assertEquals(2, engine.eval("map.size()"));
+        assertEquals(1, engine.eval("map.get('a')"));
+        assertEquals(true, engine.eval("map.containsKey('b')"));
+    }
+
+    @Test
+    void testEvalFunctionWithJavaType() {
+        // Replicates what happens with call read('file.js') for a JS file containing Java.type
+        // First, evaluate the function definition (like read() does)
+        String jsFileContent = """
+            function fn(array) {
+              var ArrayList = Java.type('java.util.ArrayList');
+              var list = new ArrayList();
+              for (var i = 0; i < array.length; i++) {
+                list.add(array[i]);
+              }
+              return list.size();
+            }
+            """;
+        Object fn = eval(jsFileContent);
+        assertNotNull(fn, "Function should be returned from eval");
+        assertTrue(fn instanceof JsCallable, "Should be callable");
+
+        // Now call the function with an argument
+        JsCallable callable = (JsCallable) fn;
+        Object result = callable.call(null, new Object[]{List.of("a", "b", "c")});
+        assertEquals(3, result);
+    }
+
+    // =================================================================================================================
+    // Java → JS Type Conversion Tests
+    // =================================================================================================================
+
+    @Test
+    void testDateConversion() {
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        long millis = 1609459200000L; // 2021-01-01T00:00:00Z
+
+        // java.util.Date should be usable as JS Date
+        engine.put("javaDate", new Date(millis));
+        assertEquals(millis, engine.eval("javaDate.getTime()"));
+        assertEquals(2021, engine.eval("javaDate.getFullYear()"));
+        assertEquals("object", engine.eval("typeof javaDate"));
+    }
+
+    @Test
+    void testInstantConversion() {
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        long millis = 1609459200000L;
+
+        // Instant should work as JS Date
+        engine.put("instant", Instant.ofEpochMilli(millis));
+        assertEquals(millis, engine.eval("instant.getTime()"));
+        assertEquals(2021, engine.eval("instant.getFullYear()"));
+    }
+
+    @Test
+    void testLocalDateTimeConversion() {
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+
+        // LocalDateTime should work as JS Date
+        LocalDateTime ldt = LocalDateTime.of(2025, 3, 15, 10, 30, 0);
+        engine.put("localDT", ldt);
+        assertEquals(2025, engine.eval("localDT.getFullYear()"));
+        assertEquals(2, engine.eval("localDT.getMonth()"));  // 0-indexed
+        assertEquals(15, engine.eval("localDT.getDate()"));
+        assertEquals(10, engine.eval("localDT.getHours()"));
+        assertEquals(30, engine.eval("localDT.getMinutes()"));
+    }
+
+    @Test
+    void testLocalDateConversion() {
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+
+        // LocalDate should work as JS Date (at start of day)
+        LocalDate ld = LocalDate.of(2025, 6, 20);
+        engine.put("localDate", ld);
+        assertEquals(2025, engine.eval("localDate.getFullYear()"));
+        assertEquals(5, engine.eval("localDate.getMonth()"));  // 0-indexed
+        assertEquals(20, engine.eval("localDate.getDate()"));
+        assertEquals(0, engine.eval("localDate.getHours()"));  // start of day
+    }
+
+    @Test
+    void testZonedDateTimeConversion() {
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+
+        // ZonedDateTime should work as JS Date
+        ZonedDateTime zdt = ZonedDateTime.of(2025, 12, 25, 14, 30, 0, 0, ZoneId.of("UTC"));
+        engine.put("zonedDT", zdt);
+        // Note: getFullYear etc use local timezone, so we test getTime() which is UTC millis
+        long expectedMillis = zdt.toInstant().toEpochMilli();
+        assertEquals(expectedMillis, engine.eval("zonedDT.getTime()"));
+    }
+
+    @Test
+    void testJavaTimeChainedFormat() {
+        // Chained java.time expressions should reach Java methods
+        // not on the JsDate prototype. ZonedDateTime.now(...) returns a ZDT
+        // that's wrapped in JsDate; .format(formatter) must fall through to
+        // the Java method on the original ZonedDateTime.
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        Object result = engine.eval(
+                "java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC)"
+                        + ".format(java.time.format.DateTimeFormatter.ofPattern(\"yyyy-MM-dd'T'HH:mm:ss'Z'\"))");
+        assertInstanceOf(String.class, result);
+        String s = (String) result;
+        assertTrue(s.contains("T"), "expected 'T' in: " + s);
+        assertTrue(s.endsWith("Z"), "expected 'Z' suffix in: " + s);
+    }
+
+    @Test
+    void testJavaTimeChainedFormatViaJavaType() {
+        // Same as above but using Java.type() pattern.
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        Object result = engine.eval(
+                "var ZonedDateTime = Java.type('java.time.ZonedDateTime');\n"
+                        + "var ZoneOffset = Java.type('java.time.ZoneOffset');\n"
+                        + "var DateTimeFormatter = Java.type('java.time.format.DateTimeFormatter');\n"
+                        + "ZonedDateTime.now(ZoneOffset.UTC)"
+                        + ".format(DateTimeFormatter.ofPattern(\"yyyy-MM-dd'T'HH:mm:ss'Z'\"))");
+        assertInstanceOf(String.class, result);
+        String s = (String) result;
+        assertTrue(s.contains("T"), "expected 'T' in: " + s);
+        assertTrue(s.endsWith("Z"), "expected 'Z' suffix in: " + s);
+    }
+
+    @Test
+    void testZonedDateTimeFormatStoredVar() {
+        // ZDT held in a variable, then formatted — confirms the host fall-through
+        // works regardless of whether the access is mid-chain or on a binding.
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        engine.eval("var zdt = java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC)");
+        Object result = engine.eval(
+                "zdt.format(java.time.format.DateTimeFormatter.ofPattern('yyyy-MM-dd'))");
+        assertInstanceOf(String.class, result);
+        assertTrue(((String) result).matches("\\d{4}-\\d{2}-\\d{2}"));
+    }
+
+    @Test
+    void testJavaTimeRoundTrip() {
+        // engine.put(zdt) → engine.get() should preserve the original Java
+        // type (no lossy round-trip through Date).
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        ZonedDateTime zdt = ZonedDateTime.of(2025, 12, 25, 14, 30, 0, 0, ZoneId.of("UTC"));
+        engine.put("zonedDT", zdt);
+        // Both Java Date prototype methods and round-trip work side by side:
+        assertEquals(zdt.toInstant().toEpochMilli(), engine.eval("zonedDT.getTime()"));
+        assertEquals(zdt, engine.get("zonedDT"));
+    }
+
+    @Test
+    void testNestedMapConversion() {
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+
+        // Nested map with Date should have Date converted
+        Map<String, Object> inner = new HashMap<>();
+        inner.put("created", new Date(1609459200000L));
+        inner.put("name", "test");
+
+        Map<String, Object> outer = new HashMap<>();
+        outer.put("data", inner);
+        outer.put("timestamp", new Date(1609459200000L));
+
+        engine.put("obj", outer);
+        assertEquals(1609459200000L, engine.eval("obj.timestamp.getTime()"));
+        assertEquals(1609459200000L, engine.eval("obj.data.created.getTime()"));
+        assertEquals("test", engine.eval("obj.data.name"));
+    }
+
+    @Test
+    void testNestedListConversion() {
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+
+        // List containing Dates should have Dates converted
+        List<Object> list = List.of(
+                new Date(1609459200000L),
+                new Date(1609545600000L),
+                "not a date"
+        );
+
+        engine.put("dates", list);
+        assertEquals(1609459200000L, engine.eval("dates[0].getTime()"));
+        assertEquals(1609545600000L, engine.eval("dates[1].getTime()"));
+        assertEquals("not a date", engine.eval("dates[2]"));
+    }
+
+    @Test
+    void testEvalWithMapConversion() {
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+
+        // evalWith should also convert dates in the vars map
+        Map<String, Object> vars = new HashMap<>();
+        vars.put("startDate", new Date(1609459200000L));
+        vars.put("endDate", Instant.ofEpochMilli(1609545600000L));
+
+        Object result = engine.evalWith("startDate.getTime() + endDate.getTime()", vars);
+        assertEquals(1609459200000L + 1609545600000L, ((Number) result).longValue());
+    }
+
+    @Test
+    void testByteArrayConversion() {
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+
+        // byte[] should be converted to JsUint8Array
+        byte[] bytes = new byte[]{1, 2, 3, (byte) 255};
+        engine.put("bytes", bytes);
+        assertEquals(4, engine.eval("bytes.length"));
+        assertEquals(1, engine.eval("bytes[0]"));
+        assertEquals(255, engine.eval("bytes[3]"));  // unsigned
+    }
+
+    @Test
+    void testJavaArrayConvertedToJsList() {
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+
+        // Java array should be converted to a JS-compatible list
+        String[] items = {"a", "b", "c"};
+        engine.put("items", items);
+
+        // Basic access should work
+        assertEquals("a", engine.eval("items[0]"));
+        assertEquals(3, engine.eval("items.length"));
+
+        // JS array methods should work after conversion
+        Object mapped = engine.eval("items.map(x => x.toUpperCase())");
+        assertEquals(List.of("A", "B", "C"), mapped);
+
+        Object filtered = engine.eval("items.filter(x => x !== 'b')");
+        assertEquals(List.of("a", "c"), filtered);
+
+        Object joined = engine.eval("items.join('-')");
+        assertEquals("a-b-c", joined);
+    }
+
+    @Test
+    void testJavaIntArrayConvertedToJsList() {
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+
+        // Primitive int array
+        int[] numbers = {1, 2, 3, 4, 5};
+        engine.put("numbers", numbers);
+
+        assertEquals(1, engine.eval("numbers[0]"));
+        assertEquals(5, engine.eval("numbers.length"));
+
+        // JS array methods
+        Object sum = engine.eval("numbers.reduce((a, b) => a + b, 0)");
+        assertEquals(15, sum);
+
+        Object doubled = engine.eval("numbers.map(x => x * 2)");
+        assertEquals(List.of(2, 4, 6, 8, 10), doubled);
+    }
+
+    @Test
+    void testJavaObjectArrayConvertedToJsList() {
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+
+        // Object array with mixed types
+        Object[] mixed = {"hello", 42, true};
+        engine.put("mixed", mixed);
+
+        assertEquals("hello", engine.eval("mixed[0]"));
+        assertEquals(42, engine.eval("mixed[1]"));
+        assertEquals(true, engine.eval("mixed[2]"));
+        assertEquals(3, engine.eval("mixed.length"));
+
+        // forEach should work
+        engine.eval("var result = []; mixed.forEach(x => result.push(x))");
+        assertEquals(List.of("hello", 42, true), engine.get("result"));
+    }
+
+    @Test
+    void testJavaListBracketAccess() {
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+
+        // This replicates the mock multipart access pattern: requestParts['myFile'][0]
+        Map<String, Object> filePart = new HashMap<>();
+        filePart.put("name", "myFile");
+        filePart.put("filename", "test.xlsx");
+        filePart.put("value", new byte[]{1, 2, 3});
+
+        List<Map<String, Object>> partsList = List.of(filePart);
+        Map<String, List<Map<String, Object>>> requestParts = new HashMap<>();
+        requestParts.put("myFile", partsList);
+
+        engine.put("requestParts", requestParts);
+
+        // This should work: access list element via bracket notation
+        Object result = engine.eval("requestParts['myFile'][0]");
+        assertNotNull(result);
+        assertInstanceOf(Map.class, result);
+        assertEquals("myFile", ((Map<?, ?>) result).get("name"));
+    }
+
+    @Test
+    void testXmlDocumentPassthrough() {
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+
+        // Create an XML document and verify it passes through JS correctly
+        org.w3c.dom.Document doc = io.karatelabs.common.Xml.toXmlDoc("<root><foo>bar</foo></root>");
+        engine.put("doc", doc);
+
+        // Verify typeof
+        assertEquals("object", engine.eval("typeof doc"));
+
+        // Verify it can be passed to a function and received as a Node
+        JsInvokable testFn = args -> args[0] instanceof org.w3c.dom.Node ? "success" : "not a node";
+        engine.put("testFn", testFn);
+        assertEquals("success", engine.eval("testFn(doc)"));
+    }
+
+    // =================================================================================================================
+    // Interface Static Fields Tests
+    // =================================================================================================================
+
+    @Test
+    void testInterfaceStaticFieldAccess() {
+        // Test that static fields on interfaces can be accessed (like Keys.ENTER)
+        assertEquals("foo-value", eval("var DemoInterface = Java.type('io.karatelabs.js.DemoInterface'); DemoInterface.FOO"));
+        assertEquals("bar-value", eval("var DemoInterface = Java.type('io.karatelabs.js.DemoInterface'); DemoInterface.BAR"));
+    }
+
+    @Test
+    void testInterfaceStaticFieldUnicode() {
+        // Test unicode values like Key.ENTER = "\uE007"
+        assertEquals("\uE007", eval("var DemoInterface = Java.type('io.karatelabs.js.DemoInterface'); DemoInterface.ENTER"));
+        assertEquals("\uE004", eval("var DemoInterface = Java.type('io.karatelabs.js.DemoInterface'); DemoInterface.TAB"));
+        assertEquals("\uE00C", eval("var DemoInterface = Java.type('io.karatelabs.js.DemoInterface'); DemoInterface.ESCAPE"));
+    }
+
+    @Test
+    void testInterfaceStaticFieldWithPut() {
+        // Test when interface is put as JavaType wrapper (like engine.put("Key", new JavaType(Keys.class)))
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        engine.put("DemoInterface", new JavaType(DemoInterface.class));
+        assertEquals("foo-value", engine.eval("DemoInterface.FOO"));
+        assertEquals("bar-value", engine.eval("DemoInterface.BAR"));
+        assertEquals("\uE007", engine.eval("DemoInterface.ENTER"));
+    }
+
+    @Test
+    void testStaticNestedEnumAccess() {
+        // Java.type('utils.PostgresHelper').QueryIdType.STRING
+        // worked in v1 (GraalJS) but throws in v2 because getStatic does not
+        // resolve nested classes.
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        Object result = engine.eval(
+                "var DemoUtils = Java.type('io.karatelabs.js.DemoUtils'); DemoUtils.QueryIdType.STRING");
+        assertEquals(DemoUtils.QueryIdType.STRING, result);
+    }
+
+    @Test
+    void testStaticNestedClassMethodCall() {
+        // Sibling case: nested non-enum class — call a static method on it.
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        Object result = engine.eval(
+                "var DemoUtils = Java.type('io.karatelabs.js.DemoUtils'); DemoUtils.NestedHelper.greet()");
+        assertEquals("hello-nested", result);
+    }
+
+    @Test
+    void testStaticNestedEnumAccessFqn() {
+        // Same as above but using the dotted FQN form (no Java.type binding).
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        Object result = engine.eval(
+                "io.karatelabs.js.DemoUtils.QueryIdType.STRING");
+        assertEquals(DemoUtils.QueryIdType.STRING, result);
+    }
+
+    @Test
+    void testXmlPathViaSimpleObject() {
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+
+        // Create a SimpleObject with xmlPath method (similar to karate object)
+        SimpleObject myKarate = name -> {
+            if ("xmlPath".equals(name)) {
+                return (JsInvokable) args -> {
+                    org.w3c.dom.Node node = (org.w3c.dom.Node) args[0];
+                    String path = args[1].toString();
+                    org.w3c.dom.NodeList nodeList = io.karatelabs.common.Xml.getNodeListByPath(node, path);
+                    return nodeList.getLength() > 0 ? nodeList.item(0).getTextContent() : null;
+                };
+            }
+            return null;
+        };
+
+        org.w3c.dom.Document doc = io.karatelabs.common.Xml.toXmlDoc("<root><foo>bar</foo></root>");
+        engine.put("doc", doc);
+        engine.put("myKarate", myKarate);
+
+        assertEquals("bar", engine.eval("myKarate.xmlPath(doc, '/root/foo')"));
+    }
+
+    // =================================================================================================================
+    // Java exception → JS-catchable Error Tests
+    // =================================================================================================================
+
+    @Test
+    void testJavaMethodExceptionIsJsCatchable() {
+        // Calling an instance method on a Java object via the external bridge:
+        // exception is unwrapped from InvocationTargetException and surfaces as a JS-catchable Error.
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        engine.put("obj", new ThrowingJavaObject());
+        Object result = engine.eval(
+                "try { obj.kaboom() } catch (e) { 'got:' + e.message }");
+        assertEquals("got:from java method", result);
+    }
+
+    @Test
+    void testJavaStaticMethodExceptionIsJsCatchable() {
+        // Static method path: Java.type(...).method() — same unwrapping applies.
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        Object result = engine.eval(
+                "var T = Java.type('io.karatelabs.js.ExternalBridgeTest$ThrowingJavaObject');\n" +
+                        "try { T.staticBoom() } catch (e) { 'got:' + e.message }");
+        assertEquals("got:from static java method", result);
+    }
+
+    @Test
+    void testJavaMethodCheckedExceptionIsJsCatchable() {
+        // Checked exception wrapped in InvocationTargetException also surfaces with its message.
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        engine.put("obj", new ThrowingJavaObject());
+        Object result = engine.eval(
+                "try { obj.checkedBoom() } catch (e) { 'got:' + e.message }");
+        assertEquals("got:checked fail", result);
+    }
+
+    @SuppressWarnings("unused")
+    public static class ThrowingJavaObject {
+        public Object kaboom() {
+            throw new RuntimeException("from java method");
+        }
+
+        public Object checkedBoom() throws Exception {
+            throw new Exception("checked fail");
+        }
+
+        public static Object staticBoom() {
+            throw new RuntimeException("from static java method");
+        }
+    }
+
+    // =================================================================================================================
+    // Undefined → Null Conversion at JS/Java Boundary Tests
+    // =================================================================================================================
+
+    @Test
+    void testUndefinedPropertyPassedToJavaMethodBecomesNull() {
+        // Simulates: var user = { name: 'John' }; pojo.echoValue(user.version)
+        // user.version is undefined, should become null when passed to Java
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        engine.eval("""
+                var DemoPojo = Java.type('io.karatelabs.js.DemoPojo');
+                var pojo = new DemoPojo();
+                var user = { name: 'John' };
+                var result = pojo.describeValue(user.version);
+                """);
+        // user.version is undefined, should be converted to null at Java boundary
+        assertEquals("null", engine.get("result"));
+    }
+
+    @Test
+    void testExplicitUndefinedPassedToJavaMethodBecomesNull() {
+        // Simulates: pojo.echoValue(undefined)
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        engine.eval("""
+                var DemoPojo = Java.type('io.karatelabs.js.DemoPojo');
+                var pojo = new DemoPojo();
+                var result = pojo.describeValue(undefined);
+                """);
+        assertEquals("null", engine.get("result"));
+    }
+
+    @Test
+    void testUndefinedFromMapMissingKeyPassedToJava() {
+        // Simulates the exact DynamoDB scenario:
+        // var user = utils.getUserById(userId); // Returns Map from DynamoDB
+        // utils.updateUser(user.version);  // version field doesn't exist
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        Map<String, Object> user = new HashMap<>();
+        user.put("userId", "123");
+        user.put("name", "John");
+        // Note: 'version' key is intentionally missing
+        engine.put("user", user);
+        engine.eval("""
+                var DemoPojo = Java.type('io.karatelabs.js.DemoPojo');
+                var pojo = new DemoPojo();
+                var result = pojo.describeValue(user.version);
+                """);
+        assertEquals("null", engine.get("result"));
+    }
+
+    @Test
+    void testNullPassedToJavaMethodRemainsNull() {
+        // Explicit null should still work
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        engine.eval("""
+                var DemoPojo = Java.type('io.karatelabs.js.DemoPojo');
+                var pojo = new DemoPojo();
+                var result = pojo.describeValue(null);
+                """);
+        assertEquals("null", engine.get("result"));
+    }
+
+    @Test
+    void testDefinedValuePassedToJavaMethodWorks() {
+        // Sanity check: defined values should pass through normally
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        engine.eval("""
+                var DemoPojo = Java.type('io.karatelabs.js.DemoPojo');
+                var pojo = new DemoPojo();
+                var user = { name: 'John', version: 42 };
+                var result = pojo.echoValue(user.version);
+                """);
+        assertEquals(42, engine.get("result"));
+    }
+
+    // =================================================================================================================
+    // JsValue → Java Conversion at JS/Java Boundary Tests
+    // These tests verify that JsDate, JsUint8Array, etc. are unwrapped to their Java equivalents
+    // =================================================================================================================
+
+    @Test
+    void testJsDatePassedToJavaMethodBecomesJavaDate() {
+        // new Date() returns JsDate (a JsValue), should be unwrapped to java.util.Date
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        engine.eval("""
+                var DemoPojo = Java.type('io.karatelabs.js.DemoPojo');
+                var pojo = new DemoPojo();
+                var d = new Date(1609459200000);
+                var result = pojo.describeType(d);
+                """);
+        // JsDate implements JsValue, should be unwrapped to java.util.Date
+        assertEquals("java.util.Date", engine.get("result"));
+    }
+
+    @Test
+    void testJsDateFromExpressionPassedToJavaMethod() {
+        // Date stored in object property, then passed to Java
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        engine.eval("""
+                var DemoPojo = Java.type('io.karatelabs.js.DemoPojo');
+                var pojo = new DemoPojo();
+                var obj = { created: new Date(1609459200000) };
+                var result = pojo.describeType(obj.created);
+                """);
+        assertEquals("java.util.Date", engine.get("result"));
+    }
+
+    @Test
+    void testJsDatePassedToTypedJavaMethod() {
+        // Java method with Date parameter type should receive java.util.Date
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        engine.eval("""
+                var DemoPojo = Java.type('io.karatelabs.js.DemoPojo');
+                var pojo = new DemoPojo();
+                var d = new Date(1609459200000);
+                var result = pojo.getDateMillis(d);
+                """);
+        assertEquals(1609459200000L, engine.get("result"));
+    }
+
+    @Test
+    void testJsDateFromArrayPassedToJavaMethod() {
+        // Date stored in array, then passed to Java
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        engine.eval("""
+                var DemoPojo = Java.type('io.karatelabs.js.DemoPojo');
+                var pojo = new DemoPojo();
+                var arr = [new Date(1609459200000), new Date(1609545600000)];
+                var result = pojo.describeType(arr[0]);
+                """);
+        assertEquals("java.util.Date", engine.get("result"));
+    }
+
+    @Test
+    void testJsDateFromFunctionReturnPassedToJavaMethod() {
+        // Date returned from a function, then passed to Java
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        engine.eval("""
+                var DemoPojo = Java.type('io.karatelabs.js.DemoPojo');
+                var pojo = new DemoPojo();
+                function getDate() { return new Date(1609459200000); }
+                var result = pojo.describeType(getDate());
+                """);
+        assertEquals("java.util.Date", engine.get("result"));
+    }
+
+    @Test
+    void testJsDateFromTernaryExpressionPassedToJavaMethod() {
+        // Date from conditional expression
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        engine.eval("""
+                var DemoPojo = Java.type('io.karatelabs.js.DemoPojo');
+                var pojo = new DemoPojo();
+                var flag = true;
+                var d = flag ? new Date(1609459200000) : null;
+                var result = pojo.describeType(d);
+                """);
+        assertEquals("java.util.Date", engine.get("result"));
+    }
+
+    @Test
+    void testJsUint8ArrayPassedToJavaMethodBecomesByteArray() {
+        // Uint8Array (JsUint8Array implements JsValue) should be unwrapped to byte[]
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        engine.eval("""
+                var DemoPojo = Java.type('io.karatelabs.js.DemoPojo');
+                var pojo = new DemoPojo();
+                var bytes = new Uint8Array([1, 2, 3, 255]);
+                var result = pojo.describeType(bytes);
+                """);
+        // JsUint8Array should be unwrapped to byte[]
+        assertEquals("[B", engine.get("result")); // [B is the JVM name for byte[]
+    }
+
+    @Test
+    void testJsUint8ArrayPassedToTypedJavaMethod() {
+        // Java method with byte[] parameter should receive byte[]
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        engine.eval("""
+                var DemoPojo = Java.type('io.karatelabs.js.DemoPojo');
+                var pojo = new DemoPojo();
+                var bytes = new Uint8Array([1, 2, 3, 255]);
+                var result = pojo.getByteArrayLength(bytes);
+                """);
+        assertEquals(4, engine.get("result"));
+    }
+
+    @Test
+    void testJsUint8ArrayFromPropertyPassedToJavaMethod() {
+        // Uint8Array stored in object property
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        engine.eval("""
+                var DemoPojo = Java.type('io.karatelabs.js.DemoPojo');
+                var pojo = new DemoPojo();
+                var obj = { data: new Uint8Array([10, 20, 30]) };
+                var result = pojo.getByteArrayLength(obj.data);
+                """);
+        assertEquals(3, engine.get("result"));
+    }
+
+    @Test
+    void testMultipleJsValueArgsPassedToJavaMethod() {
+        // Multiple JsValue args in one call
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        // Use a SimpleObject to capture args
+        java.util.List<Object> capturedArgs = new java.util.ArrayList<>();
+        SimpleObject utils = name -> {
+            if ("capture".equals(name)) {
+                return (JavaCallable) (context, args) -> {
+                    for (Object arg : args) {
+                        capturedArgs.add(arg);
+                    }
+                    return null;
+                };
+            }
+            return null;
+        };
+        engine.put("utils", utils);
+        engine.eval("""
+                var d = new Date(1609459200000);
+                var bytes = new Uint8Array([1, 2, 3]);
+                utils.capture(d, bytes, undefined);
+                """);
+        assertEquals(3, capturedArgs.size());
+        // JsDate should be unwrapped to java.util.Date
+        assertInstanceOf(Date.class, capturedArgs.get(0), "JsDate should be unwrapped to Date");
+        // JsUint8Array should be unwrapped to byte[]
+        assertInstanceOf(byte[].class, capturedArgs.get(1), "JsUint8Array should be unwrapped to byte[]");
+        // undefined should be null
+        assertNull(capturedArgs.get(2), "undefined should be null");
+    }
+
+    @Test
+    void testDateNowPassedToJavaMethod() {
+        // Date.now() returns a number, not a Date - this should work already
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        engine.eval("""
+                var DemoPojo = Java.type('io.karatelabs.js.DemoPojo');
+                var pojo = new DemoPojo();
+                var result = pojo.describeType(Date.now());
+                """);
+        // Date.now() returns a long/number, not JsDate
+        assertEquals("java.lang.Long", engine.get("result"));
+    }
+
+    // =================================================================================================================
+    // JS Function Passed to Java Code Tests
+    // These tests verify that JS functions can be received by Java code expecting JavaCallable
+    // =================================================================================================================
+
+    @Test
+    void testJsFunctionPassedToJavaMethodAsCallable() {
+        // Simulates: proc.waitForOutput(function(line) { return line.indexOf('ready') >= 0 })
+        // Java code checks: if (args[0] instanceof JavaCallable)
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        java.util.List<Object> capturedResults = new java.util.ArrayList<>();
+        SimpleObject utils = name -> {
+            if ("forEach".equals(name)) {
+                return (JavaCallable) (context, args) -> {
+                    if (args.length < 2 || !(args[1] instanceof JavaCallable)) {
+                        throw new RuntimeException("forEach requires a function argument");
+                    }
+                    List<?> list = (List<?>) args[0];
+                    JavaCallable fn = (JavaCallable) args[1];
+                    for (Object item : list) {
+                        Object result = fn.call(context, new Object[]{item});
+                        capturedResults.add(result);
+                    }
+                    return null;
+                };
+            }
+            return null;
+        };
+        engine.put("utils", utils);
+        engine.eval("""
+                var items = ['a', 'b', 'c'];
+                utils.forEach(items, function(x) { return x.toUpperCase() });
+                """);
+        assertEquals(List.of("A", "B", "C"), capturedResults);
+    }
+
+    @Test
+    void testJsArrowFunctionPassedToJavaMethodAsCallable() {
+        // Arrow function syntax
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        java.util.List<Object> capturedResults = new java.util.ArrayList<>();
+        SimpleObject utils = name -> {
+            if ("map".equals(name)) {
+                return (JavaCallable) (context, args) -> {
+                    if (args.length < 2 || !(args[1] instanceof JavaCallable)) {
+                        throw new RuntimeException("map requires a function argument");
+                    }
+                    List<?> list = (List<?>) args[0];
+                    JavaCallable fn = (JavaCallable) args[1];
+                    java.util.List<Object> result = new java.util.ArrayList<>();
+                    for (Object item : list) {
+                        result.add(fn.call(context, new Object[]{item}));
+                    }
+                    return result;
+                };
+            }
+            return null;
+        };
+        engine.put("utils", utils);
+        Object result = engine.eval("""
+                var items = [1, 2, 3];
+                utils.map(items, x => x * 2);
+                """);
+        assertEquals(List.of(2, 4, 6), result);
+    }
+
+    @Test
+    void testJsFunctionFromVariablePassedToJavaMethod() {
+        // Function stored in variable, then passed
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        final Object[] capturedFn = new Object[1];
+        SimpleObject utils = name -> {
+            if ("captureCallable".equals(name)) {
+                return (JavaCallable) (context, args) -> {
+                    capturedFn[0] = args[0];
+                    if (args[0] instanceof JavaCallable jc) {
+                        return jc.call(context, new Object[]{"test"});
+                    }
+                    throw new RuntimeException("Not a JavaCallable: " + args[0].getClass().getName());
+                };
+            }
+            return null;
+        };
+        engine.put("utils", utils);
+        Object result = engine.eval("""
+                var fn = function(x) { return 'received: ' + x };
+                utils.captureCallable(fn);
+                """);
+        assertEquals("received: test", result);
+        assertInstanceOf(JavaCallable.class, capturedFn[0], "JS function should be instanceof JavaCallable");
+    }
+
+    // =================================================================================================================
+    // JS Function → Java Functional Interface Coercion Tests
+    // JS functions are accepted by Java methods declaring Predicate / Function /
+    // Consumer / Supplier / Runnable parameters. v1 got this via Graal interop;
+    // v2 routes through default methods on JavaCallable.
+    // =================================================================================================================
+
+    @Test
+    void testJsFunctionAsPredicate() {
+        // Java method takes Predicate<Map<String, Object>>
+        // and is called from JS with a JS function as the predicate argument.
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        Map<String, Object> r1 = new HashMap<>();
+        r1.put("status", "active");
+        r1.put("count", 5);
+        Map<String, Object> r2 = new HashMap<>();
+        r2.put("status", "inactive");
+        r2.put("count", 3);
+        Map<String, Object> r3 = new HashMap<>();
+        r3.put("status", "active");
+        r3.put("count", 1);
+        engine.put("rows", List.of(r1, r2, r3));
+        engine.eval("""
+                var DemoPojo = Java.type('io.karatelabs.js.DemoPojo');
+                var pojo = new DemoPojo();
+                var result = pojo.filterRows(rows, function(row) { return row['status'] === 'active' });
+                """);
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> result = (List<Map<String, Object>>) engine.get("result");
+        assertEquals(2, result.size());
+        assertEquals("active", result.get(0).get("status"));
+        assertEquals("active", result.get(1).get("status"));
+    }
+
+    @Test
+    void testJsArrowFunctionAsPredicate() {
+        // Arrow function variant
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        Map<String, Object> r1 = new HashMap<>();
+        r1.put("count", 10);
+        Map<String, Object> r2 = new HashMap<>();
+        r2.put("count", 2);
+        engine.put("rows", List.of(r1, r2));
+        engine.eval("""
+                var DemoPojo = Java.type('io.karatelabs.js.DemoPojo');
+                var pojo = new DemoPojo();
+                var result = pojo.filterRows(rows, row => row.count > 5);
+                """);
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> result = (List<Map<String, Object>>) engine.get("result");
+        assertEquals(1, result.size());
+        assertEquals(10, result.get(0).get("count"));
+    }
+
+    @Test
+    void testJsPredicateTruthyConversion() {
+        // Predicate uses JS truthy semantics: empty string / 0 / undefined are false,
+        // non-empty string / non-zero number / objects are true.
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        Map<String, Object> r1 = new HashMap<>();
+        r1.put("name", "alice");
+        Map<String, Object> r2 = new HashMap<>();
+        r2.put("name", "");
+        Map<String, Object> r3 = new HashMap<>();
+        // 'name' missing → undefined
+        engine.put("rows", List.of(r1, r2, r3));
+        engine.eval("""
+                var DemoPojo = Java.type('io.karatelabs.js.DemoPojo');
+                var pojo = new DemoPojo();
+                var result = pojo.filterRows(rows, function(r) { return r.name });
+                """);
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> result = (List<Map<String, Object>>) engine.get("result");
+        assertEquals(1, result.size());
+        assertEquals("alice", result.get(0).get("name"));
+    }
+
+    @Test
+    void testJsFunctionAsFunction() {
+        // Java method takes Function<T, R>: JS function returns the transformed value.
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        Object result = engine.eval("""
+                var DemoPojo = Java.type('io.karatelabs.js.DemoPojo');
+                var pojo = new DemoPojo();
+                pojo.transform('hello', function(s) { return s.toUpperCase() });
+                """);
+        assertEquals("HELLO", result);
+    }
+
+    @Test
+    void testJsFunctionAsFunctionUnwrapsJsValue() {
+        // Function.apply routes through Engine.toJava — JsDate must be unwrapped
+        // to java.util.Date so Java callers don't see internal wrapper types.
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        Object result = engine.eval("""
+                var DemoPojo = Java.type('io.karatelabs.js.DemoPojo');
+                var pojo = new DemoPojo();
+                pojo.transform(1609459200000, function(millis) { return new Date(millis) });
+                """);
+        assertInstanceOf(Date.class, result);
+        assertEquals(1609459200000L, ((Date) result).getTime());
+    }
+
+    @Test
+    void testJsFunctionAsConsumer() {
+        // Java method takes Consumer<T>: JS function executes for side-effects.
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        engine.eval("""
+                var DemoPojo = Java.type('io.karatelabs.js.DemoPojo');
+                var pojo = new DemoPojo();
+                var captured;
+                pojo.consumeValue('hello', function(v) { captured = v + ' world' });
+                """);
+        assertEquals("hello world", engine.get("captured"));
+    }
+
+    @Test
+    void testJsFunctionAsSupplier() {
+        // Java method takes Supplier<T>: zero-arg JS function provides the value.
+        // After the JsLazy split, Supplier is a clean parameter-coercion target —
+        // it no longer doubles as the lazy-binding sentinel.
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        Object result = engine.eval("""
+                var DemoPojo = Java.type('io.karatelabs.js.DemoPojo');
+                var pojo = new DemoPojo();
+                pojo.produce(function() { return 'supplied' });
+                """);
+        assertEquals("supplied", result);
+    }
+
+    @Test
+    void testJsFunctionAsRunnable() {
+        // Java method takes Runnable: zero-arg JS function for fire-and-forget execution.
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        engine.eval("""
+                var DemoPojo = Java.type('io.karatelabs.js.DemoPojo');
+                var pojo = new DemoPojo();
+                var ran = false;
+                pojo.execute(function() { ran = true });
+                """);
+        assertEquals(true, engine.get("ran"));
+    }
+
+    @Test
+    void testJsFunctionInstanceOfFunctionalInterfaces() {
+        // Sanity check: a JS function obtained from JS via the bridge is recognised
+        // as each of the supported single-arg functional interfaces.
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        Object[] captured = new Object[1];
+        SimpleObject utils = name -> {
+            if ("capture".equals(name)) {
+                return (JavaCallable) (context, args) -> {
+                    captured[0] = args[0];
+                    return null;
+                };
+            }
+            return null;
+        };
+        engine.put("utils", utils);
+        engine.eval("utils.capture(function(x) { return x })");
+        assertInstanceOf(java.util.function.Function.class, captured[0]);
+        assertInstanceOf(java.util.function.Predicate.class, captured[0]);
+        assertInstanceOf(java.util.function.Consumer.class, captured[0]);
+        assertInstanceOf(java.util.function.Supplier.class, captured[0]);
+        assertInstanceOf(Runnable.class, captured[0]);
+        // JsLazy is the lazy-binding sentinel — JS functions are explicitly NOT lazy.
+        assertFalse(captured[0] instanceof JsLazy);
+    }
+
+    // =================================================================================================================
+    // Java.type() Classloader Tests
+    // Class.forName() uses the caller's defining loader (this bundle); classes
+    // loaded only by a child loader (e.g. JUnit Platform Console Launcher's
+    // --cp loader, set as TCCL) need the lookup to consult TCCL first.
+    // =================================================================================================================
+
+    private static java.net.URLClassLoader compileIntoIsolatedLoader(String fqcn, String source) throws Exception {
+        javax.tools.JavaCompiler compiler = javax.tools.ToolProvider.getSystemJavaCompiler();
+        assertNotNull(compiler, "JavaCompiler unavailable — test requires a JDK (not a JRE)");
+        java.nio.file.Path tmp = java.nio.file.Files.createTempDirectory("karate-cl-iso-");
+        tmp.toFile().deleteOnExit();
+        String simpleName = fqcn.substring(fqcn.lastIndexOf('.') + 1);
+        java.nio.file.Path srcFile = tmp.resolve(simpleName + ".java");
+        java.nio.file.Files.writeString(srcFile, source);
+        int rc = compiler.run(null, null, null, "-d", tmp.toString(), srcFile.toString());
+        assertEquals(0, rc, "javac failed");
+        // Parent = platform loader → bundle classpath is NOT in the parent chain,
+        // so the compiled class is reachable ONLY via this URLClassLoader.
+        return new java.net.URLClassLoader(
+                new java.net.URL[]{tmp.toUri().toURL()},
+                ClassLoader.getPlatformClassLoader());
+    }
+
+    @Test
+    void testJavaTypeResolvesViaThreadContextClassLoader() throws Exception {
+        // Compile com.example.IsolatedHelper into a dir reachable only by a
+        // URLClassLoader that's NOT in the karate-js loader's parent chain.
+        // Pre-fix: Class.forName uses the karate-js loader → CNFE → forType
+        // returns null. Post-fix: TCCL lookup succeeds.
+        java.net.URLClassLoader isolated = compileIntoIsolatedLoader(
+                "com.example.IsolatedHelper",
+                "package com.example;\n" +
+                        "public class IsolatedHelper {\n" +
+                        "  public static String hello() { return \"hi-from-isolated\"; }\n" +
+                        "}\n");
+        ClassLoader prev = Thread.currentThread().getContextClassLoader();
+        try {
+            Thread.currentThread().setContextClassLoader(isolated);
+            engine = new Engine();
+            engine.setExternalBridge(bridge);
+            Object result = engine.eval(
+                    "var H = Java.type('com.example.IsolatedHelper'); H.hello()");
+            assertEquals("hi-from-isolated", result);
+        } finally {
+            Thread.currentThread().setContextClassLoader(prev);
+            isolated.close();
+        }
+    }
+
+    @Test
+    void testJavaTypeMissingClassThrowsTypeError() {
+        // Java.type for a genuinely missing class must throw a clear error
+        // rather than silently returning null (which would later surface as
+        // "cannot read properties of null").
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        Exception ex = assertThrows(Exception.class, () ->
+                engine.eval("Java.type('com.example.does.not.Exist')"));
+        assertTrue(ex.getMessage().contains("class not found"),
+                "expected 'class not found' in: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("com.example.does.not.Exist"),
+                "expected class name in: " + ex.getMessage());
+    }
+
+    // Member lookup on a Java class is resolved once and remembered — the RESOLUTION, never the
+    // value. A getter read twice with a mutation in between must see the mutation.
+    @Test
+    void testCachedMemberResolutionStillReadsLiveValues() {
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        DemoPojo pojo = new DemoPojo();
+        pojo.setIntValue(1);
+        engine.put("pojo", pojo);
+        assertEquals(1, engine.eval("pojo.intValue"));
+        pojo.setIntValue(2);
+        assertEquals(2, engine.eval("pojo.intValue"), "a cached lookup must not cache the value");
+        // a public field, resolved by a different branch of the same cache
+        assertEquals("instance-field", engine.eval("pojo.instanceField"));
+        // and a method member is still callable
+        assertEquals(2, engine.eval("pojo.getIntValue()"));
+    }
+
+    // A property that does not exist is an ordinary answer (undefined), not an error — this is
+    // the `karate.properties['nope'] || 'default'` shape, and it must not depend on an
+    // exception being built and swallowed. Repeated because the miss is remembered too.
+    @Test
+    void testMissingMemberIsUndefinedNotAnError() {
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        engine.put("pojo", new DemoPojo());
+        assertNull(engine.eval("pojo.noSuchThing"));
+        assertNull(engine.eval("pojo.noSuchThing"));
+        assertEquals("fallback", engine.eval("pojo.noSuchThing || 'fallback'"));
+        // an absent Map key takes the same route, and the Map's own methods still resolve
+        engine.put("map", new java.util.HashMap<>(java.util.Map.of("a", 1)));
+        assertNull(engine.eval("map['nope']"));
+        assertEquals(1, engine.eval("map['a']"));
+        assertEquals(1, engine.eval("map.size()"));
+    }
+
+    @Test
+    void testJsFunctionViaEngineEvalSupportsFunctionalInterface() {
+        // Function returned to Java via engine.eval() (i.e. wrapped as
+        // JsFunctionWrapper) also satisfies the functional interfaces.
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        Object fn = engine.eval("(function(x) { return x * 2 })");
+        assertInstanceOf(java.util.function.Function.class, fn);
+        @SuppressWarnings("unchecked")
+        java.util.function.Function<Object, Object> javaFn = (java.util.function.Function<Object, Object>) fn;
+        assertEquals(10, ((Number) javaFn.apply(5)).intValue());
+    }
+
+    @Test
+    void testJavaConstructorArgsCrossTheBoundaryLikeMethodArgs() {
+        // A Java call's byte[] return reaches JS as a Uint8Array; handing it
+        // straight to a Java constructor has to unwrap it back to byte[] for
+        // overload resolution, exactly as an ordinary Java method call would.
+        assertEquals("sample", eval("new java.lang.String(java.util.Base64.getDecoder().decode('c2FtcGxl'), 'UTF-8')"));
+        assertEquals("sample", eval("var JString = Java.type('java.lang.String');"
+                + " var Base64 = Java.type('java.util.Base64');"
+                + " new JString(Base64.getDecoder().decode('c2FtcGxl'), 'UTF-8')"));
+    }
+
+    @Test
+    void testJavaConstructorUndefinedArgBecomesNull() {
+        assertNull(eval("var DemoPojo = Java.type('io.karatelabs.js.DemoPojo'); new DemoPojo(undefined).stringValue"));
+    }
+
+    @Test
+    void testJavaConstructorUnwrapsJsDateArg() {
+        // AtomicReference takes Object, so the constructor matches either way — what
+        // is being pinned is that what lands inside is the unwrapped java.util.Date.
+        Object ref = eval("new java.util.concurrent.atomic.AtomicReference(new Date(0))");
+        Object held = ((java.util.concurrent.atomic.AtomicReference<?>) ref).get();
+        assertInstanceOf(Date.class, held);
+        assertEquals(0L, ((Date) held).getTime());
+    }
+
+    @Test
+    void testJavaConstructorAcceptsJsArrayAndObject() {
+        assertEquals(2, eval("new java.util.ArrayList([1, 2]).size()"));
+        assertEquals(1, eval("new java.util.HashMap({a: 1}).get('a')"));
+    }
+
+    @Test
+    void testThrowingJavaConstructorSurfacesItsOwnMessage() {
+        Exception ex = assertThrows(Exception.class, () -> eval("new java.math.BigDecimal('x')"));
+        assertFalse(ex.getMessage().contains("is not a constructor"), ex.getMessage());
+        assertTrue(ex.getMessage().contains("Character x"), "expected the NumberFormatException text in: " + ex.getMessage());
+        Exception uri = assertThrows(Exception.class, () -> eval("new java.net.URI('::bad')"));
+        assertTrue(uri.getMessage().contains("::bad"), "expected the URISyntaxException text in: " + uri.getMessage());
+    }
+
+    @Test
+    void testJavaConstructorWithNoMatchingOverload() {
+        Exception ex = assertThrows(Exception.class, () -> eval("new java.math.BigDecimal(true, false)"));
+        assertTrue(ex.getMessage().contains("has no constructor matching ("),
+                "expected the overload-mismatch text in: " + ex.getMessage());
+    }
+
+    @Test
+    void testNonInstantiableJavaClassIsNotAConstructor() {
+        // "is not a constructor" is reserved for a class that cannot be
+        // instantiated at all, so it stays distinct from an overload miss.
+        Exception ex = assertThrows(Exception.class, () -> eval("new java.io.InputStream()"));
+        assertTrue(ex.getMessage().contains("is not a constructor"), ex.getMessage());
+        Exception iface = assertThrows(Exception.class, () -> eval("new java.lang.Runnable()"));
+        assertTrue(iface.getMessage().contains("is not a constructor"), iface.getMessage());
+        Exception noPublic = assertThrows(Exception.class, () -> eval("new java.lang.Math()"));
+        assertTrue(noPublic.getMessage().contains("is not a constructor"), noPublic.getMessage());
+    }
+
+    @Test
+    void testJavaMethodsOnJsStringsAndNumbers() {
+        assertEquals(96354, eval("'abc'.hashCode()"));
+        assertEquals(true, eval("'ABC'.equalsIgnoreCase('abc')"));
+        // the same method reached by the shapes that already resolved
+        assertEquals(96354, eval("'abc'['hashCode']()"));
+        assertEquals(96354, eval("var f = 'abc'.hashCode; f()"));
+        assertEquals(96354, eval("var JString = Java.type('java.lang.String'); new JString('abc').hashCode()"));
+        assertEquals(96354, eval("Java.type('java.lang.String').valueOf('abc').hashCode()"));
+        assertEquals(5, eval("var JInteger = Java.type('java.lang.Integer'); new JInteger(5).intValue()"));
+        assertEquals(5, eval("(5).intValue()"));
+    }
+
+    @Test
+    void testWithoutABridgeJavaMethodsOnStringsStayInvisible() {
+        // the whole string-to-Java route is bridge-only — pure JS is untouched
+        engine = new Engine();
+        assertNull(engine.eval("'abc'.hashCode"));
+        Exception ex = assertThrows(Exception.class, () -> engine.eval("'abc'.hashCode()"));
+        assertTrue(ex.getMessage().contains("is not a function"), ex.getMessage());
+    }
+
+    @Test
+    void testJsPrototypeWinsOverJavaMethodsOfTheSameName() {
+        match(eval("'a,b'.split(',')"), "['a', 'b']");
+        assertEquals(3, eval("'abc'.length"));
+        assertEquals("x", eval("' x '.trim()"));
+        // Java's replaceAll takes a regex, JS' takes a literal — JS wins
+        assertEquals("acc", eval("'abc'.replaceAll('b','c')"));
+        assertNull(eval("'abc'.foo"));
+        assertEquals(false, eval("'hashCode' in Object('abc')"));
+    }
+
+    @Test
+    void testJavaMethodsOnBigIntResolveLikeTheOtherPrimitives() {
+        assertEquals(4, eval("(10n).bitLength()"));
+        assertEquals("a", eval("(10n).toString(16)"));
+    }
+
+    @Test
+    void testForwardingPathsMarshalJavaMethodArgs() {
+        // call / apply / bind / Reflect.apply bypass the interpreter's call
+        // site, so `undefined` has to become null on each of them too
+        String isNull = "var isNull = Java.type('java.util.Objects').isNull; ";
+        assertEquals(true, eval(isNull + "isNull.call(null, undefined)"));
+        assertEquals(true, eval(isNull + "isNull.apply(null, [undefined])"));
+        assertEquals(true, eval(isNull + "isNull.bind(null, undefined)()"));
+        assertEquals(true, eval(isNull + "isNull.bind(null)(undefined)"));
+        assertEquals(true, eval(isNull + "Reflect.apply(isNull, null, [undefined])"));
+        assertEquals(false, eval(isNull + "Reflect.apply(isNull, null, ['x'])"));
+        // a hole in the argument array is undefined, so null on the Java side
+        assertEquals(true, eval(isNull + "isNull.apply(null, new Array(1))"));
+        assertEquals(true, eval(isNull + "Reflect.apply(isNull, null, [,])"));
+    }
+
+    @Test
+    void testForwardingLeavesTheHostsArrayAlone() {
+        // a bound Java method handed straight to Java gets the host's own array;
+        // the marshalled copy must not leak back into it
+        JavaCallable bound = (JavaCallable) eval("Java.type('java.util.Objects').isNull.bind(null)");
+        Object[] hostArgs = {Terms.UNDEFINED};
+        assertEquals(true, bound.call(null, hostArgs));
+        assertSame(Terms.UNDEFINED, hostArgs[0]);
+        // a typed host array as argumentsList: the copy has to admit the converted value
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        engine.put("arr", new JsUndefined[]{Terms.UNDEFINED});
+        assertEquals(true, engine.eval("Reflect.apply(Java.type('java.util.Objects').isNull, null, arr)"));
+        assertNull(engine.eval("Reflect.construct(Java.type('io.karatelabs.js.DemoPojo'), arr).stringValue"));
+    }
+
+    @Test
+    void testReflectConstructOnAJavaType() {
+        assertEquals("sample", eval("Reflect.construct(Java.type('java.lang.String'),"
+                + " [java.util.Base64.getDecoder().decode('c2FtcGxl'), 'UTF-8'])"));
+        assertEquals(2, eval("Reflect.construct(Java.type('java.util.ArrayList'), [[1, 2]]).size()"));
+        assertNull(eval("Reflect.construct(Java.type('io.karatelabs.js.DemoPojo'), [undefined]).stringValue"));
+        // an explicit newTarget that is the same Java type is the default spelled out
+        assertEquals("abc", eval("var J = Java.type('java.lang.String'); Reflect.construct(J, ['abc'], J)"));
+        // only a Java type is promoted; a plain object is still not a constructor under a bridge
+        Exception ex = assertThrows(Exception.class, () -> eval("Reflect.construct({}, [])"));
+        assertTrue(ex.getMessage().contains("not a constructor"), ex.getMessage());
+    }
+
+    @Test
+    void testJsPropertyHoldingUndefinedStillShadowsTheJavaMember() {
+        // prototypes are shared across engines, so restore them afterwards
+        try {
+            String shadow = "String.prototype.hashCode = undefined; ";
+            assertNull(eval(shadow + "'abc'.hashCode"));
+            Exception ex = assertThrows(Exception.class, () -> eval(shadow + "'abc'.hashCode()"));
+            assertTrue(ex.getMessage().contains("is not a function"), ex.getMessage());
+            String getter = "Object.defineProperty(String.prototype, 'isBlank',"
+                    + " { get: function() { return undefined }, configurable: true }); ";
+            assertNull(eval(getter + "'abc'.isBlank"));
+            assertNull(eval(getter + "new String('abc').isBlank"));
+            Exception getterCall = assertThrows(Exception.class, () -> eval(getter + "'abc'.isBlank()"));
+            assertTrue(getterCall.getMessage().contains("is not a function"), getterCall.getMessage());
+        } finally {
+            eval("delete String.prototype.hashCode; delete String.prototype.isBlank");
+        }
+        assertEquals(96354, eval("'abc'.hashCode()"));
+        assertEquals(false, eval("'abc'.isBlank()"));
+    }
+
+    @Test
+    void testJsPropertyHoldingNullShadowsAJavaMapMember() {
+        // a raw Map receiver probes Object.prototype; an inherited null must
+        // read as null, not fall through to Map.size / Map.isEmpty on the Java side
+        try {
+            engine = new Engine();
+            engine.setExternalBridge(bridge);
+            engine.put("map", new java.util.HashMap<>(java.util.Map.of("a", 1)));
+            assertNull(engine.eval("Object.prototype.size = null; map.size"));
+            assertNull(engine.eval("Object.prototype.isEmpty = undefined; map.isEmpty"));
+            Exception ex = assertThrows(Exception.class, () -> engine.eval("map.size()"));
+            assertTrue(ex.getMessage().contains("is not a function"), ex.getMessage());
+            assertEquals(1, engine.eval("map.get('a')"));
+        } finally {
+            eval("delete Object.prototype.size; delete Object.prototype.isEmpty");
+        }
+        engine = new Engine();
+        engine.setExternalBridge(bridge);
+        engine.put("map", new java.util.HashMap<>(java.util.Map.of("a", 1)));
+        assertEquals(1, engine.eval("map.size()"));
+        assertEquals(false, engine.eval("map.isEmpty()"));
+    }
+
+    @Test
+    void testNewOnAJavaTypeReachedByValue() {
+        // the callee is a parenthesised expression, not a name, so it arrives
+        // as the raw Java type rather than through the named wrap sites
+        assertEquals("abc", eval("new (Java.type('java.lang.String'))('abc')"));
+        assertEquals(96354, eval("new (Java.type('java.lang.String'))('abc').hashCode()"));
+        assertEquals(2, eval("var pick = true; new (pick ? Java.type('java.util.ArrayList') : Java.type('java.util.LinkedList'))([1, 2]).size()"));
+    }
+
+}

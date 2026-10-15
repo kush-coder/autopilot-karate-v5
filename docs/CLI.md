@@ -1,0 +1,827 @@
+# Karate v2 CLI Design
+
+This document describes the CLI architecture for Karate v2, including subcommand design and integration with the Rust launcher.
+
+> See also: [DESIGN.md](./DESIGN.md) | [Rust Launcher Spec](../../karate-cli/docs/spec.md)
+
+---
+
+## Architecture Overview
+
+Karate v2 CLI has a two-tier architecture:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Rust Launcher (karate binary)                              │
+│  - Management commands: setup, update, config, doctor       │
+│  - Delegates runtime commands to JVM                        │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼ delegates
+┌─────────────────────────────────────────────────────────────┐
+│  Java CLI (karate-core Main.java)                           │
+│  - Runtime commands: run, mock, init, clean                 │
+│  - Receives args from Rust launcher                         │
+│  - Uses PicoCLI for parsing                                 │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Key principle:** The Rust launcher handles installation/management; the Java CLI handles test execution and runtime features.
+
+---
+
+## Subcommand Design
+
+### Command Hierarchy
+
+```
+karate <command> [options] [args]
+
+Runtime Commands (implemented in Java):
+  run              Run Karate tests
+  mock             Start mock server
+  clean            Clean output directories
+
+Management Commands (implemented in Rust):
+  setup            First-run wizard
+  update           Check for updates
+  config           View/edit configuration
+  init             Initialize new project (interactive)
+  doctor           System diagnostics
+  version          Show version info
+```
+
+### Java CLI Responsibility
+
+The Java CLI (`io.karatelabs.Main`) implements:
+
+| Command | Description | Status |
+|---------|-------------|--------|
+| `run` | Run Karate tests | Priority 1 |
+| `clean` | Clean output directories | Priority 2 |
+| `mock` | Start mock server | Available |
+
+> **MCP:** there is deliberately no `karate mcp` in core — the MCP server (LLM integration) is part of
+> **karate-agent**, the commercial layer in the open-core model (`karate serve` exposes `/api/mcp`).
+
+> **Note:** `init` is implemented in Rust (not Java) because it needs to scaffold different project types (Maven, Gradle, standalone) before Java/JVM is involved. See [Rust Launcher Spec](../../karate-cli/docs/spec.md).
+
+---
+
+## The `run` Command
+
+### Synopsis
+
+```bash
+karate run [options] [paths...]
+```
+
+### Behavior
+
+1. **With paths:** Run specified feature files/directories (inherits other settings from pom). Positional paths and `-P` **replace** the pom's `paths` — they are never added to them, so each feature runs exactly once
+2. **Without paths:** Look for `karate-pom.json` in current directory
+3. **With `--pom`:** Use specified project file
+4. **With `--no-pom`:** Ignore `karate-pom.json` even if present
+
+### Supported File Types
+
+| Pattern | Description |
+|---------|-------------|
+| `*.feature` | Gherkin feature files (standard Karate tests) |
+| `*.karate.js` | JavaScript scripts with full `karate.*` API |
+
+**JavaScript scripts (`*.karate.js`)** are ideal for:
+- Complex async operations with callbacks
+- Process management (`karate.fork()`, `karate.exec()`)
+- Custom test harnesses and orchestration
+- Scenarios that benefit from native JS control flow
+
+```bash
+# Run feature files
+karate run tests/users.feature
+
+# Run JS scripts
+karate run tests/setup.karate.js
+
+# Run mixed (discovers both .feature and .karate.js)
+karate run tests/
+
+# Run multiple paths from different packages in a single run
+# (useful when positional args are awkward, e.g. via -Dkarate.options in Maven)
+karate run -P classpath:com/comp/commission -P classpath:com/comp/statement
+
+# Comma-separated form — tight for Maven: -Dkarate.options="--path a,b"
+karate run --path classpath:com/comp/commission,classpath:com/comp/statement
+```
+
+### Running Specific Scenarios by Line Number
+
+You can run specific scenarios by appending `:LINE` to the feature file path:
+
+```bash
+# Run scenario at line 10
+karate run tests/users.feature:10
+
+# Run multiple scenarios (lines 10 and 25)
+karate run tests/users.feature:10:25
+
+# Works with classpath resources too
+karate run classpath:features/users.feature:10
+```
+
+**Line number matching:**
+
+| Line Points To | What Runs |
+|----------------|-----------|
+| `Scenario:` declaration | That specific scenario |
+| Any step within a scenario | That scenario |
+| `Scenario Outline:` declaration | All examples from that outline |
+| `Examples:` table | All examples from that table |
+
+**Note:** Line number selection bypasses tag filters (`@ignore`, `@env`, etc.), allowing you to run specific scenarios regardless of their tags. This is useful for debugging or running individual tests from an IDE.
+
+### Running Specific Scenarios by Name
+
+Use `-n, --name` to select scenarios by their author-assigned name. Unlike line numbers, names are stable under edits and auto-formatting — IDE plugins can use them as a line-independent identifier for gutter/run-config invocations.
+
+```bash
+# Run a single scenario by name
+karate run -n "Login happy path" tests/users.feature
+
+# The name filter scans all features in the run, so it works across a directory
+karate run -n "Login happy path" tests/
+
+# Combine with :LINE to narrow to one row of a Scenario Outline
+karate run -n "Parameterized check" tests/outline.feature:9
+```
+
+**Matching semantics:**
+
+- **Exact match**, not regex. Leading/trailing whitespace is trimmed on both sides, so `-n " Login "` still matches `Login`.
+- **Duplicate names run all matches** — if two scenarios share a name, both run (consistent with how a tag filter selects every scenario carrying the tag).
+- **Scenario Outlines:** the name matches the outline and runs all its rows. For row-level targeting, combine `-n` with `:LINE` (intersection semantics — both must match).
+- **Bypasses tag filters** (`@ignore`, `@env`) — same as `:LINE`. Running a specific scenario by name always wins over filters.
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `-P, --path <path>` | Feature file or directory to run — repeatable and/or comma-separated, combines with positional paths |
+| `-t, --tags <expr>` | Tag expression filter (e.g., `@smoke`, `~@slow`) |
+| `-T, --threads <n>` | Parallel thread count (default: 1) |
+| `-e, --env <name>` | Karate environment (karate.env) |
+| `-n, --name <name>` | Scenario name filter (exact, whitespace-trimmed); bypasses tag filters |
+| `-o, --output <dir>` | Output directory (default: target/karate-reports) |
+| `-w, --workdir <dir>` | Working directory for relative paths |
+| `-g, --configdir <dir>` | Directory containing karate-config.js |
+| `-p, --pom <file>` | Path to project file (default: karate-pom.json) |
+| `--no-pom` | Ignore karate-pom.json even if present |
+| `-C, --clean` | Clean output directory before running |
+| `-D, --dryrun` | Skip step execution; @setup scenarios still run. See [Dry Run](#dry-run). |
+| `--no-color` | Disable colored output. Color is also environment-driven: a set `NO_COLOR` env var disables it (https://no-color.org/ — agents and CIs commonly export `NO_COLOR=1`), a non-`0` `FORCE_COLOR` forces it on, and otherwise `TERM`/`COLORTERM` are consulted. |
+| `--log-report <level>` | Threshold for what gets captured into reports (HTML/JSONL/Cucumber/JUnit). Default: `debug`. |
+| `--log-console <level>` | Threshold for SLF4J/console output via Logback: `trace`/`debug`/`info`/`warn`/`error`/`off` (alias `none`). Default: `info`. Use `off`/`none` to silence the console completely (HTTP traffic still reaches the HTML report — see [DESIGN.md § Logging](./DESIGN.md#two-thresholds-report-vs-console)). |
+| `-f, --format <formats>` | Output formats (see below) |
+| `--listener <classes>` | Comma-separated RunListener class names |
+| `--listener-factory <classes>` | Comma-separated RunListenerFactory class names |
+
+### Output Formats
+
+Control report output with `-f/--format`. Comma-separated, use `~` to disable:
+
+| Format | Description | Default |
+|--------|-------------|---------|
+| `html` | Karate HTML reports | On |
+| `cucumber:json` | Per-feature Cucumber JSON (for Allure, ReportPortal) | Off |
+| `junit:xml` | JUnit XML reports | Off |
+| `karate:jsonl` | JSONL event stream (for CI/CD, IDEs) | Off |
+
+**Examples:**
+
+```bash
+# Enable Cucumber JSON (HTML still on by default)
+karate run -f cucumber:json features/
+
+# Enable multiple formats
+karate run -f cucumber:json,junit:xml features/
+
+# Disable HTML, enable Cucumber JSON
+karate run -f ~html,cucumber:json features/
+
+# Only JSONL output (disable HTML)
+karate run -f ~html,karate:jsonl features/
+```
+
+### Log Masking
+
+Log masking is configured per-scenario or globally via `configure logging = { mask: ... }` in feature files or `karate-config.js`. There is no CLI flag — masks are declarative and live with the test code that knows what's sensitive.
+
+```javascript
+// karate-config.js — applies to all scenarios in this run
+configure logging = {
+  mask: {
+    headers:    ['Authorization', 'Cookie', 'X-Api-Key'],
+    jsonPaths:  ['$.password', '$..token'],
+    patterns:   [{ regex: '\\bBearer [A-Za-z0-9._-]+\\b', replacement: 'Bearer ***' }],
+    replacement: '***',
+    enableForUri: function(uri) { return uri.indexOf('/health') < 0 }
+  }
+}
+```
+
+See [DESIGN.md § Logging](./DESIGN.md#logging) for the full shape.
+
+### Examples
+
+```bash
+# Run with auto-detected karate-pom.json
+karate run
+
+# Run specific paths (inherits env, threads, etc. from pom)
+karate run src/test/features
+
+# Run with explicit pom file
+karate run --pom my-project.json
+
+# Run ignoring karate-pom.json
+karate run --no-pom src/test/features
+
+# Run with options
+karate run -t @smoke -e dev -T 5 src/test/features
+
+# Run from different working directory
+karate run -w /home/user/project src/test/features
+```
+
+---
+
+## Project File
+
+### Canonical Name: `karate-pom.json`
+
+The project file name is `karate-pom.json` (inspired by Maven's POM concept). When `karate run` is invoked, it automatically loads `karate-pom.json` from the current directory (or workdir if specified).
+
+> **Note:** `karate-pom.json` is designed for **non-Java teams** using the standalone CLI without Maven/Gradle. Java teams should use `Runner.Builder` directly with system properties for CI/CD overrides.
+
+> **Note:** This is distinct from `karate-config.js` which handles runtime configuration (baseUrl, auth, etc.). The pom file defines *how* to run tests (paths, tags, threads, output).
+
+### Schema
+
+```json
+{
+  "paths": ["src/test/features/", "classpath:features/"],
+  "tags": ["@smoke", "~@slow"],
+  "env": "dev",
+  "threads": 5,
+  "scenarioName": "Login happy path",
+  "configDir": "src/test/resources",
+  "workingDir": "/home/user/project",
+  "dryRun": false,
+  "clean": false,
+  "output": {
+    "dir": "target/karate-reports",
+    "html": true,
+    "junitXml": false,
+    "cucumberJson": false,
+    "jsonLines": false
+  },
+  "logging": {
+    "report": "debug",
+    "console": "info"
+  },
+  "listeners": ["com.example.MyListener"],
+  "listenerFactories": ["com.example.MyListenerFactory"]
+}
+```
+
+### Path Resolution
+
+**Important:** `outputDir` and `workingDir` serve different purposes and are **independent**:
+
+| Setting | Purpose | Relative To |
+|---------|---------|-------------|
+| `workingDir` | Resolves feature paths, config files, and pom location | Process current directory |
+| `output.dir` | Where reports are written | Process current directory (NOT workingDir) |
+
+This means if you set `workingDir: "src/test/java"` and `output.dir: "target/karate-reports"`, reports go to `./target/karate-reports` (not `./src/test/java/target/karate-reports`).
+
+**Feature paths vs file references.** A path you *invoke* — a positional feature path, `workingDir`, `configDir` — keeps ordinary operating-system meaning: a leading `/` is the filesystem root. A path a test *points at* — `read('/data/x.json')`, `karate.callSingle('/mock/start.js')` — is a **reference**, and there a leading `/` means the **project root**, never a host path; spell a genuine host path `file:/abs/path`. The project root is the directory `karate-config.js` was found in (for a Java build, the classpath root); a `classpath:` reference asks the classloader first and then falls back under that root, and a project can declare a different resource dir with one line in `karate-boot.js`:
+
+```js
+boot.classpath('src/test/resources');
+```
+
+That declaration also re-anchors `workingDir` on the project root when none was set explicitly, so a project resolves identically whether it is run by the JVM or served as a folder.
+
+**Best practice:** When the process working directory may vary (CI/CD, IDE integrations), use **absolute paths** for `output.dir`:
+
+```json
+{
+  "workingDir": "/home/user/project/src/test/java",
+  "output": {
+    "dir": "/home/user/project/target/karate-reports"
+  }
+}
+```
+
+### Precedence
+
+CLI arguments override pom file values:
+
+```
+CLI flags → karate-pom.json → defaults
+```
+
+The pom is always loaded if present, and CLI args override specific values. Use `--no-pom` to ignore it entirely.
+
+---
+
+## System Properties & Environment Variables
+
+`Runner.Builder.parallel()` reads a small set of system properties and environment variables just before running, and **overrides** Builder values with them. This preserves the v1 contract used by Maven and Gradle teams: a Runner class hard-codes its defaults (paths, tags, env), and CI passes `-Dkarate.options="--tags @smoke"` to run a subset with zero code change.
+
+### Supported overrides
+
+| Sysprop | Env var fallback | Effect |
+|---------|------------------|--------|
+| `karate.options` | `KARATE_OPTIONS` | Full option string, parsed with the `karate run` grammar. Overrides paths, `-P`, tags, threads, env, name, configdir, output, dryrun, formats, log levels |
+| `karate.env` | `KARATE_ENV` | Override karate environment |
+| `karate.config.dir` | `KARATE_CONFIG_DIR` | Override karate-config.js directory |
+| `karate.output.dir` | — | Override report output directory (honored via `FileUtils`) |
+
+Examples:
+
+```bash
+# Override a Runner class's hard-coded tags from Maven
+mvn test -Dtest=MyKarateTest -Dkarate.options="--tags @smoke"
+
+# Multiple overrides in one string
+mvn test -Dtest=MyKarateTest -Dkarate.options="--tags @smoke --env qa --threads 4"
+
+# Maven user override using individual env sysprop (terse)
+mvn test -Dtest=MyKarateTest -Dkarate.env=qa
+
+# Non-Java team using the standalone CLI with env var
+KARATE_OPTIONS="--tags @smoke" karate run features/
+KARATE_ENV=qa karate run features/
+```
+
+### Precedence (highest → lowest)
+
+```
+karate.options (sysprop)
+  └─ KARATE_OPTIONS (env)            # only if sysprop absent
+    └─ individual sysprops (karate.env, karate.config.dir)
+      └─ KARATE_ENV / KARATE_CONFIG_DIR (env)   # fallback
+        └─ karate.output.dir
+          └─ Runner.Builder values (programmatic)
+            └─ karate-pom.json
+              └─ defaults
+```
+
+Rules:
+- If **both** `karate.options` sysprop and `KARATE_OPTIONS` env var are set, the sysprop wins.
+- If `karate.options` sets `--env qa` **and** `-Dkarate.env=dev` is also set, `karate.options` wins (it's applied last).
+- Paths in `karate.options` **replace** Builder paths entirely (v1 parity) — not additive.
+- A malformed `karate.options` string is logged at WARN and ignored; the run proceeds with Builder defaults rather than crashing.
+
+### Logging
+
+- INFO: `using system property 'karate.options': --tags @smoke`
+- INFO: `karate.options applied: tags=[@smoke], env=qa, threads=4` — one-line summary of what actually took effect
+- DEBUG: per-field before → after diff, e.g. `tags: ['@wip'] (Builder) → ['@smoke'] (karate.options)` — useful when troubleshooting "why is the wrong tag running"
+- WARN: `invalid karate.options ignored: <message>` on parse errors
+
+### What `karate.options` can contain
+
+The option string uses the **same grammar as the `karate run` CLI**. Common flags:
+
+| Flag | Purpose |
+|------|---------|
+| positional paths or `-P, --path` | Feature files/dirs (replaces Builder paths) |
+| `-t, --tags` | Tag filter |
+| `-T, --threads` | Parallel thread count |
+| `-e, --env` | Karate environment |
+| `-n, --name` | Scenario name filter (exact, whitespace-trimmed) |
+| `-o, --output` | Output directory |
+| `-g, --configdir` | Directory containing `karate-config.js` |
+| `-f, --format` | Output formats (`html`, `cucumber:json`, `junit:xml`, `karate:jsonl`; prefix `~` to disable) |
+| `-D, --dryrun` | Dry-run |
+| `--log-report` | Threshold for report buffer capture |
+| `--log-console` | Threshold for SLF4J/console output |
+
+CLI-lifecycle flags (`--no-pom`, `-p/--pom`, `-w/--workdir`, `-C/--clean`, `-B/--backup-reportdir`, `--listener`, `--listener-factory`) are intentionally **ignored** when set via `karate.options` — they're orchestration concerns specific to invoking the CLI, not Builder state.
+
+### Paths with spaces
+
+The option string is tokenized POSIX-shell-style, so inner double/single quotes survive and whitespace is preserved. For multiple paths that contain spaces:
+
+```bash
+mvn test -Dtest=UsersTest '-Dkarate.options=-P "src/features/happy path" -P "src/features/edge cases"'
+```
+
+Outer single quotes stop the shell from interpreting the inner doubles; inner doubles group each path into a single token inside the handler.
+
+---
+
+## Implementation Plan
+
+### Phase 1: Subcommand Refactoring
+
+Refactor `Main.java` to use PicoCLI subcommands:
+
+```java
+@Command(
+    name = "karate",
+    subcommands = {
+        RunCommand.class,
+        CleanCommand.class,
+    }
+)
+public class Main implements Callable<Integer> {
+
+    @Parameters(arity = "0..*", hidden = true)
+    List<String> unknownArgs;
+
+    @Override
+    public Integer call() {
+        // No subcommand specified
+        if (unknownArgs != null && !unknownArgs.isEmpty()) {
+            // Legacy: treat args as paths, delegate to run
+            return new RunCommand().runWithPaths(unknownArgs);
+        }
+        // Look for karate-pom.json in cwd
+        if (Files.exists(Path.of("karate-pom.json"))) {
+            return new RunCommand().call();
+        }
+        // Show help
+        CommandLine.usage(this, System.out);
+        return 0;
+    }
+}
+```
+
+### Phase 2: RunCommand
+
+Extract current `Main.java` logic into `RunCommand`:
+
+```java
+@Command(name = "run", description = "Run Karate tests")
+public class RunCommand implements Callable<Integer> {
+
+    public static final String DEFAULT_POM_FILE = "karate-pom.json";
+
+    @Parameters(description = "Feature files or directories", arity = "0..*")
+    List<String> paths;
+
+    @Option(names = {"-p", "--pom"}, description = "Project file (default: karate-pom.json)")
+    String pomFile;
+
+    @Option(names = {"--no-pom"}, description = "Ignore karate-pom.json")
+    boolean noPom;
+
+    // ... other options ...
+
+    @Override
+    public Integer call() {
+        // Load pom if present (unless --no-pom)
+        if (!noPom) {
+            loadPom();
+        }
+        // CLI args override pom values
+        // ... rest of execution
+    }
+}
+```
+
+### Phase 3: CleanCommand
+
+```java
+@Command(name = "clean", description = "Clean output directories")
+public class CleanCommand implements Callable<Integer> {
+
+    @Option(names = {"-o", "--output"}, description = "Output directory to clean")
+    String outputDir;
+
+    @Override
+    public Integer call() {
+        // Cleans:
+        // - karate-reports/
+        // - karate-reports_*/ (backup directories)
+        // - karate-temp/ (Chrome user data, callSingle cache, etc.)
+        return 0;
+    }
+}
+```
+
+### Temp Directory Structure
+
+Karate uses a standardized temp directory for runtime artifacts:
+
+```
+target/                          (or build/ for Gradle)
+├── karate-reports/              # Test reports (HTML, JSON, etc.)
+├── karate-reports_20260125_*/   # Backup directories (when backupReportDir enabled)
+└── karate-temp/                 # Runtime temp files (cleaned by 'karate clean')
+    ├── chrome-abc12345/         # Chrome/browser user data directories
+    └── cache/                   # callSingle disk cache files
+```
+
+**Build directory detection:** Karate automatically detects Maven vs Gradle projects:
+- Checks for `build.gradle`, `build.gradle.kts`, `settings.gradle*` → uses `build/`
+- Checks for `pom.xml` → uses `target/`
+- Falls back to checking existing `build/` or `target/` directories
+- Override with system property: `-Dkarate.output.dir=custom/path`
+
+---
+
+## Backward Compatibility
+
+### Legacy Behavior
+
+For backward compatibility, bare arguments (no subcommand) are treated as paths:
+
+| Invocation | Interpretation |
+|------------|----------------|
+| `karate run src/test` | Explicit run command |
+| `karate src/test` | Legacy → delegates to `run` |
+| `karate` | Auto-load `karate-pom.json` or show help |
+| `karate -t @smoke src/test` | Legacy with options → delegates to `run` |
+
+### Migration Path
+
+1. **v2.0:** Support both `karate run` and legacy `karate <paths>`
+2. **v2.1+:** Deprecation warnings for legacy usage
+3. **v3.0:** Consider removing legacy support
+
+---
+
+## Integration with Rust Launcher
+
+The Rust launcher (see [spec.md](../../karate-cli/docs/spec.md)) delegates runtime commands to the Java CLI:
+
+```
+karate run src/test/features -t @smoke
+    │
+    ▼ Rust launcher
+java -jar ~/.karate/dist/karate-2.0.0.jar run src/test/features -t @smoke
+    │
+    ▼ Java CLI
+Main.java parses and executes
+```
+
+### Classpath Construction
+
+The Rust launcher constructs the classpath in this order:
+- Karate fatjar (`~/.karate/dist/karate-X.X.X.jar`)
+- Extension JARs (`~/.karate/ext/*.jar`)
+- Project-local extensions (`.karate/ext/*.jar`)
+- Extra classpath entries from `--cp` flags
+
+The `--cp` global flag allows extensions (e.g. IDE integrations) to contribute proprietary JARs:
+```bash
+karate --cp /path/to/karate-ide-v2.jar run features/
+karate --cp /path/to/a.jar --cp /path/to/b.jar run features/
+```
+
+### JVM Options
+
+Configured via `karate-cli.json`:
+```json
+{
+  "jvm_opts": "-Xmx512m"
+}
+```
+
+---
+
+## The `mock` Command
+
+Start a mock server from one or more mock feature files (`-m` is required — features are not
+positional args):
+
+```bash
+karate mock -m mocks/payments.feature -p 8080
+karate mock -m a.feature -m b.feature -p 8443 --ssl --cert cert.pem --key key.pem
+```
+
+| Option | Description |
+|--------|-------------|
+| `-m, --mock <file>` | Mock feature file (repeatable, required) |
+| `-p, --port <port>` | Port to listen on (default: 0 = dynamic) |
+| `-s, --ssl` | Enable HTTPS |
+| `-c, --cert <file>` | SSL certificate (PEM) |
+| `-k, --key <file>` | SSL private key (PEM) |
+| `--path-prefix <prefix>` | URL path prefix to strip from incoming requests |
+| `-W, --watch` | Hot-reload when feature files change |
+| `--max-initial-line-length <bytes>` | Max request line length (default: 4096; over it: 414) |
+| `--max-header-size <bytes>` | Max total request header size (default: 8192; over it: 431) |
+| `--max-content-length <bytes>` | Max request body size (default: 1048576; over it: 413) |
+
+> **Trusted networks only.** `karate mock` listens on all network interfaces, so other machines that can reach the host can call it. That suits CI and shared dev environments, but never run a mock where untrusted clients can reach it. A mock feature is trusted code. See [MOCKS.md](./MOCKS.md#overview) and [SECURITY.md](../SECURITY.md).
+
+---
+
+## Future Commands (Java)
+
+> **Note:** `karate init` is implemented in Rust. See [Rust Launcher Spec](../../karate-cli/docs/spec.md) for details.
+
+### `karate perf`
+
+Run performance tests with Gatling (requires karate-gatling-bundle.jar in `~/.karate/ext/`):
+
+```bash
+karate perf --users 10 --duration 30s features/
+```
+
+See [GATLING.md](./GATLING.md) for full documentation.
+
+---
+
+## CLI Extension SPI (CommandProvider)
+
+Modules can register additional subcommands via ServiceLoader:
+
+```java
+// io.karatelabs.cli.CommandProvider
+public interface CommandProvider {
+    String getName();           // e.g., "perf"
+    String getDescription();    // e.g., "Run performance tests"
+    Object getCommand();        // PicoCLI command instance
+}
+```
+
+**Registration:** Create `META-INF/services/io.karatelabs.cli.CommandProvider` with implementation class name.
+
+**Discovery:** Main.java discovers providers on classpath:
+
+```java
+ServiceLoader<CommandProvider> providers = ServiceLoader.load(CommandProvider.class);
+for (CommandProvider provider : providers) {
+    spec.addSubcommand(provider.getName(), provider.getCommand());
+}
+```
+
+**Use case:** The karate-gatling module uses this to add the `perf` subcommand when its JAR is in `~/.karate/ext/`.
+
+---
+
+## TODO
+
+### Two-Way JSON Configuration
+
+Currently `karate-pom.json` is read-only (JSON → config). Implement bidirectional conversion:
+
+1. **`KaratePom.toJson()`** - serialize config back to JSON
+2. **`RunCommand.toPom()`** - convert CLI args to KaratePom object
+3. **`karate config --export`** - dump effective merged config as JSON
+4. **`karate config --show`** - display current effective configuration
+
+**Use cases:**
+- IDE tooling for programmatic config read/write
+- `karate init` generating starter `karate-pom.json` with user's CLI preferences
+- Debugging: see what config is actually being used after CLI + pom merge
+
+---
+
+## Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Success (all tests passed) |
+| `1` | Test failures |
+| `2` | Configuration error |
+| `3` | Runtime error |
+
+---
+
+## File Structure
+
+After subcommand refactoring:
+
+```
+io.karatelabs/
+├── Main.java              # Parent command, delegates to subcommands
+└── cli/
+    ├── RunCommand.java    # karate run
+    └── CleanCommand.java  # karate clean
+
+io.karatelabs.core/
+├── KaratePom.java         # JSON pom parsing
+├── Runner.java            # Programmatic API
+└── ...
+```
+
+---
+
+## Manual CLI Testing
+
+### Setup
+
+A test script is provided at `etc/test-cli.sh`. The `home/` folder is gitignored for test workspaces.
+
+**Build project:**
+```bash
+# Standard build
+mvn clean install -DskipTests
+
+# Build fatjar (for simpler testing)
+mvn clean package -DskipTests -Pfatjar
+```
+
+**Test workspace** (already set up in `home/test-project/`):
+```
+home/test-project/
+├── karate-pom.json       # Project file
+└── features/
+    └── hello.feature     # Test feature with @smoke, @api tags
+```
+
+### Running CLI Commands
+
+**Option 1: Using test-cli.sh (recommended)**
+
+The script auto-detects fatjar or builds classpath:
+```bash
+# Help
+./etc/test-cli.sh --help
+
+# Run tests
+./etc/test-cli.sh home/test-project/features
+
+# Run with workdir
+./etc/test-cli.sh -w home/test-project features
+
+# Run with explicit pom
+./etc/test-cli.sh -p home/test-project/karate-pom.json
+```
+
+**Option 2: Using fatjar directly**
+```bash
+# Build fatjar first
+mvn package -DskipTests -Pfatjar
+
+# Run
+java -jar karate-core/target/karate.jar --help
+java -jar karate-core/target/karate.jar home/test-project/features
+```
+
+**Option 3: Using mvn exec:java**
+```bash
+cd karate-core
+mvn exec:java -Dexec.mainClass="io.karatelabs.Main" \
+  -Dexec.args="--help"
+```
+
+### Fatjar Build
+
+The fatjar profile is configured in `karate-core/pom.xml`:
+
+```bash
+# Build fatjar
+mvn package -DskipTests -Pfatjar
+
+# Output: karate-core/target/karate.jar
+```
+
+### Test Scenarios
+
+| Test | Command | Expected |
+|------|---------|----------|
+| Help | `--help` | Shows usage with all options |
+| Version | `--version` | Shows "Karate 2.0" |
+| Run with paths | `home/test-project/features` | Executes tests, reports to default dir |
+| Run with pom | `-p home/test-project/karate-pom.json` | Loads pom, uses pom paths |
+| Run with workdir | `-w home/test-project features` | Clean relative paths in reports |
+| Run with env | `-e dev features` | Sets karate.env |
+| Run with tags | `-t @smoke features` | Filters by tag |
+| Run no pom | `--no-pom features` | Ignores karate-pom.json |
+| Dry run | `-D features` | Parses but doesn't execute |
+| Clean | `-C -o home/test-project/target features` | Cleans output before run |
+
+### Verify Output
+
+After running tests, verify:
+
+```bash
+# Reports generated
+ls -la home/test-project/target/reports/
+
+# Expected files
+# - karate-summary.html
+# - feature-html/*.html (per-feature reports)
+```
+
+### Cleanup
+
+```bash
+rm -rf home/test-project/target
+```
+
+---
+
+## References
+
+- [Rust Launcher Spec](../../karate-cli/docs/spec.md) - Full architecture for Rust-based CLI launcher
+- [DESIGN.md](./DESIGN.md) - Runtime architecture and design reference
+- [PicoCLI Subcommands](https://picocli.info/#_subcommands) - PicoCLI documentation

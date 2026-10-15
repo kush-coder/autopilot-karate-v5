@@ -1,0 +1,1207 @@
+/*
+ * The MIT License
+ *
+ * Copyright 2025 Karate Labs Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package io.karatelabs.core.callsingle;
+
+import io.karatelabs.core.FeatureResult;
+import io.karatelabs.core.Runner;
+import io.karatelabs.core.ScenarioResult;
+import io.karatelabs.core.StepResult;
+import io.karatelabs.core.SuiteResult;
+import io.karatelabs.test.LogSilencer;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.io.File;
+import java.net.URL;
+import java.net.URLClassLoader;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.jar.JarEntry;
+import java.util.jar.JarOutputStream;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Tests for karate.callSingle() - executes a file once per Suite with caching.
+ * Verifies:
+ * - Single execution even with parallel threads
+ * - Thread-safe caching with proper locking
+ * - Exception caching
+ */
+class CallSingleTest {
+
+    @TempDir
+    Path tempDir;
+
+    @Test
+    void testCallSingleBasic() throws Exception {
+        // Create a feature that callSingle will execute
+        Path singleFeature = tempDir.resolve("single.feature");
+        Files.writeString(singleFeature, """
+            Feature: Single
+            Scenario:
+            * def value = 42
+            """);
+
+        // Create caller feature that uses callSingle
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario: Use callSingle
+            * def result = karate.callSingle('single.feature')
+            * match result.value == 42
+            """);
+
+        SuiteResult result = Runner.builder()
+                .path(callerFeature.toString())
+                .workingDir(tempDir)
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                .backupOutputDir(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed(), "callSingle basic should work: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallSingleWithJs() throws Exception {
+        // Create a JS file that returns a value
+        Path jsFile = tempDir.resolve("setup.js");
+        Files.writeString(jsFile, """
+            function() {
+                return { token: 'abc123', timestamp: Date.now() };
+            }
+            """);
+
+        // Create caller feature
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario: Use callSingle with JS
+            * def auth = karate.callSingle('setup.js')
+            * match auth.token == 'abc123'
+            """);
+
+        SuiteResult result = Runner.builder()
+                .path(callerFeature.toString())
+                .workingDir(tempDir)
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                .backupOutputDir(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed(), "callSingle with JS should work: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallSingleCachesResult() throws Exception {
+        // Create a feature that uses a timestamp to prove caching
+        Path singleFeature = tempDir.resolve("single.feature");
+        Files.writeString(singleFeature, """
+            Feature: Single
+            Scenario:
+            * def timestamp = java.lang.System.currentTimeMillis()
+            """);
+
+        // Create caller feature with two scenarios that both call callSingle
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario: First call
+            * def result1 = karate.callSingle('single.feature')
+            * def ts1 = result1.timestamp
+
+            Scenario: Second call (should get cached)
+            * def result2 = karate.callSingle('single.feature')
+            * def ts2 = result2.timestamp
+            """);
+
+        SuiteResult result = Runner.builder()
+                .path(callerFeature.toString())
+                .workingDir(tempDir)
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                .backupOutputDir(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed(), "callSingle caching should work: " + getFailureMessage(result));
+        assertEquals(2, result.getScenarioCount());
+    }
+
+    @Test
+    void testCallSingleParallelExecution() throws Exception {
+        // Create a feature that simulates slow initialization
+        // Uses a static counter to track how many times it's actually called
+        Path counterFeature = tempDir.resolve("slow-init.feature");
+        Files.writeString(counterFeature, """
+            Feature: Slow Init
+            Scenario:
+            # Simulate slow operation
+            * def sleepResult = java.lang.Thread.sleep(100)
+            * def initValue = 'initialized-' + java.lang.System.currentTimeMillis()
+            """);
+
+        // Create a feature with multiple scenarios that all use callSingle
+        Path parallelFeature = tempDir.resolve("parallel.feature");
+        Files.writeString(parallelFeature, """
+            Feature: Parallel Test
+
+            Scenario: Thread 1
+            * def result = karate.callSingle('slow-init.feature')
+            * match result.initValue contains 'initialized-'
+
+            Scenario: Thread 2
+            * def result = karate.callSingle('slow-init.feature')
+            * match result.initValue contains 'initialized-'
+
+            Scenario: Thread 3
+            * def result = karate.callSingle('slow-init.feature')
+            * match result.initValue contains 'initialized-'
+
+            Scenario: Thread 4
+            * def result = karate.callSingle('slow-init.feature')
+            * match result.initValue contains 'initialized-'
+            """);
+
+        // Run with 4 parallel threads
+        long startTime = System.currentTimeMillis();
+        SuiteResult result = Runner.builder()
+                .path(parallelFeature.toString())
+                .workingDir(tempDir)
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                .backupOutputDir(false)
+                .parallel(4);
+        long elapsed = System.currentTimeMillis() - startTime;
+
+        assertTrue(result.isPassed(), "Parallel callSingle should work: " + getFailureMessage(result));
+        assertEquals(4, result.getScenarioCount());
+
+        // If callSingle is working correctly, total time should be ~100ms (one execution)
+        // not 400ms (4 sequential executions)
+        // Allow some buffer for thread scheduling
+        assertTrue(elapsed < 300, "Expected parallel execution in ~100ms, but took " + elapsed + "ms");
+    }
+
+    @Test
+    void testCallSingleExceptionCaching() throws Exception {
+        // Create a feature that throws an error
+        Path failFeature = tempDir.resolve("fail.feature");
+        Files.writeString(failFeature, """
+            Feature: Fail
+            Scenario:
+            * def x = karate.fail('intentional error')
+            """);
+
+        // Create caller feature
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario: First call fails
+            * def result = karate.callSingle('fail.feature')
+            """);
+
+        SuiteResult result = LogSilencer.silenced("karate.runtime", () -> Runner.builder()
+                .path(callerFeature.toString())
+                .workingDir(tempDir)
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                .backupOutputDir(false)
+                .parallel(1));
+
+        assertTrue(result.isFailed(), "callSingle with failing feature should fail");
+    }
+
+    @Test
+    void testCallSingleWithArgument() throws Exception {
+        // Create a feature that uses an argument
+        Path singleFeature = tempDir.resolve("single.feature");
+        Files.writeString(singleFeature, """
+            Feature: Single with Arg
+            Scenario:
+            * def result = 'Hello ' + name
+            """);
+
+        // Create caller feature
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario: Use callSingle with arg
+            * def response = karate.callSingle('single.feature', { name: 'World' })
+            * match response.result == 'Hello World'
+            """);
+
+        SuiteResult result = Runner.builder()
+                .path(callerFeature.toString())
+                .workingDir(tempDir)
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                .backupOutputDir(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed(), "callSingle with argument should work: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallSingleMultipleDifferentPaths() throws Exception {
+        // Create two different features
+        Path feature1 = tempDir.resolve("first.feature");
+        Files.writeString(feature1, """
+            Feature: First
+            Scenario:
+            * def value = 'first'
+            """);
+
+        Path feature2 = tempDir.resolve("second.feature");
+        Files.writeString(feature2, """
+            Feature: Second
+            Scenario:
+            * def value = 'second'
+            """);
+
+        // Create caller that uses callSingle for both
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario: Use callSingle for multiple files
+            * def result1 = karate.callSingle('first.feature')
+            * def result2 = karate.callSingle('second.feature')
+            * match result1.value == 'first'
+            * match result2.value == 'second'
+            """);
+
+        SuiteResult result = Runner.builder()
+                .path(callerFeature.toString())
+                .workingDir(tempDir)
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                .backupOutputDir(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed(), "callSingle with multiple paths should work: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallSingleCacheKeyDifferentiation() throws Exception {
+        // Create a feature that uses the passed argument
+        Path tokenFeature = tempDir.resolve("get-token.feature");
+        Files.writeString(tokenFeature, """
+            Feature: Get Token
+            Scenario:
+            * def token = 'token-for-' + username
+            """);
+
+        // Create caller that uses ?suffix for cache key differentiation
+        // Same feature file, different args, different cache keys
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario: Use callSingle with cache key suffix
+            * def adminResult = karate.callSingle('get-token.feature?admin', { username: 'admin' })
+            * def userResult = karate.callSingle('get-token.feature?user', { username: 'user' })
+            * match adminResult.token == 'token-for-admin'
+            * match userResult.token == 'token-for-user'
+            """);
+
+        SuiteResult result = Runner.builder()
+                .path(callerFeature.toString())
+                .workingDir(tempDir)
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                .backupOutputDir(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed(), "callSingle with ?suffix cache keys should work: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallSingleWithoutSuffixSharesCache() throws Exception {
+        // Create a feature that uses the passed argument
+        Path tokenFeature = tempDir.resolve("get-token.feature");
+        Files.writeString(tokenFeature, """
+            Feature: Get Token
+            Scenario:
+            * def token = 'token-for-' + username
+            """);
+
+        // Create caller WITHOUT ?suffix - both calls share same cache
+        // Second call returns cached result from first call (admin's token)
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario: Without suffix, cache is shared
+            * def adminResult = karate.callSingle('get-token.feature', { username: 'admin' })
+            * def userResult = karate.callSingle('get-token.feature', { username: 'user' })
+            # Both return admin's token because cache is shared
+            * match adminResult.token == 'token-for-admin'
+            * match userResult.token == 'token-for-admin'
+            """);
+
+        SuiteResult result = Runner.builder()
+                .path(callerFeature.toString())
+                .workingDir(tempDir)
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                .backupOutputDir(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed(), "callSingle without suffix should share cache: " + getFailureMessage(result));
+    }
+
+    // ========== Tests for callSingle from karate-config.js ==========
+
+    @Test
+    void testCallSingleFromConfig() throws Exception {
+        // Create a setup feature that callSingle will execute (simulates auth/bootstrap)
+        Path setupFeature = tempDir.resolve("bootstrap.feature");
+        Files.writeString(setupFeature, """
+            Feature: Bootstrap
+            Scenario:
+            * def authToken = 'token-' + java.lang.System.currentTimeMillis()
+            * def baseUrl = 'http://localhost:8080'
+            """);
+
+        // Create karate-config.js that uses callSingle to bootstrap
+        Path configJs = tempDir.resolve("karate-config.js");
+        Files.writeString(configJs, """
+            function fn() {
+                var config = {};
+                var bootstrap = karate.callSingle('bootstrap.feature');
+                config.authToken = bootstrap.authToken;
+                config.baseUrl = bootstrap.baseUrl;
+                return config;
+            }
+            """);
+
+        // Create a feature that uses the config values
+        Path testFeature = tempDir.resolve("test.feature");
+        Files.writeString(testFeature, """
+            Feature: Test using config
+            Scenario: Use bootstrapped values
+            * match authToken contains 'token-'
+            * match baseUrl == 'http://localhost:8080'
+            """);
+
+        SuiteResult result = Runner.builder()
+                .path(testFeature.toString())
+                .workingDir(tempDir)
+                .configDir(configJs.toString())
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                .backupOutputDir(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed(), "callSingle from config should work: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallSingleFromConfigWithJsFile() throws Exception {
+        // Create a JS file that returns auth config (common pattern)
+        Path authJs = tempDir.resolve("auth.js");
+        Files.writeString(authJs, """
+            function() {
+                // Simulate expensive auth call that should only happen once
+                karate.log('Performing authentication...');
+                return {
+                    token: 'bearer-abc123',
+                    userId: 'user-42',
+                    timestamp: new Date().toISOString()
+                };
+            }
+            """);
+
+        // Create karate-config.js that uses callSingle for auth
+        Path configJs = tempDir.resolve("karate-config.js");
+        Files.writeString(configJs, """
+            function fn() {
+                var auth = karate.callSingle('auth.js');
+                return {
+                    authToken: auth.token,
+                    userId: auth.userId
+                };
+            }
+            """);
+
+        // Create a feature that uses the auth values
+        Path testFeature = tempDir.resolve("test.feature");
+        Files.writeString(testFeature, """
+            Feature: Test with JS-based auth
+            Scenario: Use auth from callSingle
+            * match authToken == 'bearer-abc123'
+            * match userId == 'user-42'
+            """);
+
+        SuiteResult result = Runner.builder()
+                .path(testFeature.toString())
+                .workingDir(tempDir)
+                .configDir(configJs.toString())
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                .backupOutputDir(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed(), "callSingle from config with JS file should work: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallSingleFromConfigParallelScenarios() throws Exception {
+        // Reset the counter before test (reuse existing counter class)
+        io.karatelabs.core.parallel.CallOnceCounter.reset();
+
+        // Create a setup feature that increments the counter
+        Path setupFeature = tempDir.resolve("counting-setup.feature");
+        Files.writeString(setupFeature, """
+            Feature: Counting Setup
+            Scenario:
+            * def Counter = Java.type('io.karatelabs.core.parallel.CallOnceCounter')
+            * def count = Counter.incrementAndGet()
+            * def sharedValue = 'initialized-once'
+            """);
+
+        // Create karate-config.js that uses callSingle
+        Path configJs = tempDir.resolve("karate-config.js");
+        Files.writeString(configJs, """
+            function fn() {
+                var setup = karate.callSingle('counting-setup.feature');
+                return {
+                    sharedValue: setup.sharedValue
+                };
+            }
+            """);
+
+        // Create a feature with multiple scenarios that all use the config
+        Path testFeature = tempDir.resolve("parallel-test.feature");
+        Files.writeString(testFeature, """
+            Feature: Parallel test with shared config
+
+            Scenario: Thread 1
+            * match sharedValue == 'initialized-once'
+
+            Scenario: Thread 2
+            * match sharedValue == 'initialized-once'
+
+            Scenario: Thread 3
+            * match sharedValue == 'initialized-once'
+
+            Scenario: Thread 4
+            * match sharedValue == 'initialized-once'
+            """);
+
+        // Run with 4 parallel threads
+        SuiteResult result = Runner.builder()
+                .path(testFeature.toString())
+                .workingDir(tempDir)
+                .configDir(configJs.toString())
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                .backupOutputDir(false)
+                .parallel(4);
+
+        assertTrue(result.isPassed(), "Parallel scenarios with config callSingle should work: " + getFailureMessage(result));
+        assertEquals(4, result.getScenarioCount());
+
+        // Verify callSingle only executed once (counter incremented exactly once)
+        int count = io.karatelabs.core.parallel.CallOnceCounter.get();
+        assertEquals(1, count, "callSingle should execute exactly once across all parallel scenarios, but executed " + count + " times");
+    }
+
+    // ========== Tests for callSingle with tag selector ==========
+
+    @Test
+    void testCallSingleWithTagSelector() throws Exception {
+        // Create a feature with multiple scenarios, each with a different tag
+        Path taggedFeature = tempDir.resolve("tagged.feature");
+        Files.writeString(taggedFeature, """
+            Feature: Tagged Scenarios
+
+            @admin
+            Scenario: Admin setup
+            * def role = 'admin'
+            * def token = 'admin-token-123'
+
+            @user
+            Scenario: User setup
+            * def role = 'user'
+            * def token = 'user-token-456'
+
+            @guest
+            Scenario: Guest setup
+            * def role = 'guest'
+            * def token = 'guest-token-789'
+            """);
+
+        // Create caller that uses callSingle with tag selector
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller with tag selector
+            Scenario: Use callSingle with @user tag
+            * def result = karate.callSingle('tagged.feature@user')
+            * match result.role == 'user'
+            * match result.token == 'user-token-456'
+            """);
+
+        SuiteResult result = Runner.builder()
+                .path(callerFeature.toString())
+                .workingDir(tempDir)
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                .backupOutputDir(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed(), "callSingle with tag selector should work: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallSingleWithTagSelectorCaching() throws Exception {
+        // Test that callSingle with different tag selectors use different cache keys
+        Path taggedFeature = tempDir.resolve("multi-tagged.feature");
+        Files.writeString(taggedFeature, """
+            Feature: Multi Tagged
+
+            @dev
+            Scenario: Dev setup
+            * def env = 'development'
+            * def timestamp = java.lang.System.currentTimeMillis()
+
+            @prod
+            Scenario: Prod setup
+            * def env = 'production'
+            * def timestamp = java.lang.System.currentTimeMillis()
+            """);
+
+        // Create caller that uses callSingle with different tags
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario: Use callSingle with different tags
+            * def devResult = karate.callSingle('multi-tagged.feature@dev')
+            * def prodResult = karate.callSingle('multi-tagged.feature@prod')
+            * match devResult.env == 'development'
+            * match prodResult.env == 'production'
+            """);
+
+        SuiteResult result = Runner.builder()
+                .path(callerFeature.toString())
+                .workingDir(tempDir)
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                .backupOutputDir(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed(), "callSingle with different tags should return different results: " + getFailureMessage(result));
+    }
+
+    // ========== karate.read() inside callSingle from karate-config.js ==========
+
+    @Test
+    void testCallSingleFromConfigInvokingKarateBaseWithDynamicRead() throws Exception {
+        // karate-config.js calls karate.callSingle on karate-base.js,
+        // which in turn builds a dynamic classpath path from karate.env and karate.read's a JSON file.
+        Path flagsJson = tempDir.resolve("feature-flags-staging.json");
+        Files.writeString(flagsJson, "{ \"flagA\": true, \"flagB\": false }");
+
+        Path baseJs = tempDir.resolve("karate-base.js");
+        Files.writeString(baseJs, """
+            function fn() {
+                var env = karate.env;
+                var featureFlags = karate.read('feature-flags-' + env + '.json');
+                return { featureFlags: featureFlags };
+            }
+            """);
+
+        Path configJs = tempDir.resolve("karate-config.js");
+        Files.writeString(configJs, """
+            function fn() {
+                var base = karate.callSingle('karate-base.js');
+                return base;
+            }
+            """);
+
+        Path testFeature = tempDir.resolve("test.feature");
+        Files.writeString(testFeature, """
+            Feature: featureFlags from callSingle base
+            Scenario: featureFlags resolved from dynamic path
+            * match featureFlags == { flagA: true, flagB: false }
+            """);
+
+        SuiteResult result = Runner.builder()
+                .path(testFeature.toString())
+                .workingDir(tempDir)
+                .configDir(configJs.toString())
+                .karateEnv("staging")
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                .backupOutputDir(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed(), "callSingle from config invoking karate-base.js with dynamic read should work: "
+                + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallSingleFromConfigWithJarBackedClasspath() throws Exception {
+        // Same flow as above, but karate-base.js, karate-config.js and the JSON live inside a JAR.
+        // jar: URIs are opaque so uri.getPath() returns null - Resource.getExtension() must handle that
+        // or karate.read('classpath:...json') NPEs once the JSON path is resolved against a jar fs.
+        Path jarPath = tempDir.resolve("config-bundle.jar");
+        try (JarOutputStream jos = new JarOutputStream(Files.newOutputStream(jarPath))) {
+            jos.putNextEntry(new JarEntry("karate-base.js"));
+            jos.write("""
+                function fn() {
+                    var env = karate.env;
+                    var featureFlags = karate.read('classpath:common/config/feature-flags-' + env + '.json');
+                    return { featureFlags: featureFlags };
+                }
+                """.getBytes());
+            jos.closeEntry();
+
+            jos.putNextEntry(new JarEntry("karate-config.js"));
+            jos.write("""
+                function fn() {
+                    var base = karate.callSingle('classpath:karate-base.js');
+                    return base;
+                }
+                """.getBytes());
+            jos.closeEntry();
+
+            jos.putNextEntry(new JarEntry("common/"));
+            jos.closeEntry();
+            jos.putNextEntry(new JarEntry("common/config/"));
+            jos.closeEntry();
+            jos.putNextEntry(new JarEntry("common/config/feature-flags-staging.json"));
+            jos.write("{ \"flagA\": true, \"flagB\": false }".getBytes());
+            jos.closeEntry();
+        }
+
+        // Caller feature lives on disk - it will load classpath: resources via the JAR-backed classloader.
+        Path callerFeature = tempDir.resolve("test.feature");
+        Files.writeString(callerFeature, """
+            Feature: featureFlags from JAR-backed classpath callSingle
+            Scenario: featureFlags resolved from JAR-backed classpath
+            * match featureFlags == { flagA: true, flagB: false }
+            """);
+
+        ClassLoader original = Thread.currentThread().getContextClassLoader();
+        try (URLClassLoader jarLoader = new URLClassLoader(new URL[]{jarPath.toUri().toURL()}, original)) {
+            Thread.currentThread().setContextClassLoader(jarLoader);
+            SuiteResult result = Runner.builder()
+                    .path(callerFeature.toString())
+                    .workingDir(tempDir)
+                    .karateEnv("staging")
+                    .outputConsoleSummary(false)
+                    .outputHtmlReport(false)
+                    .backupOutputDir(false)
+                    .parallel(1);
+            assertTrue(result.isPassed(), "callSingle resolving JAR-backed classpath JSON should work: "
+                    + getFailureMessage(result));
+        } finally {
+            Thread.currentThread().setContextClassLoader(original);
+        }
+    }
+
+    // ========== Tests for callSingleCache (disk caching) ==========
+
+    @Test
+    void testCallSingleCacheToDisk() {
+        // Clean up any existing cache file first
+        File cacheDir = new File("target/callsingle-cache");
+        if (cacheDir.exists()) {
+            File[] files = cacheDir.listFiles();
+            if (files != null) {
+                for (File f : files) {
+                    f.delete();
+                }
+            }
+        }
+
+        SuiteResult result = Runner.path("classpath:io/karatelabs/core/callsingle/cache/cache-test.feature")
+                .configDir("classpath:io/karatelabs/core/callsingle/cache")
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        assertEquals(0, result.getScenarioFailedCount(), String.join("\n", result.getErrors()));
+
+        // Verify cache file was created
+        File[] cacheFiles = cacheDir.listFiles((dir, name) -> name.endsWith(".txt"));
+        assertNotNull(cacheFiles, "Cache directory should contain files");
+        assertTrue(cacheFiles.length > 0, "Should have at least one cache file");
+    }
+
+    // ========== Tests for callSingle reporting ==========
+    // The "winning" scenario (the one whose thread acquires the lock and actually executes
+    // the feature) should carry the called feature's FeatureResult on the calling step's
+    // callResults so HTML / Cucumber JSON / JUnit reports surface its HTTP traffic and steps.
+    // Subsequent cache-hit scenarios should not double-report.
+
+    @Test
+    void testCallSingleFromStepAttachesToCallingStep() throws Exception {
+        Path setupFeature = tempDir.resolve("setup.feature");
+        Files.writeString(setupFeature, """
+            Feature: Setup
+            Scenario:
+            * def token = 'abc'
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario: invoke from step
+            * def result = karate.callSingle('setup.feature')
+            * match result.token == 'abc'
+            """);
+
+        SuiteResult result = Runner.builder()
+                .path(callerFeature.toString())
+                .workingDir(tempDir)
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                // nested call results are the assertion subject here; keep them past feature end
+                .retainCallResults(true)
+                .backupOutputDir(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed(), getFailureMessage(result));
+
+        StepResult callingStep = findStepWithCallResults(result);
+        assertNotNull(callingStep, "callSingle should attach FeatureResult to the calling step");
+        assertEquals(1, callingStep.getCallResults().size());
+        FeatureResult attached = callingStep.getCallResults().get(0);
+        assertEquals("setup.feature", attached.getFeature().getResource().getRelativePath());
+    }
+
+    @Test
+    void testCallSingleFromConfigAttachesToFirstStep() throws Exception {
+        Path setupFeature = tempDir.resolve("setup.feature");
+        Files.writeString(setupFeature, """
+            Feature: Setup
+            Scenario:
+            * def token = 'config-token'
+            """);
+
+        Path configJs = tempDir.resolve("karate-config.js");
+        Files.writeString(configJs, """
+            function fn() {
+                var auth = karate.callSingle('setup.feature');
+                return { token: auth.token };
+            }
+            """);
+
+        Path testFeature = tempDir.resolve("test.feature");
+        Files.writeString(testFeature, """
+            Feature: Test
+            Scenario: uses config
+            * match token == 'config-token'
+            """);
+
+        SuiteResult result = Runner.builder()
+                .path(testFeature.toString())
+                .workingDir(tempDir)
+                .configDir(configJs.toString())
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                // nested call results are the assertion subject here; keep them past feature end
+                .retainCallResults(true)
+                .backupOutputDir(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed(), getFailureMessage(result));
+
+        StepResult firstStep = result.getFeatureResults().get(0)
+                .getScenarioResults().get(0)
+                .getStepResults().get(0);
+        assertTrue(firstStep.hasCallResults(),
+                "config-time callSingle should attach to the first step's callResults");
+        assertEquals(1, firstStep.getCallResults().size());
+        assertEquals("setup.feature",
+                firstStep.getCallResults().get(0).getFeature().getResource().getRelativePath());
+    }
+
+    @Test
+    void testCallSingleParallelOnlyWinnerCarriesCallResults() throws Exception {
+        Path setupFeature = tempDir.resolve("setup.feature");
+        Files.writeString(setupFeature, """
+            Feature: Setup
+            Scenario:
+            * def shared = 'once'
+            """);
+
+        Path configJs = tempDir.resolve("karate-config.js");
+        Files.writeString(configJs, """
+            function fn() {
+                var s = karate.callSingle('setup.feature');
+                return { shared: s.shared };
+            }
+            """);
+
+        Path testFeature = tempDir.resolve("parallel.feature");
+        Files.writeString(testFeature, """
+            Feature: Parallel
+            Scenario: a
+            * match shared == 'once'
+            Scenario: b
+            * match shared == 'once'
+            Scenario: c
+            * match shared == 'once'
+            Scenario: d
+            * match shared == 'once'
+            """);
+
+        SuiteResult result = Runner.builder()
+                .path(testFeature.toString())
+                .workingDir(tempDir)
+                .configDir(configJs.toString())
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                // nested call results are the assertion subject here; keep them past feature end
+                .retainCallResults(true)
+                .backupOutputDir(false)
+                .parallel(4);
+
+        assertTrue(result.isPassed(), getFailureMessage(result));
+
+        int totalCallResults = 0;
+        for (FeatureResult fr : result.getFeatureResults()) {
+            for (ScenarioResult sr : fr.getScenarioResults()) {
+                for (StepResult step : sr.getStepResults()) {
+                    if (step.hasCallResults()) {
+                        totalCallResults += step.getCallResults().size();
+                    }
+                }
+            }
+        }
+        assertEquals(1, totalCallResults,
+                "callSingle runs once — only the winning scenario should carry the FeatureResult");
+    }
+
+    @Test
+    void testCallSingleFailureStillAttachesForVisibility() throws Exception {
+        Path failFeature = tempDir.resolve("fail.feature");
+        Files.writeString(failFeature, """
+            Feature: Failing setup
+            Scenario:
+            * def x = karate.fail('boom')
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario: invoke failing setup
+            * def result = karate.callSingle('fail.feature')
+            """);
+
+        SuiteResult result = LogSilencer.silenced("karate.runtime", () -> Runner.builder()
+                .path(callerFeature.toString())
+                .workingDir(tempDir)
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                // nested call results are the assertion subject here; keep them past feature end
+                .retainCallResults(true)
+                .backupOutputDir(false)
+                .parallel(1));
+
+        assertTrue(result.isFailed(), "callSingle of a failing feature should fail the scenario");
+
+        StepResult callingStep = findStepWithCallResults(result);
+        assertNotNull(callingStep,
+                "failed callSingle should still attach its FeatureResult so the failure is visible in the report");
+        assertTrue(callingStep.getCallResults().get(0).isFailed());
+    }
+
+    @Test
+    void testCallSingleResultDoesNotEvalLeakedOutlineExamplePlaceholder() throws Exception {
+        // A Scenario Outline puts example-row values such as '#(config.itemId)' into scope as
+        // raw placeholder strings (resolved lazily where they are *used*, e.g. inside request JSON).
+        // When the scenario calls a setup feature that itself uses karate.callSingle(), those
+        // placeholder strings are inherited down into the called features and echoed back in the
+        // callSingle result variable map. The result map must NOT have its embedded expressions
+        // re-evaluated in a scope where 'config' isn't defined yet — that used to throw
+        // "ReferenceError: config is not defined". The placeholders still resolve correctly at
+        // their actual point of use, after the setup call has defined config / regionId.
+        Path initHelper = tempDir.resolve("initHelper.feature");
+        Files.writeString(initHelper, """
+            @ignore
+            Feature: Init helper (called via callSingle)
+            Scenario:
+            * def initialized = true
+            * def timestamp = java.lang.System.currentTimeMillis()
+            """);
+
+        Path setup = tempDir.resolve("setupWithCallSingle.feature");
+        Files.writeString(setup, """
+            @ignore
+            Feature: Setup feature with callSingle
+            Scenario:
+            * def initResult = karate.callSingle('initHelper.feature')
+            * def regionId = 'REGION-001'
+            * def config = { itemId: 'ITEM-12345', groupId: 'GRP-99' }
+            """);
+
+        Path main = tempDir.resolve("embeddedExprInExamples.feature");
+        Files.writeString(main, """
+            Feature: Outline #() in Examples + callSingle in called feature
+
+            Scenario Outline: Examples with variable references + callSingle in called feature
+            * call read('setupWithCallSingle.feature')
+            * def sent = { itemId: <itemId>, region: <region> }
+            * match sent == { itemId: 'ITEM-12345', region: 'REGION-001' }
+
+            Examples:
+            | itemId             | region        |
+            | '#(config.itemId)' | '#(regionId)' |
+            """);
+
+        SuiteResult result = Runner.builder()
+                .path(main.toString())
+                .workingDir(tempDir)
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                .backupOutputDir(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed(), "repro 2913: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallSingleFailureFromConfigStillAttachesForVisibility() throws Exception {
+        // A callSingle invoked during karate-config.js resolution that FAILS. The config
+        // exception aborts ScenarioRuntime construction, so no step ever runs and the whole
+        // runtime (with the called feature's FeatureResult buffered on its executor) is
+        // discarded - the report collapses to one "Scenario execution failed: ..." line.
+        // The called feature's steps and HTTP traffic must survive into the report.
+        Path nestedFeature = tempDir.resolve("nested.feature");
+        Files.writeString(nestedFeature, """
+            Feature: nested feature that fails
+            Scenario: fails on the last step
+            * def a = 1
+            * def b = 2
+            * match a == b
+            """);
+
+        Path configJs = tempDir.resolve("karate-config.js");
+        Files.writeString(configJs, """
+            function fn() {
+                var setup = karate.callSingle('nested.feature');
+                return {};
+            }
+            """);
+
+        Path mainFeature = tempDir.resolve("main.feature");
+        Files.writeString(mainFeature, """
+            Feature: main
+            Scenario: trivial
+            * def x = 1
+            * match x == 1
+            """);
+
+        SuiteResult result = LogSilencer.silenced("karate.runtime", () -> Runner.builder()
+                .path(mainFeature.toString())
+                .workingDir(tempDir)
+                .configDir(configJs.toString())
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                // nested call results are the assertion subject here; keep them past feature end
+                .retainCallResults(true)
+                .backupOutputDir(false)
+                .parallel(1));
+
+        assertTrue(result.isFailed(), "callSingle failing during config should fail the scenario");
+
+        StepResult callingStep = findStepWithCallResults(result);
+        assertNotNull(callingStep,
+                "config-time callSingle failure should still attach its FeatureResult so the nested "
+                        + "steps are visible in the report");
+        FeatureResult attached = callingStep.getCallResults().get(0);
+        assertTrue(attached.isFailed());
+        assertEquals("nested.feature", attached.getFeature().getResource().getRelativePath());
+        // the whole point: per-step detail of the called feature, not one collapsed message
+        assertEquals(3, attached.getScenarioResults().get(0).getStepResults().size());
+    }
+
+    @Test
+    void testConfigJsWithHelperFunctionBeforeFnIsNotSilentlySkipped() throws Exception {
+        // karate-config.js declaring a helper alongside fn() is not a single parenthesizable
+        // expression, so the "(" + js + ")" wrap fails to parse and evaluation falls back to a
+        // plain eval that only DECLARES the functions - fn() is never invoked. Config silently
+        // returns nothing: variables are missing and any failure inside fn() disappears.
+        Path nestedFeature = tempDir.resolve("nested.feature");
+        Files.writeString(nestedFeature, """
+            Feature: nested
+            Scenario:
+            * def token = 'from-nested'
+            """);
+
+        Path configJs = tempDir.resolve("karate-config.js");
+        Files.writeString(configJs, """
+            function setupCallSingle() {
+                return karate.callSingle('nested.feature');
+            }
+            function fn() {
+                var setup = setupCallSingle();
+                return { token: setup.token };
+            }
+            """);
+
+        Path mainFeature = tempDir.resolve("main.feature");
+        Files.writeString(mainFeature, """
+            Feature: main
+            Scenario: uses config
+            * match token == 'from-nested'
+            """);
+
+        SuiteResult result = LogSilencer.silenced("karate.runtime", () -> Runner.builder()
+                .path(mainFeature.toString())
+                .workingDir(tempDir)
+                .configDir(configJs.toString())
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                .backupOutputDir(false)
+                .parallel(1));
+
+        assertTrue(result.isPassed(), "fn() must be invoked even when a helper is declared beside it: "
+                + getFailureMessage(result));
+    }
+
+    @Test
+    void testConfigJsWithHelperFunctionDoesNotSwallowCallSingleFailure() throws Exception {
+        // The visible symptom of fn() never being invoked: fn() returns {} anyway, so nothing looks
+        // missing and a callSingle failure inside it disappears entirely - the run passes instantly.
+        Path failFeature = tempDir.resolve("fail.feature");
+        Files.writeString(failFeature, """
+            Feature: failing setup
+            Scenario:
+            * def x = karate.fail('boom')
+            """);
+
+        Path configJs = tempDir.resolve("karate-config.js");
+        Files.writeString(configJs, """
+            function setupCallSingle() {
+                return karate.callSingle('fail.feature');
+            }
+            function fn() {
+                var setup = setupCallSingle();
+                return {};
+            }
+            """);
+
+        Path mainFeature = tempDir.resolve("main.feature");
+        Files.writeString(mainFeature, """
+            Feature: main
+            Scenario: trivial
+            * def x = 1
+            """);
+
+        SuiteResult result = LogSilencer.silenced("karate.runtime", () -> Runner.builder()
+                .path(mainFeature.toString())
+                .workingDir(tempDir)
+                .configDir(configJs.toString())
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                // nested call results are the assertion subject here; keep them past feature end
+                .retainCallResults(true)
+                .backupOutputDir(false)
+                .parallel(1));
+
+        assertTrue(result.isFailed(), "a callSingle failure inside a helper-invoking fn() must not vanish");
+        // and the nested detail must survive, same as the direct-in-fn() case
+        StepResult callingStep = findStepWithCallResults(result);
+        assertNotNull(callingStep, "the swallowed failure should now carry its nested FeatureResult");
+        assertTrue(callingStep.getCallResults().get(0).isFailed());
+    }
+
+    @Test
+    void testEnvConfigDeclaringOnlyHelpersDoesNotReinvokeTheMainConfigFn() throws Exception {
+        // base / config / env-config share one engine scope, so a fn declared by an EARLIER file is
+        // still bound when a later declarations-only file is evaluated. The fallback must only invoke
+        // an fn that THIS file contributed - otherwise the main config's fn runs a second time and its
+        // side effects (a login call, a counter) happen twice.
+        io.karatelabs.core.parallel.CallOnceCounter.reset();
+
+        // self-invoking pattern: also unparseable when wrapped, so it takes the same fallback path
+        Path configJs = tempDir.resolve("karate-config.js");
+        Files.writeString(configJs, """
+            function fn() {
+                var Counter = Java.type('io.karatelabs.core.parallel.CallOnceCounter');
+                Counter.incrementAndGet();
+                return { fromMain: true };
+            }
+            fn();
+            """);
+
+        // env config declares helpers only - it contributes no fn of its own
+        Path envConfigJs = tempDir.resolve("karate-config-dev.js");
+        Files.writeString(envConfigJs, """
+            function helperOne() { return 1; }
+            function helperTwo() { return 2; }
+            """);
+
+        Path mainFeature = tempDir.resolve("main.feature");
+        Files.writeString(mainFeature, """
+            Feature: main
+            Scenario: config applied once
+            * match fromMain == true
+            """);
+
+        SuiteResult result = Runner.builder()
+                .path(mainFeature.toString())
+                .workingDir(tempDir)
+                .configDir(tempDir.toString())
+                .karateEnv("dev")
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                // nested call results are the assertion subject here; keep them past feature end
+                .retainCallResults(true)
+                .backupOutputDir(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed(), getFailureMessage(result));
+        assertEquals(1, io.karatelabs.core.parallel.CallOnceCounter.get(),
+                "the main config's fn() must run exactly once, not again for the env config");
+    }
+
+    private static StepResult findStepWithCallResults(SuiteResult result) {
+        for (FeatureResult fr : result.getFeatureResults()) {
+            for (ScenarioResult sr : fr.getScenarioResults()) {
+                for (StepResult step : sr.getStepResults()) {
+                    if (step.hasCallResults()) {
+                        return step;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    private String getFailureMessage(SuiteResult result) {
+        if (result.isPassed()) return "none";
+        for (FeatureResult fr : result.getFeatureResults()) {
+            for (ScenarioResult sr : fr.getScenarioResults()) {
+                if (sr.isFailed()) {
+                    return sr.getFailureMessage();
+                }
+            }
+        }
+        return "unknown";
+    }
+
+}

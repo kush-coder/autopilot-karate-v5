@@ -1,0 +1,17 @@
+<!--
+    Fragment page. On POST, context.switch('items') abandons this template
+    and renders items.html in its place. The shell still wraps the switched
+    content for full-page navigation.
+-->
+<script ka:scope="global">
+    if (request.post) {
+        context.switch('items');
+    }
+</script>
+<section id="create-item-page">
+    <h2 id="create-title">Create Item</h2>
+    <form method="post" th:action="context.template">
+        <input name="name"/>
+        <button type="submit">Create</button>
+    </form>
+</section>

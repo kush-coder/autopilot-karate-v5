@@ -1,0 +1,1538 @@
+/*
+ * The MIT License
+ *
+ * Copyright 2025 Karate Labs Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package io.karatelabs.core;
+
+import io.karatelabs.common.Resource;
+import io.karatelabs.gherkin.Feature;
+import io.karatelabs.test.LogSilencer;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+import static io.karatelabs.core.TestUtils.*;
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Tests for Scenario Outline expansion and execution.
+ * Includes both static Examples tables and dynamic outlines via @setup scenarios.
+ */
+public class OutlineTest {
+
+    @TempDir
+    Path tempDir;
+
+    // ========== Static Outline Tests ==========
+
+    @Test
+    void testBasicOutlineExpansion() throws Exception {
+        Path feature = tempDir.resolve("outline-basic.feature");
+        Files.writeString(feature, """
+            Feature: Basic Outline
+
+            Scenario Outline: Test with <name>
+            * def value = '<name>'
+            * match value == '<name>'
+
+            Examples:
+            | name  |
+            | alice |
+            | bob   |
+            | carol |
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+
+        assertTrue(result.isPassed(), getFailureMessage(result));
+        assertEquals(3, result.getScenarioCount());
+        assertEquals(3, result.getScenarioPassedCount());
+    }
+
+    @Test
+    void testOutlineWithMultipleColumns() throws Exception {
+        Path feature = tempDir.resolve("outline-multi.feature");
+        Files.writeString(feature, """
+            Feature: Multi-column Outline
+
+            Scenario Outline: Add <a> + <b> = <sum>
+            * def result = <a> + <b>
+            * match result == <sum>
+
+            Examples:
+            | a! | b! | sum! |
+            | 1  | 2  | 3    |
+            | 5  | 5  | 10   |
+            | 0  | 0  | 0    |
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+
+        assertTrue(result.isPassed(), getFailureMessage(result));
+        assertEquals(3, result.getScenarioCount());
+    }
+
+    @Test
+    void testMatchOnNullIntermediateDoesNotResolveExamplesColumn() throws Exception {
+        // An Examples column binds a variable (e.g. `id`) in scope. Matching a child of a
+        // null/absent intermediate path against that column must still degrade to #notpresent
+        // and FAIL — it must not resolve the trailing path segment to the same-named column
+        // variable. Previously `nullNode.id` read the `id` column value and falsely passed.
+        Path feature = tempDir.resolve("null-intermediate.feature");
+        Files.writeString(feature, """
+            Feature: match on null intermediate path must not pass
+
+            Scenario Outline: <scenario>
+            * def response = { data: { a: { nullNode: null } } }
+            * match response.data.a.nullNode.id == '<id>'
+            * match response.data.a.nullNode.count == <count>
+
+            Examples:
+            | scenario | id      | count |
+            | s1       | ABC-123 | 42    |
+            """);
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+        assertTrue(result.isFailed(), "expected the scenario to fail (path does not exist)");
+        assertEquals(1, result.getScenarioFailedCount());
+        assertEquals(0, result.getScenarioPassedCount());
+    }
+
+    @Test
+    void testNotPresentAcrossMultipleExamplesColumnsOnAbsentPaths() throws Exception {
+        // Two+ Examples columns whose value is "#notpresent", used against absent paths, must
+        // pass. The absent leaves degrade to #notpresent and match the #notpresent markers —
+        // the column variables must not shadow the path resolution.
+        Path feature = tempDir.resolve("notpresent-multi-col.feature");
+        Files.writeString(feature, """
+            Feature: notpresent across multiple example columns
+
+            Scenario Outline: <scenario>
+            * def response = { data: { parent: { child: { existingNode: null } } } }
+            * match response.data.parent.child.missingNode.value == <expected>
+            * match response.data.parent.child.missingNode.id == <id>
+
+            Examples:
+            | scenario | expected      | id            |
+            | row 1    | "#notpresent" | "#notpresent" |
+            """);
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+        assertTrue(result.isPassed(), getFailureMessage(result));
+        assertEquals(1, result.getScenarioPassedCount());
+    }
+
+    @Test
+    void testOutlineWithStringSubstitution() throws Exception {
+        Path feature = tempDir.resolve("outline-string.feature");
+        Files.writeString(feature, """
+            Feature: String Substitution
+
+            Scenario Outline: Greeting <person>
+            * def greeting = 'Hello <person>!'
+            * match greeting == '<expected>'
+
+            Examples:
+            | person | expected      |
+            | World  | Hello World!  |
+            | Karate | Hello Karate! |
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+
+        assertTrue(result.isPassed(), getFailureMessage(result));
+    }
+
+    @Test
+    void testOutlineWithJsonSubstitution() throws Exception {
+        Path feature = tempDir.resolve("outline-json.feature");
+        Files.writeString(feature, """
+            Feature: JSON in Outline
+
+            Scenario Outline: User <name> is <age> years old
+            * def user = { name: '<name>', age: <age> }
+            * match user.name == '<name>'
+            * match user.age == <age>
+
+            Examples:
+            | name  | age! |
+            | john  | 30   |
+            | jane  | 25   |
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+
+        assertTrue(result.isPassed(), getFailureMessage(result));
+    }
+
+    @Test
+    void testMultipleExamplesTables() throws Exception {
+        Path feature = tempDir.resolve("outline-multi-tables.feature");
+        Files.writeString(feature, """
+            Feature: Multiple Examples Tables
+
+            Scenario Outline: Test <type> with value <val>
+            * def x = <val>
+            * match x == <val>
+
+            Examples: Positive values
+            | type     | val! |
+            | positive | 1    |
+            | positive | 10   |
+
+            Examples: Zero and negative
+            | type     | val! |
+            | zero     | 0    |
+            | negative | -5   |
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+
+        assertTrue(result.isPassed(), getFailureMessage(result));
+        // 2 rows from first table + 2 rows from second table = 4 scenarios
+        assertEquals(4, result.getScenarioCount());
+    }
+
+    @Test
+    void testOutlineWithBackground() throws Exception {
+        Path feature = tempDir.resolve("outline-background.feature");
+        Files.writeString(feature, """
+            Feature: Outline with Background
+
+            Background:
+            * def base = 100
+
+            Scenario Outline: Add <val> to base
+            * def result = base + <val>
+            * match result == <expected>
+
+            Examples:
+            | val! | expected! |
+            | 1    | 101       |
+            | 50   | 150       |
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+
+        assertTrue(result.isPassed(), getFailureMessage(result));
+        assertEquals(2, result.getScenarioCount());
+    }
+
+    @Test
+    void testOutlineFailure() throws Exception {
+        Path feature = tempDir.resolve("outline-fail.feature");
+        Files.writeString(feature, """
+            Feature: Outline with Failure
+
+            Scenario Outline: Test <val>
+            * def actual = <val>
+            * match actual == <expected>
+
+            Examples:
+            | val! | expected! |
+            | 1    | 1         |
+            | 2    | 999       |
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+
+        assertFalse(result.isPassed());
+        assertEquals(2, result.getScenarioCount());
+        assertEquals(1, result.getScenarioPassedCount());
+        assertEquals(1, result.getScenarioFailedCount());
+    }
+
+    @Test
+    void testOutlineWithStringConcatenation() throws Exception {
+        // Simpler test that avoids docstring parsing complexity
+        Path feature = tempDir.resolve("outline-concat.feature");
+        Files.writeString(feature, """
+            Feature: Outline with String Concat
+
+            Scenario Outline: Template <id>
+            * def body = 'Hello ' + name + '!'
+            * match body == 'Hello <name>!'
+
+            Examples:
+            | id  | name  |
+            | 001 | alice |
+            | 002 | bob   |
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+
+        assertTrue(result.isPassed(), getFailureMessage(result));
+        assertEquals(2, result.getScenarioCount());
+    }
+
+    @Test
+    void testOutlineWithJsonObject() throws Exception {
+        // Simpler test that avoids table parsing complexity
+        Path feature = tempDir.resolve("outline-json2.feature");
+        Files.writeString(feature, """
+            Feature: Outline with JSON
+
+            Scenario Outline: JSON test <id>
+            * def data = ({ id: id, val: val })
+            * match data.id == '<id>'
+            * match data.val == <val>
+
+            Examples:
+            | id | val! |
+            | a  | 1    |
+            | b  | 2    |
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+
+        assertTrue(result.isPassed(), getFailureMessage(result));
+        assertEquals(2, result.getScenarioCount());
+    }
+
+    @Test
+    void testOutlineExampleVariablesAccessible() throws Exception {
+        Path feature = tempDir.resolve("outline-vars.feature");
+        Files.writeString(feature, """
+            Feature: Outline Variables
+
+            Scenario Outline: Direct access to example vars
+            * def computed = name + '-' + value
+            * match computed == '<name>-<value>'
+
+            Examples:
+            | name | value |
+            | foo  | bar   |
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+
+        assertTrue(result.isPassed(), getFailureMessage(result));
+    }
+
+    @Test
+    void testOutlineScenarioNameSubstituted() throws Exception {
+        // Verify karate.scenario.name and karate.info.scenarioName reflect substituted values
+        Path feature = tempDir.resolve("outline-name.feature");
+        Files.writeString(feature, """
+            Feature: Outline Name Substitution
+
+            Scenario Outline: name is <name> and age is <age>
+            * def expected = 'name is ' + name + ' and age is ' + age
+            * match karate.scenario.name == expected
+            * match karate.info.scenarioName == expected
+
+            Examples:
+            | name | age! |
+            | Bob  | 5    |
+            | Nyan | 6    |
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+
+        assertTrue(result.isPassed(), getFailureMessage(result));
+        assertEquals(2, result.getScenarioPassedCount());
+    }
+
+    @Test
+    void testOutlinePlaceholderInDocString() throws Exception {
+        // Verify placeholders are substituted in docstrings
+        Path feature = tempDir.resolve("outline-docstring.feature");
+        Files.writeString(feature, """
+            Feature: Outline DocString
+
+            Scenario Outline: Test docstring with <name>
+            * text expected =
+            \"\"\"
+            Hello <name>!
+            \"\"\"
+            * match expected contains name
+
+            Examples:
+            | name   |
+            | World  |
+            | Karate |
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+
+        assertTrue(result.isPassed(), getFailureMessage(result));
+        assertEquals(2, result.getScenarioPassedCount());
+    }
+
+    @Test
+    void testOutlinePlaceholderInDocStringWithTypeHint() throws Exception {
+        // A step whose only content is the keyword (e.g. `request`) followed by a doc-string
+        // produces step.text == null. Outline expansion then NPE'd on text.replace(...).
+        Path feature = tempDir.resolve("outline-docstring-typehint.feature");
+        Files.writeString(feature, """
+            Feature: Type-hint in doc-string
+
+            Scenario Outline: Type-hint with angle-bracket in doc-string
+            Given url 'https://example.com'
+            And path 'post'
+            And request
+            \"\"\"
+            {
+              firstName: <firstName>,
+              lastName: <lastName>,
+              active: <active>
+            }
+            \"\"\"
+
+            Examples:
+            | firstName! | lastName! | active! |
+            | 'Alice'    | 'Smith'   | true    |
+            | 'Bob'      | 'Jones'   | false   |
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+
+        assertTrue(result.isPassed(), getFailureMessage(result));
+        assertEquals(2, result.getScenarioPassedCount());
+    }
+
+    @Test
+    void testOutlinePlaceholderInStepTable() throws Exception {
+        // Verify placeholders are substituted in step tables
+        // Note: table keyword evaluates cells as expressions, so use quoted values
+        Path feature = tempDir.resolve("outline-table.feature");
+        Files.writeString(feature, """
+            Feature: Outline Step Table
+
+            Scenario Outline: Test table with <name>
+            * table data
+            | name   | value |
+            | '<name>' | '<value>' |
+            * match data[0].name == name
+            * match data[0].value == value
+
+            Examples:
+            | name | value |
+            | foo  | one   |
+            | bar  | two   |
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+
+        assertTrue(result.isPassed(), getFailureMessage(result));
+        assertEquals(2, result.getScenarioPassedCount());
+    }
+
+    @Test
+    void testMixedScenarioAndOutline() throws Exception {
+        Path feature = tempDir.resolve("mixed.feature");
+        Files.writeString(feature, """
+            Feature: Mixed Scenarios
+
+            Scenario: Regular scenario
+            * def x = 1
+            * match x == 1
+
+            Scenario Outline: Outline <val>
+            * def y = <val>
+            * match y == <val>
+
+            Examples:
+            | val! |
+            | 2    |
+            | 3    |
+
+            Scenario: Another regular scenario
+            * def z = 4
+            * match z == 4
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+
+        assertTrue(result.isPassed(), getFailureMessage(result));
+        // 1 regular + 2 from outline + 1 regular = 4 scenarios
+        assertEquals(4, result.getScenarioCount());
+    }
+
+    @Test
+    void testTypeHints() throws Exception {
+        // Columns ending with ! are evaluated as JS expressions
+        Path feature = tempDir.resolve("type-hints.feature");
+        Files.writeString(feature, """
+            Feature: Type Hints
+
+            Scenario Outline: Type hint <description>
+            * match value == expected
+
+            Examples:
+            | description       | value!           | expected!              |
+            | number            | 42               | 42                     |
+            | boolean true      | true             | true                   |
+            | boolean false     | false            | false                  |
+            | null              | null             | null                   |
+            | array             | [1, 2, 3]        | [1, 2, 3]              |
+            | object            | { a: 1 }         | { a: 1 }               |
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+
+        assertTrue(result.isPassed(), getFailureMessage(result));
+        assertEquals(6, result.getScenarioCount());
+    }
+
+    @Test
+    void testStringColumnsWithoutTypeHint() throws Exception {
+        // Columns without ! are treated as strings
+        Path feature = tempDir.resolve("string-columns.feature");
+        Files.writeString(feature, """
+            Feature: String Columns
+
+            Scenario Outline: String value <val>
+            * match val == '<val>'
+            * match typeof val == 'string'
+
+            Examples:
+            | val |
+            | 123 |
+            | abc |
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+
+        assertTrue(result.isPassed(), getFailureMessage(result));
+    }
+
+    @Test
+    void testEmptyCellsWithTypeHintBecomeNull() throws Exception {
+        // V1 compatibility: empty cells with type hint (!) should become null
+        Path feature = tempDir.resolve("empty-typehint.feature");
+        Files.writeString(feature, """
+            Feature: Empty Cells with Type Hint
+
+            Scenario Outline: Test with value
+            * match value == expected
+
+            Examples:
+            | value! | expected! |
+            | 42     | 42        |
+            |        | null      |
+            | true   | true      |
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+
+        assertTrue(result.isPassed(), getFailureMessage(result));
+        assertEquals(3, result.getScenarioCount());
+    }
+
+    @Test
+    void testEmptyCellsInParamsSkipped() throws Exception {
+        // V1 compatibility: empty cells with type hint should be null
+        Path feature = tempDir.resolve("empty-params.feature");
+        Files.writeString(feature, """
+            Feature: Empty Cells in Params
+
+            Scenario Outline: Search test
+            # Verify nulls are set correctly for empty cells with type hints
+            * match name == expectedName
+            * match country == expectedCountry
+            * match limit == expectedLimit
+
+            Examples:
+            | name | country | limit! | expectedName! | expectedCountry! | expectedLimit! |
+            | foo  | IN      |      5 | 'foo'         | 'IN'             | 5              |
+            | bar  |         |     10 | 'bar'         | null             | 10             |
+            | baz  |         |        | 'baz'         | null             | null           |
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+
+        assertTrue(result.isPassed(), getFailureMessage(result));
+        assertEquals(3, result.getScenarioCount());
+    }
+
+    @Test
+    void testOutlineWithEscapedPipeInExamples() throws Exception {
+        // A backslash-escaped pipe "\|" in an Examples cell is a literal pipe, not a delimiter
+        Path feature = tempDir.resolve("escaped-pipe.feature");
+        Files.writeString(feature, """
+            Feature: escaped pipe in examples
+
+            Scenario Outline: value with escaped pipe
+            * def expected = 'Hello | World'
+            * match message == expected
+
+            Examples:
+            | message!          |
+            | "Hello \\| World" |
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+
+        assertTrue(result.isPassed(), getFailureMessage(result));
+        assertEquals(1, result.getScenarioCount());
+    }
+
+    // ========== Dynamic Outline Tests ==========
+
+    @Test
+    void testDynamicOutlineWithSetup() throws Exception {
+        Path feature = tempDir.resolve("dynamic-setup.feature");
+        Files.writeString(feature, """
+            Feature: Dynamic Outline with Setup
+
+            @setup
+            Scenario: Generate test data
+            * def data = [{a: 1, expected: 1}, {a: 2, expected: 2}]
+
+            Scenario Outline: Test <a>
+            * def actual = <a>
+            * match actual == <expected>
+
+            Examples:
+            | karate.setup().data |
+            """);
+
+        Feature f = Feature.read(Resource.from(feature, tempDir));
+        FeatureRuntime fr = new FeatureRuntime(null, f);
+        FeatureResult result = fr.call();
+
+        assertEquals(2, result.getPassedCount(), "Should have 2 passing scenarios from dynamic data");
+        assertEquals(0, result.getFailedCount());
+    }
+
+    @Test
+    void testDynamicOutlineWithSetupOnce() throws Exception {
+        Path feature = tempDir.resolve("dynamic-setuponce.feature");
+        Files.writeString(feature, """
+            Feature: Dynamic Outline with SetupOnce
+
+            @setup
+            Scenario: Generate test data
+            * def data = [{x: 10}, {x: 20}, {x: 30}]
+
+            Scenario Outline: First outline <x>
+            * def result = <x> * 2
+            * match result == <x> * 2
+
+            Examples:
+            | karate.setupOnce().data |
+
+            Scenario Outline: Second outline <x>
+            * def result = <x> + 5
+            * match result == <x> + 5
+
+            Examples:
+            | karate.setupOnce().data |
+            """);
+
+        Feature f = Feature.read(Resource.from(feature, tempDir));
+        FeatureRuntime fr = new FeatureRuntime(null, f);
+        FeatureResult result = fr.call();
+
+        // Both outlines use the same cached data (3 items each = 6 total scenarios)
+        assertEquals(6, result.getPassedCount(), "Should have 6 passing scenarios (3+3 from cached setup)");
+        assertEquals(0, result.getFailedCount());
+    }
+
+    @Test
+    void testDynamicOutlineWithInlineExpression() throws Exception {
+        Path feature = tempDir.resolve("dynamic-inline.feature");
+        Files.writeString(feature, """
+            Feature: Dynamic Outline with Inline Expression
+
+            Scenario Outline: Test inline data <name>
+            * def greeting = 'Hello, ' + '<name>'
+            * match greeting == 'Hello, ' + '<name>'
+
+            Examples:
+            | [{name: 'Alice'}, {name: 'Bob'}, {name: 'Charlie'}] |
+            """);
+
+        Feature f = Feature.read(Resource.from(feature, tempDir));
+        FeatureRuntime fr = new FeatureRuntime(null, f);
+        FeatureResult result = fr.call();
+
+        assertEquals(3, result.getPassedCount(), "Should have 3 passing scenarios from inline array");
+        assertEquals(0, result.getFailedCount());
+    }
+
+    @Test
+    void testDynamicOutlineWithFailure() throws Exception {
+        Path feature = tempDir.resolve("dynamic-failure.feature");
+        Files.writeString(feature, """
+            Feature: Dynamic Outline with Failure
+
+            @setup
+            Scenario: Generate test data
+            * def data = [{val: 1, exp: 1}, {val: 2, exp: 999}]
+
+            Scenario Outline: Test value <val>
+            * match <val> == <exp>
+
+            Examples:
+            | karate.setup().data |
+            """);
+
+        Feature f = Feature.read(Resource.from(feature, tempDir));
+        FeatureRuntime fr = new FeatureRuntime(null, f);
+        FeatureResult result = fr.call();
+
+        assertEquals(1, result.getPassedCount(), "First scenario should pass (1 == 1)");
+        assertEquals(1, result.getFailedCount(), "Second scenario should fail (2 != 999)");
+    }
+
+    @Test
+    void testSetupScenarioNotExecutedDirectly() throws Exception {
+        Path feature = tempDir.resolve("setup-not-direct.feature");
+        Files.writeString(feature, """
+            Feature: Setup Scenario Not Executed Directly
+
+            @setup
+            Scenario: This should not run directly
+            * def data = [{val: 1}]
+            * def setupRan = true
+
+            Scenario: Regular scenario
+            * def regular = true
+            * match regular == true
+            """);
+
+        Feature f = Feature.read(Resource.from(feature, tempDir));
+        FeatureRuntime fr = new FeatureRuntime(null, f);
+        FeatureResult result = fr.call();
+
+        // Only the regular scenario should run, not the @setup scenario
+        assertEquals(1, result.getPassedCount(), "Only regular scenario should run");
+        assertEquals(0, result.getFailedCount());
+    }
+
+    @Test
+    void testCallSetupScenarioByTag() throws Exception {
+        // A @setup scenario is skipped from direct top-level execution, but it must
+        // still be callable by tag, e.g. `call read('@setup')`. v1 allowed this since
+        // call-by-tag ignored the @setup exclusion. Regression for the v2 iterator
+        // unconditionally skipping @setup before the call-by-tag selector is consulted.
+        Path feature = tempDir.resolve("call-setup-by-tag.feature");
+        Files.writeString(feature, """
+            Feature: Call @setup scenario by tag
+
+            @setup
+            Scenario: Setup
+            * def fromSetup = 'setup-ran'
+
+            Scenario: Scenario with setup
+            * call read('@setup')
+            * match fromSetup == 'setup-ran'
+
+            Scenario: Scenario without setup
+            * def ok = true
+            * match ok == true
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+
+        assertTrue(result.isPassed(), getFailureMessage(result));
+        // @setup is not run directly, so only the 2 regular scenarios execute at top level
+        assertEquals(2, result.getScenarioCount());
+        assertEquals(2, result.getScenarioPassedCount());
+    }
+
+    @Test
+    void testDynamicOutlineWithNamedSetup() throws Exception {
+        Path feature = tempDir.resolve("dynamic-named-setup.feature");
+        Files.writeString(feature, """
+            Feature: Dynamic Outline with Named Setup
+
+            @setup=users
+            Scenario: Generate user data
+            * def data = [{name: 'user1'}, {name: 'user2'}]
+
+            @setup=products
+            Scenario: Generate product data
+            * def data = [{name: 'product1'}, {name: 'product2'}, {name: 'product3'}]
+
+            Scenario Outline: Test user <name>
+            * match '<name>' contains 'user'
+
+            Examples:
+            | karate.setup('users').data |
+
+            Scenario Outline: Test product <name>
+            * match '<name>' contains 'product'
+
+            Examples:
+            | karate.setup('products').data |
+            """);
+
+        Feature f = Feature.read(Resource.from(feature, tempDir));
+        FeatureRuntime fr = new FeatureRuntime(null, f);
+        FeatureResult result = fr.call();
+
+        // 2 user scenarios + 3 product scenarios = 5 total
+        assertEquals(5, result.getPassedCount(), "Should have 5 passing scenarios (2 users + 3 products)");
+        assertEquals(0, result.getFailedCount());
+    }
+
+    @Test
+    void testDynamicOutlineWithBackground() throws Exception {
+        Path feature = tempDir.resolve("dynamic-background.feature");
+        Files.writeString(feature, """
+            Feature: Dynamic Outline with Background
+
+            Background:
+            * def baseValue = 100
+
+            @setup
+            Scenario: Generate test data
+            * def data = [{multiplier: 1}, {multiplier: 2}]
+
+            Scenario Outline: Test multiplier <multiplier>
+            * def result = baseValue * <multiplier>
+            * match result == 100 * <multiplier>
+
+            Examples:
+            | karate.setup().data |
+            """);
+
+        Feature f = Feature.read(Resource.from(feature, tempDir));
+        FeatureRuntime fr = new FeatureRuntime(null, f);
+        FeatureResult result = fr.call();
+
+        assertEquals(2, result.getPassedCount(), "Background should run before each dynamic scenario");
+        assertEquals(0, result.getFailedCount());
+    }
+
+    @Test
+    void testDynamicOutlineEmptyData() throws Exception {
+        Path feature = tempDir.resolve("dynamic-empty.feature");
+        Files.writeString(feature, """
+            Feature: Dynamic Outline with Empty Data
+
+            @setup
+            Scenario: Generate empty data
+            * def data = []
+
+            Scenario Outline: This should not run
+            * def val = <a>
+
+            Examples:
+            | karate.setup().data |
+
+            Scenario: Regular scenario after empty outline
+            * def ran = true
+            * match ran == true
+            """);
+
+        Feature f = Feature.read(Resource.from(feature, tempDir));
+        FeatureRuntime fr = new FeatureRuntime(null, f);
+        FeatureResult result = fr.call();
+
+        // Empty data means no outline scenarios run, but regular scenario should
+        assertEquals(1, result.getPassedCount(), "Only regular scenario should run");
+        assertEquals(0, result.getFailedCount());
+    }
+
+    @Test
+    void testDynamicOutlineWithComplexData() throws Exception {
+        Path feature = tempDir.resolve("dynamic-complex.feature");
+        Files.writeString(feature, """
+            Feature: Dynamic Outline with Complex Data
+
+            @setup
+            Scenario: Generate complex test data
+            * def data =
+              \"\"\"
+              [
+                { id: 1, name: 'item1', tags: ['a', 'b'] },
+                { id: 2, name: 'item2', tags: ['c'] }
+              ]
+              \"\"\"
+
+            Scenario Outline: Test item <id>
+            * match <id> == <id>
+            * match '<name>' == '<name>'
+
+            Examples:
+            | karate.setup().data |
+            """);
+
+        Feature f = Feature.read(Resource.from(feature, tempDir));
+        FeatureRuntime fr = new FeatureRuntime(null, f);
+        FeatureResult result = fr.call();
+
+        assertEquals(2, result.getPassedCount(), "Should handle complex nested data");
+        assertEquals(0, result.getFailedCount());
+    }
+
+    @Test
+    void testMissingSetupScenario() throws Exception {
+        Path feature = tempDir.resolve("missing-setup.feature");
+        Files.writeString(feature, """
+            Feature: Missing Setup Scenario
+
+            Scenario Outline: Test <val>
+            * def x = <val>
+
+            Examples:
+            | karate.setup().data |
+            """);
+
+        Feature f = Feature.read(Resource.from(feature, tempDir));
+        FeatureRuntime fr = new FeatureRuntime(null, f);
+
+        // Should fail gracefully (not crash) when @setup scenario is missing
+        FeatureResult result = fr.call();
+        assertTrue(result.isFailed(), "Should fail when @setup scenario is missing");
+        assertTrue(result.getFailureMessage().contains("setup"), "Error message should mention @setup");
+    }
+
+    // ========== Generator Function Tests ==========
+
+    @Test
+    void testDynamicOutlineWithGeneratorFunction() throws Exception {
+        Path feature = tempDir.resolve("dynamic-generator.feature");
+        Files.writeString(feature, """
+            Feature: Dynamic Outline with Generator Function
+
+            @setup
+            Scenario: Define generator
+            * def generator = function(i){ if (i == 3) return null; return { name: 'item' + i, index: i } }
+
+            Scenario Outline: Test generated item <name>
+            * match '<name>' == 'item' + <index>
+            * match __num == <index>
+
+            Examples:
+            | karate.setup().generator |
+            """);
+
+        Feature f = Feature.read(Resource.from(feature, tempDir));
+        FeatureRuntime fr = new FeatureRuntime(null, f);
+        FeatureResult result = fr.call();
+
+        // Generator returns items at index 0, 1, 2 (stops at 3 with null)
+        assertEquals(3, result.getPassedCount(), "Should have 3 passing scenarios from generator function");
+        assertEquals(0, result.getFailedCount());
+    }
+
+    @Test
+    void testDynamicOutlineWithGeneratorReturningNonMap() throws Exception {
+        Path feature = tempDir.resolve("dynamic-generator-nonmap.feature");
+        Files.writeString(feature, """
+            Feature: Dynamic Outline with Generator Returning Non-Map
+
+            @setup
+            Scenario: Define generator that returns false to stop
+            * def generator = function(i){ if (i >= 2) return false; return { val: i * 10 } }
+
+            Scenario Outline: Test value <val>
+            * match <val> == __num * 10
+
+            Examples:
+            | karate.setup().generator |
+            """);
+
+        Feature f = Feature.read(Resource.from(feature, tempDir));
+        FeatureRuntime fr = new FeatureRuntime(null, f);
+        FeatureResult result = fr.call();
+
+        // Generator returns items at index 0, 1 (stops at 2 with false)
+        assertEquals(2, result.getPassedCount(), "Should have 2 passing scenarios (stops when non-map returned)");
+        assertEquals(0, result.getFailedCount());
+    }
+
+    @Test
+    void testDynamicOutlineGeneratorMatchingV1Syntax() throws Exception {
+        // This test matches the v1 outline-generator.feature example
+        Path feature = tempDir.resolve("dynamic-generator-v1.feature");
+        Files.writeString(feature, """
+            Feature: Generator Function (v1 Compatible)
+
+            @setup
+            Scenario: Setup generator
+            * def generator = function(i){ if (i == 5) return null; return { name: 'cat' + i, age: i } }
+
+            Scenario Outline: Test generated cat
+            * match __num == age
+            * match __row.name == 'cat' + age
+
+            Examples:
+            | karate.setup().generator |
+            """);
+
+        Feature f = Feature.read(Resource.from(feature, tempDir));
+        FeatureRuntime fr = new FeatureRuntime(null, f);
+        FeatureResult result = fr.call();
+
+        // Generator creates 5 items (index 0-4)
+        assertEquals(5, result.getPassedCount(), "Should have 5 passing scenarios matching v1 behavior");
+        assertEquals(0, result.getFailedCount());
+    }
+
+    @Test
+    void testDynamicOutlineGeneratorWithSetupOnce() throws Exception {
+        Path feature = tempDir.resolve("dynamic-generator-cached.feature");
+        Files.writeString(feature, """
+            Feature: Generator Function with SetupOnce
+
+            @setup
+            Scenario: Define generator
+            * def generator = function(i){ if (i == 2) return null; return { seq: i } }
+
+            Scenario Outline: First use of generator
+            * match <seq> == __num
+
+            Examples:
+            | karate.setupOnce().generator |
+
+            Scenario Outline: Second use (cached)
+            * match <seq> == __num
+
+            Examples:
+            | karate.setupOnce().generator |
+            """);
+
+        Feature f = Feature.read(Resource.from(feature, tempDir));
+        FeatureRuntime fr = new FeatureRuntime(null, f);
+        FeatureResult result = fr.call();
+
+        // Generator evaluated once, cached result used twice: 2 + 2 = 4 scenarios
+        assertEquals(4, result.getPassedCount(), "Should have 4 passing scenarios (2 from each outline using cached data)");
+        assertEquals(0, result.getFailedCount());
+    }
+
+    @Test
+    void testDynamicOutlineGeneratorReturningEmptyImmediately() throws Exception {
+        Path feature = tempDir.resolve("dynamic-generator-empty.feature");
+        Files.writeString(feature, """
+            Feature: Generator Returns Null Immediately
+
+            @setup
+            Scenario: Generator that returns null on first call
+            * def generator = function(i){ return null }
+
+            Scenario Outline: Should not run
+            * def x = <val>
+
+            Examples:
+            | karate.setup().generator |
+
+            Scenario: Regular scenario
+            * def ran = true
+            """);
+
+        Feature f = Feature.read(Resource.from(feature, tempDir));
+        FeatureRuntime fr = new FeatureRuntime(null, f);
+        FeatureResult result = fr.call();
+
+        // Generator returns null immediately, so no outline scenarios run
+        assertEquals(1, result.getPassedCount(), "Only regular scenario should run");
+        assertEquals(0, result.getFailedCount());
+    }
+
+    @Test
+    void testDynamicOutlineWithUnnamedScenario() throws Exception {
+        // Tests that Scenario Outline without a name works correctly
+        // Regression test for NPE in Scenario.replace() when name is null
+        Path feature = tempDir.resolve("dynamic-unnamed.feature");
+        Files.writeString(feature, """
+            Feature:
+
+            @setup
+            Scenario:
+            * def data = [{ name: 'one' }, { name: 'two' }]
+
+            Scenario Outline:
+            * match name == "#present"
+
+            Examples:
+            | karate.setup().data |
+            """);
+
+        Feature f = Feature.read(Resource.from(feature, tempDir));
+        FeatureRuntime fr = new FeatureRuntime(null, f);
+        FeatureResult result = fr.call();
+
+        assertEquals(2, result.getPassedCount(), "Should have 2 passing scenarios from dynamic data");
+        assertEquals(0, result.getFailedCount());
+    }
+
+    @Test
+    void testDynamicOutlineWithTableKeyword() throws Exception {
+        // Tests that table keyword in @setup scenario works with dynamic outline
+        Path feature = tempDir.resolve("dynamic-table.feature");
+        Files.writeString(feature, """
+            Feature:
+
+            @setup
+            Scenario:
+            * table data
+                | name  | extra   |
+                | 'one' |         |
+                | 'two' | 'value' |
+
+            Scenario Outline:
+            * assert name == 'one' || name == 'two'
+
+            Examples:
+            | karate.setup().data |
+            """);
+
+        Feature f = Feature.read(Resource.from(feature, tempDir));
+        FeatureRuntime fr = new FeatureRuntime(null, f);
+        FeatureResult result = fr.call();
+
+        assertEquals(2, result.getPassedCount(), "Should have 2 passing scenarios from table data");
+        assertEquals(0, result.getFailedCount());
+    }
+
+    @Test
+    void testDynamicOutlineWithCsvFile() throws Exception {
+        // Test that read('file.csv') works in dynamic Examples
+        Path csvFile = tempDir.resolve("data.csv");
+        Files.writeString(csvFile, """
+            name,value
+            first,1
+            second,2
+            """);
+
+        Path feature = tempDir.resolve("outline-csv.feature");
+        Files.writeString(feature, """
+            Feature:
+
+            Scenario Outline: name is <name>
+            * match __row == { name: '#string', value: '#string' }
+
+            Examples:
+            | read('data.csv') |
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+
+        assertTrue(result.isPassed(), "CSV-based outline should pass: " + getFailureMessage(result));
+        assertEquals(2, result.getScenarioCount(), "Should have 2 scenarios from CSV");
+    }
+
+    @Test
+    void testDynamicOutlineWithProviderClaimedFile() throws Exception {
+        Files.writeString(tempDir.resolve("data.rows"), "first\nsecond\n");
+        Path feature = tempDir.resolve("outline-rows.feature");
+        Files.writeString(feature, """
+            Feature:
+
+            Scenario Outline: line is <line>
+            * match __row == { line: '#string', fragment: 'Sheet 2' }
+
+            Examples:
+            | read('data.rows#Sheet 2') |
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+
+        assertTrue(result.isPassed(), "provider-read outline should pass: " + getFailureMessage(result));
+        assertEquals(2, result.getScenarioCount());
+    }
+
+    @Test
+    void testDynamicOutlineFailureCarriesTheCause() throws Exception {
+        Path feature = tempDir.resolve("outline-throws.feature");
+        Files.writeString(feature, """
+            Feature:
+
+            Scenario Outline: never runs
+            * match 1 == 1
+
+            Examples:
+            | read('no-such-file.csv') |
+            """);
+
+        SuiteResult result = LogSilencer.silenced("karate.runtime", () -> runTestSuite(tempDir, feature.toString()));
+
+        assertFalse(result.isPassed());
+        String message = getFailureMessage(result);
+        assertTrue(message.contains("Failed to evaluate dynamic expression: read('no-such-file.csv') - "), message);
+        assertTrue(message.substring(message.indexOf(" - ")).contains("no-such-file.csv"), message);
+    }
+
+    // ========== Lifecycle Hook Tests ==========
+
+    // Static counter for testing hooks (reset before each test)
+    private static int afterScenarioOutlineCount = 0;
+
+    @Test
+    void testAfterScenarioOutlineHook() throws Exception {
+        // Test that configure afterScenarioOutline is called once after all examples complete
+        afterScenarioOutlineCount = 0;  // Reset counter
+
+        Path feature = tempDir.resolve("after-outline-hook.feature");
+        Files.writeString(feature, """
+            Feature: afterScenarioOutline Hook
+
+            Scenario Outline: Test <name>
+            * configure afterScenarioOutline = function(){ Java.type('io.karatelabs.core.OutlineTest').incrementAfterOutlineCount() }
+            * match '<name>' != ''
+
+            Examples:
+            | name  |
+            | alice |
+            | bob   |
+            | carol |
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+
+        assertTrue(result.isPassed(), getFailureMessage(result));
+        assertEquals(3, result.getScenarioCount());
+        // Verify hook was called exactly once (after all 3 examples completed)
+        assertEquals(1, afterScenarioOutlineCount, "afterScenarioOutline should be called once after all examples complete");
+    }
+
+    @Test
+    void testAfterScenarioOutlineHookMultipleOutlines() throws Exception {
+        // Test that afterScenarioOutline is called once per outline
+        afterScenarioOutlineCount = 0;  // Reset counter
+
+        Path feature = tempDir.resolve("after-outline-multi.feature");
+        Files.writeString(feature, """
+            Feature: Multiple Outlines with Hook
+
+            Scenario Outline: First outline <val>
+            * configure afterScenarioOutline = function(){ Java.type('io.karatelabs.core.OutlineTest').incrementAfterOutlineCount() }
+            * match <val> == <val>
+
+            Examples:
+            | val! |
+            | 1    |
+            | 2    |
+
+            Scenario Outline: Second outline <val>
+            * configure afterScenarioOutline = function(){ Java.type('io.karatelabs.core.OutlineTest').incrementAfterOutlineCount() }
+            * match <val> == <val>
+
+            Examples:
+            | val! |
+            | 10   |
+            | 20   |
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+
+        assertTrue(result.isPassed(), getFailureMessage(result));
+        assertEquals(4, result.getScenarioCount());
+        // Verify hook was called twice (once per outline)
+        assertEquals(2, afterScenarioOutlineCount, "afterScenarioOutline should be called once per outline");
+    }
+
+    @Test
+    void testAfterScenarioOutlineHookNotCalledForRegularScenario() throws Exception {
+        // Test that afterScenarioOutline is NOT called for regular scenarios
+        afterScenarioOutlineCount = 0;  // Reset counter
+
+        Path feature = tempDir.resolve("after-outline-regular.feature");
+        Files.writeString(feature, """
+            Feature: Regular Scenario Should Not Trigger Outline Hook
+
+            Scenario: Regular scenario with outline hook configured
+            * configure afterScenarioOutline = function(){ Java.type('io.karatelabs.core.OutlineTest').incrementAfterOutlineCount() }
+            * def x = 1
+
+            Scenario: Another regular scenario
+            * def y = 2
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+
+        assertTrue(result.isPassed(), getFailureMessage(result));
+        // Verify hook was NOT called (since there are no outlines)
+        assertEquals(0, afterScenarioOutlineCount, "afterScenarioOutline should not be called for regular scenarios");
+    }
+
+    // Static method for test hooks to call
+    public static void incrementAfterOutlineCount() {
+        afterScenarioOutlineCount++;
+    }
+
+    // ========== Empty Cell Placeholder Tests ==========
+
+    @Test
+    void testEmptyCellPlaceholderSubstitution() throws Exception {
+        // Issue: When Examples table cell is empty, <placeholder> should become empty string
+        // Bug: Currently leaves literal <placeholder> text instead of substituting
+        Path feature = tempDir.resolve("empty-cell-placeholder.feature");
+        Files.writeString(feature, """
+            Feature: Empty Cell Placeholder Substitution
+
+            Scenario Outline: Test with empty cells
+            * def query = { name: '<name>', country: '<country>' }
+            * print query
+            * match query.name == '<name>'
+            * match query.country == '<country>'
+
+            Examples:
+            | name | country |
+            | foo  | US      |
+            |      | JP      |
+            | bar  |         |
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+
+        assertTrue(result.isPassed(), getFailureMessage(result));
+        assertEquals(3, result.getScenarioCount());
+    }
+
+    @Test
+    void testEmptyCellPlaceholderDoesNotContainLiteralPlaceholder() throws Exception {
+        // Issue: When Examples table cell is empty, the placeholder text should NOT appear literally
+        // Verify that <name> doesn't show up as the string "<name>" when cell is empty
+        Path feature = tempDir.resolve("empty-cell-no-literal.feature");
+        Files.writeString(feature, """
+            Feature: Empty Cell Should Not Leave Literal Placeholder
+
+            Scenario Outline: Test row <__num>
+            * def nameVal = '<name>'
+            * def countryVal = '<country>'
+            * print 'nameVal=' + nameVal + ', countryVal=' + countryVal
+            # When cell is empty, the placeholder should be replaced with empty string, not literal '<name>'
+            * match nameVal != '<' + 'name>'
+            * match countryVal != '<' + 'country>'
+
+            Examples:
+            | name | country |
+            | foo  | US      |
+            |      | JP      |
+            | bar  |         |
+            |      |         |
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+
+        assertTrue(result.isPassed(), getFailureMessage(result));
+        assertEquals(4, result.getScenarioCount());
+    }
+
+    // ========== Helper Methods ==========
+
+    // ========== Docstring under Scenario Outline ==========
+
+    @Test
+    void testOutlineWithDocstringBeforeSteps() throws Exception {
+        Path feature = tempDir.resolve("outline-docstring.feature");
+        Files.writeString(feature, """
+            Feature: Docstring bug
+
+            Scenario Outline: My outline
+                \"\"\"
+                This is a doc comment describing the outline.
+                \"\"\"
+                * print "row: <label>"
+
+            Examples:
+                | label |
+                | A     |
+                | B     |
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+
+        assertTrue(result.isPassed(), "Outline with docstring should pass: " + getFailureMessage(result));
+        assertEquals(2, result.getScenarioCount(), "Should generate 2 scenarios from examples");
+        assertEquals(2, result.getScenarioPassedCount());
+    }
+
+    // ========== Tag filter on Examples blocks ==========
+
+    @Test
+    void testOutlineTagFilterPerExamplesBlock() throws Exception {
+        // When an outline has multiple Examples blocks with different tags,
+        // the tag filter should be evaluated per generated scenario, not per outline.
+        Path feature = tempDir.resolve("outline-tag-filter.feature");
+        Files.writeString(feature, """
+            Feature: Tag filter debug
+
+            @smoke
+            Scenario: simple, no skip
+            * def a = 1
+
+            @smoke @skip
+            Scenario: simple, has skip
+            * def a = 2
+
+            @smoke
+            Scenario Outline: outline, no-tag examples
+            * def label = '<label>'
+
+            Examples:
+                | label |
+                | A     |
+
+            @smoke
+            Scenario Outline: outline, skip examples
+            * def label = '<label>'
+
+            @skip
+            Examples:
+                | label |
+                | B     |
+
+            @smoke
+            Scenario Outline: outline, mixed blocks
+            * def label = '<label>'
+
+            Examples:
+                | label   |
+                | run_me  |
+
+            @skip
+            Examples:
+                | label    |
+                | skip_me  |
+            """);
+
+        SuiteResult result = Runner.path(feature.toString())
+                .workingDir(tempDir)
+                .tags("@smoke", "~@skip")
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                .backupOutputDir(false)
+                .parallel(1);
+
+        // Case 1: simple @smoke -> runs
+        // Case 2: simple @smoke @skip -> excluded by ~@skip
+        // Case 3: outline with untagged examples -> runs (1 row)
+        // Case 4: outline with @skip examples -> excluded
+        // Case 5: outline with mixed blocks -> run_me runs, skip_me excluded
+        assertEquals(3, result.getScenarioCount(),
+                "Should run 3 scenarios. Got: " + result.getScenarioCount());
+        assertTrue(result.isPassed(), "All selected scenarios should pass: " + getFailureMessage(result));
+    }
+
+    // ========== Type-hint (!) substitution into match RHS ==========
+
+    @Test
+    void testTypeHintSubstitutionInMatch() throws Exception {
+        // A !-suffixed Examples column should substitute into a match RHS such that
+        // strings stay quoted and inline JSON stays valid. Repro for the reported
+        // failures: string and inline-JSON type hints break when used as <placeholder>.
+        // Each outline asserts twice: once via the <placeholder> substitution and once
+        // via the column's auto-bound variable (Karate creates a variable per column).
+        Path feature = tempDir.resolve("typehint-match.feature");
+        Files.writeString(feature, """
+            Feature: type-hint substitution in match
+
+            Scenario Outline: string value
+            * def response = { message: 'Item not found' }
+            * match response.message == <msg>
+            * match response.message == msg
+
+            Examples:
+            | msg!             |
+            | 'Item not found' |
+
+            Scenario Outline: number value
+            * def response = { count: 42 }
+            * match response.count == <val>
+            * match response.count == val
+
+            Examples:
+            | val! |
+            | 42   |
+
+            Scenario Outline: boolean value
+            * def response = { active: true }
+            * match response.active == <val>
+            * match response.active == val
+
+            Examples:
+            | val! |
+            | true |
+
+            Scenario Outline: null value
+            * def response = { data: null }
+            * match response.data == <val>
+            * match response.data == val
+
+            Examples:
+            | val! |
+            | null |
+
+            Scenario Outline: inline JSON value
+            * def response = { item: { id: 1, name: 'test' } }
+            * match response.item == <val>
+            * match response.item == val
+
+            Examples:
+            | val!                    |
+            | { id: 1, name: 'test' } |
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+
+        assertTrue(result.isPassed(), getFailureMessage(result));
+        assertEquals(5, result.getScenarioCount());
+        assertEquals(5, result.getScenarioPassedCount());
+    }
+
+    @Test
+    void testDynamicOutlineObjectColumnExpansion() throws Exception {
+        // A dynamic outline whose row has an OBJECT column must splice that column
+        // into a step body as JSON (not Java Map.toString() `{k=v}`, which fails to
+        // parse). Inner string values stay quoted and embedded <token>s survive for
+        // a later `replace` step. Scalar columns keep their plain string form.
+        Path feature = tempDir.resolve("object-column.feature");
+        Files.writeString(feature, """
+            Feature: dynamic outline object column expansion
+
+            @setup
+            Scenario: data
+            * def testItems = [{ name: 'q1', variables: { input: { category: '<category>' } } }]
+
+            Scenario Outline: <name> - expand object column and replace tokens
+            * def requestVariables = <variables>
+            * replace requestVariables
+            | token    | value   |
+            | category | 'BOOKS' |
+            * json requestVariables = requestVariables
+            * match requestVariables.input.category == 'BOOKS'
+            * match __row.name == 'q1'
+
+            Examples:
+            | karate.setupOnce().testItems |
+            """);
+
+        Feature f = Feature.read(Resource.from(feature, tempDir));
+        FeatureRuntime fr = new FeatureRuntime(null, f);
+        FeatureResult result = fr.call();
+
+        assertEquals(1, result.getPassedCount(), "object column should expand as JSON and replace tokens");
+        assertEquals(0, result.getFailedCount());
+    }
+
+    private String getFailureMessage(SuiteResult result) {
+        if (result.isPassed()) return "none";
+        for (FeatureResult fr : result.getFeatureResults()) {
+            for (ScenarioResult sr : fr.getScenarioResults()) {
+                if (sr.isFailed()) {
+                    return sr.getFailureMessage();
+                }
+            }
+        }
+        return "unknown";
+    }
+
+}

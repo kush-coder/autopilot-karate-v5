@@ -1,0 +1,329 @@
+package io.karatelabs.js;
+
+import org.junit.jupiter.api.Test;
+
+import java.util.List;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+class JsRegexTest extends EvalBase {
+
+    @Test
+    void testDev() {
+
+    }
+
+    @Test
+    void testRegexLiteral() {
+        eval("var re = /test/; var str = re.toString()");
+        assertInstanceOf(JsRegex.class, get("re"));
+        assertEquals("/test/", get("str"));
+        eval("var re = /test/i; var str = re.toString()");
+        assertInstanceOf(JsRegex.class, get("re"));
+        assertEquals("/test/i", get("str"));
+        eval("var x = 5 / 2;"); // division not regex
+        assertEquals(2.5, get("x"));
+        eval("var isDigit = /\\d/.test('5');"); // regex literal
+        assertEquals(true, get("isDigit"));
+        // contexts where regex is allowed
+        eval("var a = { re: /test/ };");
+        eval("var b = [/test/];");
+        eval("var c = (/test/);");
+        eval("function test() { return /test/; }");
+        eval("var x = 1; var d = x > 2 ? /yes/ : /no/;");
+        // regex after operators
+        eval("var e = 5 + /test/;");
+        eval("var f = !(/test/.test('no test'));");
+    }
+
+    @Test
+    void testRegexConstructor() {
+        eval("var re = /test/; var str = re.toString()");
+        assertInstanceOf(JsRegex.class, get("re"));
+        assertEquals("/test/", get("str"));
+
+        eval("var re = new RegExp('test'); var str = re.toString()");
+        assertInstanceOf(JsRegex.class, get("re"));
+        assertEquals("/test/", get("str"));
+
+        eval("var re = RegExp('test'); var str = re.toString()");
+        assertInstanceOf(JsRegex.class, get("re"));
+        assertEquals("/test/", get("str"));
+
+        eval("var re = /test/i; var str = re.toString()");
+        assertEquals("/test/i", get("str"));
+        eval("var re = new RegExp('test', 'i'); var str = re.toString()");
+        assertEquals("/test/i", get("str"));
+    }
+
+    @Test
+    void testRegexTest() {
+        eval("var re = /hello/; var res1 = re.test('hello world'); res2 = re.test('world');");
+        assertEquals(true, get("res1"));
+        assertEquals(false, get("res2"));
+
+        // case insensitive
+        eval("var re = /hello/i; var res = re.test('Hello World')");
+        assertEquals(true, get("res"));
+
+        // multi line
+        eval("var re = /^hello/m; var res = re.test('first line\nhello second line')");
+        assertEquals(true, get("res"));
+
+        assertEquals(true, eval("/\\d+/.test('abc123')"));
+        assertEquals(false, eval("/\\d+/.test('abcdef')"));
+    }
+
+    @Test
+    void testRegexExec() {
+        eval("var re = /hello/; var res = re.exec('hello world'); var res0 = res[0]; var ind = res.index;");
+        assertEquals("hello", get("res0"));
+        assertEquals(0, get("ind"));
+
+        // capture groups
+        eval("var re = /(he)(ll)(o)/; var res = re.exec('hello world');"
+                + "var res0 = res[0]; var res1 = res[1]; var res2 = res[2]; var res3 = res[3]");
+        assertEquals("hello", get("res0"));
+        assertEquals("he", get("res1"));
+        assertEquals("ll", get("res2"));
+        assertEquals("o", get("res3"));
+
+        // global flag
+        eval("var re = /\\w+/g; var str = 'hello world'; var res = re.exec(str); var res0 = res[0];"
+                + "var res2 = re.exec(str); var res20 = res2[0];"
+                + "var res3 = re.exec(str); var ind = re.lastIndex;");
+        assertEquals("hello", get("res0"));
+        // second exec should find next match due to lastIndex
+        assertEquals("world", get("res20"));
+        // third exec should return null (no more matches)
+        assertNull(get("res3"));
+        // lastIndex should be reset to 0 after no match found
+        assertEquals(0, get("ind"));
+    }
+
+    @Test
+    void testRegexProperties() {
+        eval("var re = /test/i; var res = re.source");
+        assertEquals("test", get("res"));
+
+        // with escape characters
+        eval("var re = /test\\.com/; var res = re.source");
+        assertEquals("test\\.com", get("res"));
+
+        // flags
+        eval("var re = /test/; var flags = re.flags; var global = re.global; var ignore = re.ignoreCase; var multi = re.multiline;");
+        assertEquals("", get("flags"));
+        assertEquals(false, get("global"));
+        assertEquals(false, get("ignore"));
+        assertEquals(false, get("multi"));
+
+        eval("var re = /test/i; var flags = re.flags; var global = re.global; var ignore = re.ignoreCase; var multi = re.multiline;");
+        assertEquals("i", get("flags"));
+        assertEquals(false, get("global"));
+        assertEquals(true, get("ignore"));
+        assertEquals(false, get("multi"));
+
+        eval("var re = /test/im; var flags = re.flags; var global = re.global; var ignore = re.ignoreCase; var multi = re.multiline;");
+        assertEquals("im", get("flags"));
+        assertEquals(false, get("global"));
+        assertEquals(true, get("ignore"));
+        assertEquals(true, get("multi"));
+        eval("var re = /test/g; var flags = re.flags; var global = re.global; var ignore = re.ignoreCase; var multi = re.multiline;");
+        assertEquals("g", get("flags"));
+        assertEquals(true, get("global"));
+        assertEquals(false, get("ignore"));
+        assertEquals(false, get("multi"));
+
+        // lastIndex
+        eval("var re = /test/g; var ind1 = re.lastIndex; re.test('test'); var ind2 = re.lastIndex; re.lastIndex = 0; var ind3 = re.lastIndex");
+        assertEquals(0, get("ind1"));
+        assertTrue((Integer) get("ind2") > 0);
+        // mutation of lastIndex
+        assertEquals(0, get("ind3"));
+    }
+
+    @Test
+    void testLastIndexUserWriteReachesExec() {
+        // a JS assignment to lastIndex must steer the next global exec
+        assertEquals("2,3", eval("var re = /a/g; re.lastIndex = 2; var m = re.exec('aaaa'); m.index + ',' + re.lastIndex"));
+    }
+
+    @Test
+    void testGlobalFunctionReplaceResetsLastIndex() {
+        // @@replace with a global regex leaves lastIndex at 0 regardless of prior value
+        assertEquals("x,0", eval("var re = /a/g; re.lastIndex = 7; var r = 'a'.replace(re, function() { return 'x' }); r + ',' + re.lastIndex"));
+    }
+
+    @Test
+    void testRegexInArrowFunction() {
+        // Arrow function body starting with regex literal
+        // The parser must recognize that after =>, a / starts a regex (not division)
+        eval("var fn = s => /^test/.test(s); var r1 = fn('testing'); var r2 = fn('no match')");
+        assertEquals(true, get("r1"));
+        assertEquals(false, get("r2"));
+
+        // More complex regex pattern
+        eval("var startsWithDigit = s => /^\\d/.test(s); var r1 = startsWithDigit('123abc'); var r2 = startsWithDigit('abc123')");
+        assertEquals(true, get("r1"));
+        assertEquals(false, get("r2"));
+
+        // Arrow function with regex containing special chars
+        eval("var matchPattern = s => /^1.*/.test(s); var r1 = matchPattern('100'); var r2 = matchPattern('1000'); var r3 = matchPattern('200')");
+        assertEquals(true, get("r1"));
+        assertEquals(true, get("r2"));
+        assertEquals(false, get("r3"));
+
+        // Used in higher-order function context (like isEach in TagSelector)
+        eval("var items = ['100', '1000', '10']; var allMatch = items.every(s => /^1/.test(s))");
+        assertEquals(true, get("allMatch"));
+    }
+
+    @Test
+    void testNamedGroupsExec() {
+        // exec result carries a `groups` object keyed by capture name
+        eval("var m = /(?<y>\\d{4})-(?<m>\\d{2})/.exec('2026-05');"
+                + "var y = m.groups.y; var mo = m.groups.m;");
+        assertEquals("2026", get("y"));
+        assertEquals("05", get("mo"));
+
+        // no named groups -> groups is undefined (surfaces as null via get)
+        eval("var m = /(\\d{4})/.exec('2026'); var g = m.groups; var t = typeof m.groups;");
+        assertNull(get("g"));
+        assertEquals("undefined", get("t"));
+
+        // a named group that didn't participate -> undefined (not "")
+        eval("var m = /(?<a>x)|(?<b>y)/.exec('y'); var a = m.groups.a; var b = m.groups.b;");
+        assertNull(get("a"));
+        assertEquals("y", get("b"));
+
+        // the groups object has a null prototype per spec
+        eval("var m = /(?<y>\\d)/.exec('5'); var proto = Object.getPrototypeOf(m.groups);");
+        assertNull(get("proto"));
+
+        // lookbehind shares the (?< prefix but binds no name
+        eval("var m = /(?<=x)(?<v>\\d)/.exec('x5'); var v = m.groups.v;");
+        assertEquals("5", get("v"));
+    }
+
+    @Test
+    void testNamedGroupsMatchAndReplace() {
+        // String.prototype.match (non-global) surfaces groups
+        eval("var m = '2026-05'.match(/(?<y>\\d{4})-(?<m>\\d{2})/); var s = m.groups.y + '/' + m.groups.m;");
+        assertEquals("2026/05", get("s"));
+
+        // $<name> substitution in replace
+        eval("var s = '2026-05'.replace(/(?<y>\\d{4})-(?<m>\\d{2})/, '$<m>/$<y>');");
+        assertEquals("05/2026", get("s"));
+
+        // function replacer receives a trailing groups object
+        eval("var s = '2026'.replace(/(?<y>\\d{4})/, function() {"
+                + "  var g = arguments[arguments.length - 1]; return g.y; });");
+        assertEquals("2026", get("s"));
+
+        // matchAll yields per-match groups
+        eval("var out = []; for (var m of '1a2b'.matchAll(/(?<d>\\d)/g)) { out.push(m.groups.d); }"
+                + "var s = out.join(',');");
+        assertEquals("1,2", get("s"));
+    }
+
+    @Test
+    void testInvalidRegex() {
+        try {
+            eval("var re = /(/;"); // Unbalanced parenthesis
+            fail("Should have thrown an exception for invalid regex");
+        } catch (Exception e) {
+            assertTrue(e.getMessage().contains("Invalid regular expression"), e.getMessage());
+        }
+    }
+
+    // Repros drawn from the D1 tuning benchmark — Gemma hit "Index 1 out of
+    // bounds for length 1" while parsing a markdown table using the idiomatic
+    // str.replace(/.../g, '') chain to strip separators before parseFloat.
+
+    @Test
+    void testReplaceGlobalEmptyReplacement() {
+        eval("var x = '1,350'.replace(/,/g, '')");
+        assertEquals("1350", get("x"));
+    }
+
+    @Test
+    void testReplaceGlobalCharClassEmptyReplacement() {
+        eval("var x = '  850.00  '.replace(/[^0-9.-]+/g, '')");
+        assertEquals("850.00", get("x"));
+    }
+
+    @Test
+    void testParseFloatAfterReplace() {
+        eval("var x = parseFloat('1,350'.replace(/,/g, ''))");
+        assertEquals(1350, ((Number) get("x")).intValue());
+    }
+
+    @Test
+    void testSplitMapFilterThenIndexAndReplace() {
+        // Full chain from the D1 transcript that threw "Index 1 out of bounds".
+        eval("var row = '| EXP-301 | 2025-07-02 | Sarah Chen | Travel | United | Flight | 850.00 | Approved |';"
+                + "var cols = row.split('|').map(function(c){return c.trim();}).filter(function(c){return c!=='';});"
+                + "var len = cols.length;"
+                + "var amt = parseFloat(cols[6].replace(/,/g, ''));");
+        assertEquals(8, get("len"));
+        assertEquals(850, ((Number) get("amt")).intValue());
+    }
+
+    @Test
+    void testIndexingBeyondLengthReturnsUndefined() {
+        // JS semantics: arr[99] on a length-1 array yields undefined, not an
+        // IndexOutOfBounds. The bug originally surfaced here — a filter() return
+        // is a plain java.util.ArrayList, and out-of-range read needs to come
+        // back as UNDEFINED, not throw.
+        eval("var a = ['only'].filter(function(c){return c!=='';}); var r = a[99]");
+        assertNull(get("r"));
+    }
+
+    @Test
+    void testSplitByPipeLength() {
+        // split() returns Arrays$ArrayList — check length comes through
+        eval("var cols = '|a|b|c|'.split('|'); var n = cols.length");
+        assertEquals(5, ((Number) get("n")).intValue());
+    }
+
+    @Test
+    void testSplitMapFilterLength() {
+        // split().map().filter() — chain before the crashing index read
+        eval("var cols = '|a|b|c|'.split('|').map(function(c){return c.trim();}).filter(function(c){return c!=='';}); var n = cols.length");
+        assertEquals(3, ((Number) get("n")).intValue());
+    }
+
+    @Test
+    void testSplitMapFilterIndexInRange() {
+        // Read an IN-RANGE index from a filter() result — does NOT need
+        // out-of-range handling, just checks the pipeline.
+        eval("var cols = '|a|b|c|'.split('|').map(function(c){return c.trim();}).filter(function(c){return c!=='';}); var first = cols[0]");
+        assertEquals("a", get("first"));
+    }
+
+
+    @Test
+    void testStickyFlagAdvancesLastIndex() {
+        // Spec §22.2.7.2: `y` consults and advances lastIndex just like `g`.
+        assertEquals(1, eval("var y = /a/y; y.exec('aab'); y.lastIndex"));
+        assertEquals(2, eval("var y = /a/y; y.exec('aab'); y.exec('aab'); y.lastIndex"));
+        assertEquals(true, eval("var y = /a/y; y.test('aab')"));
+        assertEquals(1, eval("var y = /a/y; y.test('aab'); y.lastIndex"));
+        // ...but unlike `g`, a match must START at lastIndex; a miss there
+        // returns null and resets lastIndex to 0.
+        assertNull(eval("var y = /b/y; y.exec('aab')"));
+        assertEquals(0, eval("var y = /b/y; y.exec('aab'); y.lastIndex"));
+        assertEquals(false, eval("var y = /b/y; y.test('aab')"));
+        // /g still scans forward from lastIndex — the contrast that makes /y /y.
+        assertEquals(3, eval("var g = /b/g; g.exec('aab'); g.lastIndex"));
+        // A user-set lastIndex is honored, and one past the end is a clean miss.
+        assertEquals("b", eval("var y = /b/y; y.lastIndex = 2; y.exec('aab')[0]"));
+        assertNull(eval("var y = /a/y; y.lastIndex = 99; y.exec('aab')"));
+        // exec-loop idiom: /y tokenizes contiguously, then stops at the gap.
+        assertEquals(List.of("ab", "ab"), eval(
+                "var y = /ab/y; var out = []; var m;"
+                        + " while ((m = y.exec('ababXab')) !== null) out.push(m[0]);"
+                        + " out"));
+    }
+
+}

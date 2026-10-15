@@ -1,0 +1,664 @@
+# Karate V2 Mock Server
+
+This document describes the mock server for Karate V2.
+
+> See also: [DESIGN.md](./DESIGN.md) | [CLI.md](./CLI.md)
+
+---
+
+## Overview
+
+Mock servers in Karate allow you to create API test-doubles using feature files. Scenarios act as request matchers, with JavaScript expressions determining which scenario handles each incoming request.
+
+> **Trusted networks only.** The mock server (and `HttpServer` generally) is developer test tooling for your machine, CI, or a trusted internal network. Never expose it to untrusted or public clients. A mock feature is *trusted code*: it can read files, run processes and call Java with the JVM's privileges. As defense-in-depth, request data (`request`, `requestHeaders`, `requestParams`, `pathParams`, `requestUrlBase`, etc.) is treated as inert by default: embedded `#(...)` in it is not evaluated, in a JSON and an XML body alike, nor in a value the mock's JS builds from it (`'Hello ' + request.name`) — an embedded expression inside a JS-built value runs only when it is written in the mock feature or in a file the mock `read()`s; a match marker (`#(...)`, `##(...)`, `#[] ...`, `#? ...`) on the expected side of `match` or `karate.match()` sees the mock's variables and `karate` only when it is written in the mock feature itself (a comment does not count) — any other marker (request data, anything computed from it at runtime, a schema loaded with `read()`, or whatever an author-written marker such as `#(request.x)` evaluates to) is matched in a fresh engine with no variables; and Java interop and process execution (`karate.exec`, `karate.fork`) are off. A feature the mock calls (`call`, `callonce`, `karate.call()`) inherits all of this: the same switches, the same inert request data, and the marker rule applied to its own source. A trusted mock can opt back in with `configure requestExpressionsEnabled = true` (request expressions and match markers) and `configure javaBridgeEnabled = true`, and the features it calls follow. See [SECURITY.md](../SECURITY.md) and the [trust boundary docs](https://docs.karatelabs.io/extensions/test-doubles#security-and-trust-boundary).
+
+---
+
+## Architecture
+
+```
+CLI / karate.start()
+        ↓
+    MockServer (HttpServer wrapper)
+        ↓
+    MockHandler implements Function<HttpRequest, HttpResponse>
+        ↓
+    ┌───────────────────────────────────────────┐
+    │  For each request:                        │
+    │  1. Set up request variables              │
+    │  2. Evaluate scenarios (first match wins) │
+    │  3. Execute matched scenario              │
+    │  4. Build response from variables         │
+    └───────────────────────────────────────────┘
+```
+
+### Core Classes
+
+| Class | Location | Description |
+|-------|----------|-------------|
+| `MockServer` | `io.karatelabs.core.MockServer` | Public API, wraps HttpServer with mock feature handling |
+| `MockHandler` | `io.karatelabs.core.MockHandler` | Request routing and scenario execution |
+| `MockConfig` | `io.karatelabs.core.MockConfig` | Global mock configuration (CORS, headers, hooks) |
+
+---
+
+## Feature File Structure
+
+```gherkin
+Feature: User API Mock
+
+Background:
+  # Executes ONCE on server startup (not per request)
+  * def users = {}
+  * def uuid = function(){ return java.util.UUID.randomUUID() + '' }
+  * configure cors = true
+  * configure responseHeaders = { 'Content-Type': 'application/json' }
+
+Scenario: pathMatches('/users/{id}') && methodIs('get')
+  * def user = users[pathParams.id]
+  * def response = user
+  * def responseStatus = user ? 200 : 404
+
+Scenario: pathMatches('/users') && methodIs('post')
+  * def id = uuid()
+  * users[id] = request
+  * users[id].id = id
+  * def response = users[id]
+  * def responseStatus = 201
+
+Scenario:
+  # Catch-all (no matcher expression = always matches)
+  * def responseStatus = 404
+  * def response = { error: 'not found' }
+```
+
+### Mock Feature Structure
+
+- **Background** executes once on server startup
+- **Scenarios** are request matchers, not test cases
+- **Scenario names** are JavaScript expressions for matching
+- **`Scenario Outline`** is NOT supported in mock mode
+
+---
+
+## Request Variables
+
+Available in all mock scenarios:
+
+| Variable | Type | Description |
+|----------|------|-------------|
+| `request` | Object | Parsed request body (JSON object, XML, or string) |
+| `requestBytes` | byte[] | Raw request body bytes |
+| `requestPath` | String | URL path without query string (e.g., `/users/123`) |
+| `requestUri` | String | Path with query string (e.g., `/users?name=bob`) |
+| `requestUrlBase` | String | Base URL (e.g., `http://localhost:8080`) |
+| `requestMethod` | String | HTTP method in uppercase (GET, POST, etc.) |
+| `requestHeaders` | Map | Request headers as `Map<String, List<String>>` |
+| `requestCookies` | Map | Request cookies as `Map<String, { name, value }>` |
+| `requestParams` | Map | Query string or form parameters |
+| `requestParts` | Map | Multipart request parts (file uploads) |
+| `pathParams` | Map | Path parameters extracted by `pathMatches()` |
+
+---
+
+## Response Variables
+
+Set these in scenarios to configure the response:
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `response` | any | null | Response body (auto-serialized to JSON/XML/text) |
+| `responseStatus` | int | 200 | HTTP status code |
+| `responseHeaders` | Map | {} | Additional response headers |
+| `responseDelay` | int | 0 | Delay in milliseconds before sending response |
+
+---
+
+## Matcher Functions
+
+### pathMatches(pattern)
+
+Match URL path with placeholder extraction:
+
+```javascript
+pathMatches('/users/{id}')           // Extracts { id: '123' } from /users/123
+pathMatches('/v1/cats/{catId}/toys') // Multiple placeholders supported
+```
+
+### methodIs(method)
+
+Case-insensitive HTTP method check:
+
+```javascript
+methodIs('get')
+methodIs('POST')
+```
+
+### typeContains(substring)
+
+Check Content-Type header contains substring:
+
+```javascript
+typeContains('json')  // Matches application/json, application/ld+json
+typeContains('xml')   // Matches text/xml, application/xml
+```
+
+### acceptContains(substring)
+
+Check Accept header contains substring:
+
+```javascript
+acceptContains('json')
+```
+
+### headerContains(name, value)
+
+Check if any value of a header contains substring:
+
+```javascript
+headerContains('Authorization', 'Bearer')
+```
+
+### headerValue(name)
+
+Get a request header value as a String (or `null` if absent). Case-insensitive on
+`name`, returns the last value when the header appears multiple times. Cleaner
+than reaching into the raw `requestHeaders` map (and shaped consistently with
+`paramValue` / `paramExists`):
+
+```javascript
+// instead of: requestHeaders['authorization'][0]
+headerValue('Authorization')   // -> 'Bearer eyJhbGciOi...'
+```
+
+### paramValue(name)
+
+Get query/form parameter value:
+
+```javascript
+paramValue('page')  // Returns string or null
+```
+
+### paramExists(name)
+
+Check if parameter exists:
+
+```javascript
+paramExists('debug')
+```
+
+### bodyPath(expression)
+
+Extract value from request body using JsonPath or XPath:
+
+```javascript
+bodyPath('$.user.name')  // JsonPath
+bodyPath('/root/item')   // XPath (paths starting with /)
+```
+
+---
+
+## Configuration
+
+### CORS
+
+```gherkin
+Background:
+  * configure cors = true
+```
+
+When enabled:
+- OPTIONS requests return 200 with CORS headers (no scenario matching)
+- All responses include `Access-Control-Allow-Origin: *`
+
+### Response Headers
+
+```gherkin
+Background:
+  * configure responseHeaders = { 'Content-Type': 'application/json' }
+```
+
+Applied to all responses. Scenario-level `responseHeaders` overrides. Both override the `Content-Type` inferred from the `response` body (a string infers `text/plain`), so a string body served as `text/xml` keeps that type and its bytes unchanged. Header names are compared case-insensitively — `content-type` replaces `Content-Type` rather than adding a second one.
+
+### beforeScenario
+
+```gherkin
+Background:
+  * configure beforeScenario = function(){ karate.log('request received') }
+```
+
+Executes per request, before scenario matching runs. Useful for per-request setup since a mock `Background` only runs once at server init.
+
+### afterScenario
+
+```gherkin
+Background:
+  * configure afterScenario = function(){ karate.log('request handled') }
+```
+
+Executes per request after the matched scenario completes, before the response is sent.
+
+**Hook failures** (either hook) surface as HTTP 500 with an `error` field in the body — same convention as step failures. Wrap the hook body in `try/catch` if you want to suppress errors.
+
+Both hooks are also supported for regular (non-mock) scenarios. `beforeScenario` fires before `Background` steps, so it must be defined in `karate-config.js` to apply to the current scenario; defining it inside a feature's `Background` is a no-op for that scenario.
+
+---
+
+## Stateful Mocks
+
+Variables defined in `Background` persist across requests:
+
+```gherkin
+Background:
+  * def counter = { value: 0 }
+
+Scenario: pathMatches('/increment')
+  * counter.value = counter.value + 1
+  * def response = { count: counter.value }
+```
+
+**Thread safety:** The handler synchronizes request processing to prevent concurrent access to shared state.
+
+---
+
+## JavaScript File Handlers
+
+For programmatic control, you can use pure JavaScript files instead of feature files. This is useful for:
+- Integration testing with custom server setups
+- Embedding mock logic in Java applications
+- Dynamic request routing without Gherkin overhead
+
+### JS File Structure
+
+```javascript
+// mock.js - evaluated as a block for each request
+// Available: request, response, session
+
+session.items = session.items || {};
+session.counter = session.counter || 1;
+
+if (request.pathMatches('/items/{id}')) {
+    var id = request.pathParams.id;
+    if (request.get) {
+        var item = session.items[id];
+        if (item) {
+            response.body = item;
+        } else {
+            response.status = 404;
+            response.body = { error: 'Not found' };
+        }
+    } else if (request.delete) {
+        delete session.items[id];
+        response.status = 204;
+    }
+} else if (request.pathMatches('/items')) {
+    if (request.get) {
+        response.body = Object.values(session.items);
+    } else if (request.post) {
+        var id = '' + session.counter++;
+        var item = request.body;
+        item.id = id;
+        session.items[id] = item;
+        response.status = 201;
+        response.body = item;
+    }
+} else {
+    response.status = 404;
+    response.body = { error: 'Unknown path' };
+}
+```
+
+### Using JS Files with ServerTestHarness
+
+For integration testing:
+
+```java
+import io.karatelabs.http.ServerTestHarness;
+
+ServerTestHarness harness = new ServerTestHarness("classpath:mocks");
+harness.start();
+
+harness.setHandler(ctx -> {
+    ctx.evalFile("classpath:mocks/crud-mock.js");
+    return ctx.response();
+});
+
+// Make requests
+HttpResponse response = harness.post("/items", Map.of("name", "Widget"));
+assertEquals(201, response.getStatus());
+
+harness.stop();
+```
+
+### Using JS Files with HttpServer Directly
+
+Standalone, without the test harness (still on a trusted network only — see [Overview](#overview)):
+
+```java
+import io.karatelabs.common.Resource;
+import io.karatelabs.http.HttpServer;
+import io.karatelabs.http.Session;
+import io.karatelabs.js.Engine;
+
+Session session = Session.inMemory();
+String mockJs = Resource.path("classpath:mocks/api.js").getText();
+
+HttpServer server = HttpServer.start(8080, request -> {
+    HttpResponse response = new HttpResponse();
+    Engine engine = new Engine();
+    engine.put("request", request);
+    engine.put("response", response);
+    engine.put("session", session);
+    engine.eval(mockJs);
+    return response;
+});
+```
+
+### Available Objects in JS Files
+
+Same as feature file mocks:
+
+| Object | Description |
+|--------|-------------|
+| `request` | HTTP request with `get`, `post`, `put`, `delete`, `pathMatches()`, `pathParams`, `body`, `bodyJson`, `bodyString`, `bodyBytes`, `param()`, `header()`, `cookies`, `proceed()` |
+| `response` | HTTP response with `status`, `body`, `headers` |
+| `session` | Persistent state across requests |
+
+**Body accessors:** `request.body` is *content-type-converted* — a JSON `Content-Type` (or, for V1 compatibility, a body with no `Content-Type` at all that starts with `{`/`[`) arrives as an already-parsed Map/List, plain text as a string, binary as bytes. A body that declares a non-JSON `Content-Type` yet starts with `{`/`[` is parsed only if the *whole* document is valid JSON — so a `text/plain` TOML file opening with `[table]` stays a string. When the handler expects JSON, prefer **`request.bodyJson`**: it returns the parsed object/array in every case (already-parsed → as-is, string → lenient parse) and `null` for an unparsable/blank/binary body — never a throw. `request.bodyString` / `request.bodyBytes` give raw access. Assigning a Map/List to `response.body` serializes it as JSON and sets the `Content-Type` automatically; assigning a string sets `text/plain`.
+
+`request.cookies` mirrors the feature-file `requestCookies` shape — a `Map<String, { name, value }>` keyed by cookie name. Read a single cookie's value as `request.cookies['name'].value`. Returns an empty map when the request had no `Cookie` header.
+
+```javascript
+// auth-checking JS mock
+var sid = request.cookies['session'];
+if (!sid || !sessions[sid.value]) {
+    response.status = 401;
+    response.body = { error: 'unauthorized' };
+} else {
+    response.body = { user: sessions[sid.value].userId };
+}
+```
+
+### Proxy Mode in JS Files
+
+`request.proceed(url)` forwards the current request to a backend and returns the response — the JS-mock equivalent of `karate.proceed()`. Omit the URL to target the request's `Host` header.
+
+```javascript
+// Forward and return backend response as-is
+var r = request.proceed('http://real-backend:8080');
+response.status = r.status;
+response.body = r.body;
+
+// Modify response before returning
+var r = request.proceed('http://real-backend:8080');
+response.body = { original: r.body, modifiedAt: new Date().toISOString() };
+```
+
+---
+
+## Proxy Mode
+
+Forward requests to a real backend:
+
+```gherkin
+Scenario: requestPath.startsWith('/api')
+  * def response = karate.proceed('http://real-backend:8080')
+
+Scenario: requestPath.startsWith('/proxy')
+  # Use host from incoming request (true HTTP proxy)
+  * def response = karate.proceed()
+```
+
+`karate.proceed()` forwards the request and returns the response, which can be modified before returning.
+
+---
+
+## Java API
+
+### MockServer
+
+```java
+// Start mock server from feature file
+MockServer server = MockServer.feature("api.feature")
+    .port(8080)
+    .ssl(true)
+    .arg(Map.of("key", "value"))
+    .start();
+
+// Start from inline feature string
+MockServer server = MockServer.featureString("""
+    Feature: Test Mock
+    Scenario: methodIs('get')
+      * def response = { hello: 'world' }
+    """)
+    .port(0)  // Dynamic port
+    .start();
+
+// With watch mode (hot-reload on file changes)
+MockServer server = MockServer.feature("api.feature")
+    .port(8080)
+    .watch(true)
+    .start();
+
+// Get server info
+int port = server.getPort();
+String url = server.getUrl();  // http://localhost:8080
+
+// Stop server
+server.stopAsync();     // Non-blocking
+server.stopAndWait();   // Blocking
+```
+
+### karate.start() (from feature files)
+
+```javascript
+// Start mock server from test feature
+var server = karate.start({ mock: 'api.feature', port: 8443, ssl: true });
+
+// Use the server
+var port = server.port;
+var url = server.url;
+
+// Stop when done
+server.stop();
+```
+
+---
+
+## CLI
+
+```bash
+# Start mock server
+karate mock -m users.feature -p 8080
+
+# Multiple mock files
+karate mock -m users.feature -m orders.feature -p 8080
+
+# With SSL
+karate mock -m api.feature -p 8443 --ssl
+
+# With custom certificate
+karate mock -m api.feature -p 8443 --ssl --cert cert.pem --key key.pem
+
+# With watch mode (hot-reload on file changes)
+karate mock -m api.feature -p 8080 -W
+```
+
+CLI options:
+- `-m, --mock <file>` - Mock feature file (repeatable)
+- `-p, --port <port>` - Port to listen on (default: 0 = dynamic)
+- `-s, --ssl` - Enable HTTPS
+- `-c, --cert <file>` - SSL certificate (PEM)
+- `-k, --key <file>` - SSL private key (PEM)
+- `-W, --watch` - Enable hot-reload when feature files change
+- `--path-prefix <prefix>` - URL path prefix to strip
+- `--max-initial-line-length <bytes>`, `--max-header-size <bytes>`, `--max-content-length <bytes>` - request limits, see below
+
+---
+
+## Request Limits
+
+The mock (and any `HttpServer`) bounds each HTTP/1.x request. All values are bytes and must be positive — zero or negative throws `IllegalArgumentException` at configuration time.
+
+| Limit | Default | Over the limit |
+|-------|---------|----------------|
+| `maxInitialLineLength` — request line (method, URI, version) | 4096 | `414 Request-URI Too Long`, connection closed |
+| `maxHeaderSize` — all request headers together | 8192 | `431 Request Header Fields Too Large`, connection closed |
+| `maxContentLength` — aggregated request body | 1048576 (1 MiB) | `413 Request Entity Too Large` |
+
+A rejected request never reaches the mock scenarios. Set them with `MockServer.Builder` (`.maxHeaderSize(16384)`), `HttpServer.builder()`, `karate.start({ mock: 'api.feature', maxHeaderSize: 16384 })`, or the CLI options above. HTTP/2 is not covered.
+
+---
+
+## SSL/TLS Configuration
+
+### Server-Side SSL (Mock Server)
+
+```java
+// Auto-generated self-signed certificate
+MockServer server = MockServer.feature("api.feature")
+    .port(8443)
+    .ssl(true)
+    .start();
+
+// With custom certificate
+MockServer server = MockServer.feature("api.feature")
+    .port(8443)
+    .ssl(true)
+    .certPath("cert.pem")
+    .keyPath("key.pem")
+    .start();
+```
+
+### Client-Side SSL
+
+The Karate HTTP client trusts all certificates and skips hostname verification by default, so tests can reach targets with self-signed certificates without any configuration. This is intentional for a test client; see [SECURITY.md](../SECURITY.md).
+
+```gherkin
+# Trust all certificates (for self-signed) - same as the default, made explicit
+* configure ssl = true
+
+# With keystore for mTLS
+* configure ssl = { keyStore: 'classpath:client.pfx', keyStorePassword: 'secret', keyStoreType: 'pkcs12' }
+```
+
+---
+
+## Testing
+
+### Unit Tests (MockHandlerTest)
+
+In-memory tests without starting HTTP server:
+
+```java
+@Test
+void testSimpleGetResponse() {
+    Feature feature = Feature.read(Resource.text("""
+        Feature: Test Mock
+        Scenario: pathMatches('/hello')
+          * def response = { message: 'world' }
+        """));
+
+    MockHandler handler = new MockHandler(feature);
+    HttpRequest request = new HttpRequest();
+    request.setMethod("GET");
+    request.setPath("/hello");
+
+    HttpResponse response = handler.apply(request);
+
+    assertEquals(200, response.getStatus());
+    assertTrue(response.getBodyString().contains("world"));
+}
+```
+
+### Integration Tests (MockServerTest)
+
+Real HTTPS connections with shared server:
+
+```java
+@BeforeAll
+static void startServer() {
+    server = MockServer.featureString("""
+        Feature: Integration Test Mock
+        Background:
+          * def users = {}
+        Scenario: pathMatches('/users/{id}')
+          * def response = users[pathParams.id]
+        """)
+        .port(0)
+        .ssl(true)
+        .start();
+}
+```
+
+### End-to-End Tests (MockE2eTest)
+
+Running Karate features against a mock server:
+
+```java
+@Test
+void testPaymentsMockCrud() {
+    ScenarioRuntime sr = runFeature(new ApacheHttpClient(), """
+        Feature: Test Payments
+        Scenario: Create and get payment
+        * url 'http://localhost:%d'
+        * path '/payments'
+        * request { amount: 100 }
+        * method post
+        * status 200
+        """.formatted(port));
+
+    assertPassed(sr);
+}
+```
+
+---
+
+## V1 Compatibility
+
+### Preserved Behavior
+- Scenario matching: first match wins
+- Background executes once on startup
+- Same request/response variables
+- Same matcher function signatures
+- CORS and configure options
+
+### V2 Improvements
+- No "re-hydration" - objects pass directly via JsCallable
+- Cleaner thread-local management
+- MockServer as simple wrapper over HttpServer
+- CLI under `mock` subcommand
+
+### Not Implemented
+- WebSocket support
+- gRPC/Kafka mocking
+- Browser/driver automation
+
+---
+
+## File Structure
+
+```
+karate/
+├── karate-core/src/main/java/io/karatelabs/core/
+│   ├── MockServer.java          # Public API
+│   ├── MockHandler.java         # Request routing
+│   ├── MockConfig.java          # Configuration
+│   ├── SslConfig.java           # SSL configuration
+│   ├── SslContextFactory.java   # SSLContext creation
+│   └── SslUtils.java             # SSL utilities
+├── karate-core/src/main/java/io/karatelabs/cli/
+│   └── MockCommand.java         # CLI subcommand
+└── karate-core/src/test/java/io/karatelabs/core/mock/
+    ├── MockHandlerTest.java     # Unit tests (11 tests)
+    ├── MockServerTest.java      # Integration tests (6 tests)
+    ├── MockProxyTest.java       # Proxy mode tests (3 tests)
+    └── MockE2eTest.java         # End-to-end tests (35+ tests)
+```
+
+---
+
+## References
+
+- V1 MockHandler: `karate-core/src/main/java/com/intuit/karate/core/MockHandler.java` (in the v1 tree)
+- V1 Documentation: `karate-netty/README.md` (in the v1 tree)

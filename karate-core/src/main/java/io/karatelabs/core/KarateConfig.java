@@ -1,0 +1,1069 @@
+/*
+ * The MIT License
+ *
+ * Copyright 2025 Karate Labs Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package io.karatelabs.core;
+
+import io.karatelabs.js.SimpleObject;
+import org.slf4j.Logger;
+import io.karatelabs.output.LogContext;
+import io.karatelabs.output.LogLevel;
+import io.karatelabs.output.LogMask;
+
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+
+/**
+ * Holds runtime configuration settings set via the 'configure' keyword.
+ * <p>
+ * This is distinct from:
+ * <ul>
+ *   <li>{@link KaratePom} - Project file (karate-pom.json) for CLI options</li>
+ *   <li>karate-config.js - Runtime bootstrap that runs per-scenario</li>
+ * </ul>
+ * <p>
+ * Example usage:
+ * <pre>
+ * * configure ssl = true
+ * * configure proxy = 'http://proxy:8080'
+ * * configure readTimeout = 60000
+ * * def cfg = karate.config
+ * * match cfg.sslEnabled == true
+ * </pre>
+ * <p>
+ * Implements {@link SimpleObject} so it can be accessed as a JavaScript object
+ * via {@code karate.config}.
+ */
+public class KarateConfig implements SimpleObject {
+
+    private static final Logger logger = LogContext.RUNTIME_LOGGER;
+
+    // Keys exposed via SimpleObject
+    private static final List<String> KEYS = List.of(
+            // HTTP client settings
+            "url", "readTimeout", "connectTimeout", "followRedirects", "localAddress", "charset",
+            "strictResponseParsing",
+            // Grouped settings (Maps)
+            "ssl", "proxy", "auth", "retry", "report", "logging", "callSingleCache",
+            // Headers/Cookies
+            "headers", "cookies",
+            // HTTP retry
+            "httpRetryEnabled",
+            // Execution control
+            "continueOnStepFailure", "abortedStepsShouldPass", "abortSuiteOnFailure", "matchEachEmptyAllowed",
+            // Mock settings
+            "corsEnabled", "responseHeaders", "afterScenario", "afterScenarioOutline", "afterFeature", "onStepFailure",
+            // Driver
+            "driverConfig"
+    );
+
+    // ===== HTTP Client =====
+    private String url;
+    private int readTimeout = 30000;
+    private int connectTimeout = 30000;
+    private boolean followRedirects = true;
+    private String localAddress;
+    private Charset charset = StandardCharsets.UTF_8;
+    // response body conversion honors the DECLARED Content-Type only (no first-char sniffing);
+    // default false = the V1-compatible lenient sniff. See HttpResponse#getBodyConverted.
+    private boolean strictResponseParsing;
+
+    // ===== Grouped Settings (Maps) =====
+
+    // SSL configuration: { enabled, algorithm, keyStore, keyStorePassword, keyStoreType,
+    //                      trustStore, trustStorePassword, trustStoreType, trustAll }
+    private Map<String, Object> ssl = new HashMap<>();
+
+    // Proxy configuration: { uri, username, password, nonProxyHosts }
+    private Map<String, Object> proxy = new HashMap<>();
+
+    // Auth: { type, username, password, token, accessTokenUrl, clientId, clientSecret, scope, domain, workstation }
+    // Supported types: basic, bearer, oauth2, ntlm
+    private Map<String, Object> auth = new HashMap<>();
+
+    // Retry: { interval, count }
+    private Map<String, Object> retry = new HashMap<>(Map.of("interval", 3000, "count", 3));
+
+    // Report: { showLog, showAllSteps }
+    private Map<String, Object> report = new HashMap<>(Map.of("showLog", true, "showAllSteps", true));
+
+    // Logging: { report, console, pretty, mask }
+    //   report  - threshold for what gets captured into the report buffer (default DEBUG)
+    //   console - threshold for SLF4J/console output (default INFO)
+    //   pretty  - pretty-print HTTP request/response JSON bodies (default true)
+    //   mask    - declarative HTTP redaction { headers, jsonPaths, patterns, replacement, enableForUri }
+    private Map<String, Object> logging = new HashMap<>(Map.of(
+            "report", "debug",
+            "console", "info",
+            "pretty", true
+    ));
+    // Compiled form of logging.mask. KarateConfig is the source of truth — LogContext is a
+    // per-thread cache that ScenarioRuntime.call() repopulates from this field at scenario
+    // entry. Keeps mask/pretty alive across the LogContext.set() reset done at call() entry,
+    // which previously dropped any mask set during karate-config.js.
+    private LogMask compiledMask;
+
+    // CallSingleCache: { minutes, dir }
+    private Map<String, Object> callSingleCache = new HashMap<>();
+
+    // ===== Non-HTTP =====
+    private Object headers;  // Map<String,Object> or JS function
+    private Object cookies;  // Map<String,Object>
+
+    // HTTP retry (separate from the retry config map: this is the on/off switch)
+    private boolean httpRetryEnabled;
+
+    // Execution control
+    private boolean continueOnStepFailure;
+    private boolean abortedStepsShouldPass;
+    private boolean abortSuiteOnFailure;
+    private boolean matchEachEmptyAllowed;
+
+    // Mock settings
+    private boolean corsEnabled;
+    private Object responseHeaders;  // Map<String,Object> or JS function
+    // Lifecycle hooks. beforeScenario set inside a Background does NOT fire for the current
+    // scenario (it runs before Background) - define in karate-config.js to apply from the first scenario.
+    // Hook exceptions always fail the enclosing scenario - wrap hook bodies in try/catch if you want
+    // to suppress errors (same convention as regular steps).
+    private Object beforeScenario;        // Invokable - hook called before each scenario (before Background)
+    private Object afterScenario;         // Invokable - hook called after each scenario
+    private Object afterScenarioOutline;  // Invokable - hook called after all examples of an outline complete
+    private Object afterFeature;          // Invokable - hook called after feature completes
+    // Fires when a Gherkin step fails (match/assert/HTTP/driver/etc). Receives a single info arg:
+    //   { error, step: { line, text, prefix }, scenarioName, featureName,
+    //     embed(bytes, mime, name?),  // attach to the failed step's StepResult
+    //     proceed(),                  // override: soft-assert this failure (per-step)
+    //     stop()                      // override: hard-stop this failure (per-step)
+    //   }
+    // If the hook calls neither proceed() nor stop(), the runtime falls back to the static
+    // continueOnStepFailure config flag. Hook exceptions are caught and warn-logged - a failing
+    // onStepFailure hook never escalates into a second scenario failure. Only fires at the
+    // innermost failure: a `call` step whose callee already fired onStepFailure is suppressed
+    // (mirrors v1's isWithCallResults guard).
+    private Object onStepFailure;         // Invokable - hook called when a Gherkin step fails
+
+    // Driver configuration (Map or DriverOptions)
+    private Object driverConfig;
+
+
+    /**
+     * Create a deep copy of this configuration.
+     * Used to snapshot config state for callonce/callSingle isolation.
+     *
+     * @return a new KarateConfig with copied values
+     */
+    public KarateConfig copy() {
+        KarateConfig copy = new KarateConfig();
+        copy.copyFrom(this);
+        return copy;
+    }
+
+    /**
+     * Copy all configuration values from another KarateConfig.
+     * Used to propagate config changes from called features back to the caller.
+     *
+     * @param other the source config to copy from
+     */
+    public void copyFrom(KarateConfig other) {
+        if (other == null) return;
+        // HTTP client settings
+        this.url = other.url;
+        this.readTimeout = other.readTimeout;
+        this.connectTimeout = other.connectTimeout;
+        this.followRedirects = other.followRedirects;
+        this.localAddress = other.localAddress;
+        this.charset = other.charset;
+        this.strictResponseParsing = other.strictResponseParsing;
+        // Grouped settings (deep copy Maps)
+        this.ssl = new HashMap<>(other.ssl);
+        this.proxy = new HashMap<>(other.proxy);
+        if (other.proxy.containsKey("nonProxyHosts") && other.proxy.get("nonProxyHosts") instanceof List<?> list) {
+            this.proxy.put("nonProxyHosts", new ArrayList<>(list));
+        }
+        this.auth = new HashMap<>(other.auth);
+        this.retry = new HashMap<>(other.retry);
+        this.report = new HashMap<>(other.report);
+        this.logging = new HashMap<>(other.logging);
+        // logging.mask is a LogMask (immutable from our perspective) — shallow copy is fine
+        this.compiledMask = other.compiledMask;
+        this.callSingleCache = new HashMap<>(other.callSingleCache);
+        // Headers/Cookies (shallow copy - could be function refs)
+        this.headers = other.headers;
+        this.cookies = other.cookies;
+        // HTTP retry
+        this.httpRetryEnabled = other.httpRetryEnabled;
+        // Execution control
+        this.continueOnStepFailure = other.continueOnStepFailure;
+        this.abortedStepsShouldPass = other.abortedStepsShouldPass;
+        this.abortSuiteOnFailure = other.abortSuiteOnFailure;
+        this.matchEachEmptyAllowed = other.matchEachEmptyAllowed;
+        // Mock settings
+        this.corsEnabled = other.corsEnabled;
+        this.responseHeaders = other.responseHeaders;
+        this.beforeScenario = other.beforeScenario;
+        this.afterScenario = other.afterScenario;
+        this.afterScenarioOutline = other.afterScenarioOutline;
+        this.afterFeature = other.afterFeature;
+        this.onStepFailure = other.onStepFailure;
+        // Driver
+        this.driverConfig = other.driverConfig;
+    }
+
+    /**
+     * Three-way merge used when a cached {@code callonce} result is replayed into a later
+     * scenario. Only the keys the callee actually changed are applied — that is, the ones
+     * that differ between the {@code before} and {@code after} snapshots taken around the one
+     * real execution. Everything else keeps this config's current (per-scenario) value.
+     * <p>
+     * A wholesale {@link #copyFrom(KarateConfig)} would also stamp the *caller's* state at the
+     * time of that first execution over every later scenario. That is invisible for plain data
+     * but wrong for values that are JS functions - a lifecycle hook or a {@code configure headers}
+     * function is re-created per scenario by karate-config.js and is bound to that scenario's JS
+     * context. Replaying the first scenario's instance made every later {@code afterScenario} hook
+     * read the first scenario's variables (e.g. {@code karate.get('response')} stayed frozen).
+     * <p>
+     * Known limitation: this diffs by value, where {@link StepUtils#calleeDelta} diffs variables by
+     * identity. So a callee that sets a key to exactly the value the caller already had at that
+     * moment is indistinguishable from a callee that left it alone, and later scenarios keep their
+     * own value for it. Reaching that needs config that varies per scenario (an outline row) plus a
+     * callee setting the same key to one row's value - narrow enough to leave alone; closing it
+     * would mean tracking which keys were explicitly configured rather than comparing values.
+     *
+     * @param before config snapshot taken just before the cached execution ran
+     * @param after  config snapshot taken just after it completed
+     */
+    public void copyChangedFrom(KarateConfig before, KarateConfig after) {
+        if (after == null) return;
+        if (before == null) {
+            copyFrom(after);
+            return;
+        }
+        // HTTP client settings
+        if (!Objects.equals(before.url, after.url)) this.url = after.url;
+        if (before.readTimeout != after.readTimeout) this.readTimeout = after.readTimeout;
+        if (before.connectTimeout != after.connectTimeout) this.connectTimeout = after.connectTimeout;
+        if (before.followRedirects != after.followRedirects) this.followRedirects = after.followRedirects;
+        if (!Objects.equals(before.localAddress, after.localAddress)) this.localAddress = after.localAddress;
+        if (!Objects.equals(before.charset, after.charset)) this.charset = after.charset;
+        if (before.strictResponseParsing != after.strictResponseParsing) this.strictResponseParsing = after.strictResponseParsing;
+        // Grouped settings (deep copy Maps)
+        if (!before.ssl.equals(after.ssl)) this.ssl = new HashMap<>(after.ssl);
+        if (!before.proxy.equals(after.proxy)) {
+            this.proxy = new HashMap<>(after.proxy);
+            if (after.proxy.get("nonProxyHosts") instanceof List<?> list) {
+                this.proxy.put("nonProxyHosts", new ArrayList<>(list));
+            }
+        }
+        if (!before.auth.equals(after.auth)) this.auth = new HashMap<>(after.auth);
+        if (!before.retry.equals(after.retry)) this.retry = new HashMap<>(after.retry);
+        if (!before.report.equals(after.report)) this.report = new HashMap<>(after.report);
+        if (!before.logging.equals(after.logging)) {
+            this.logging = new HashMap<>(after.logging);
+            this.compiledMask = after.compiledMask;
+        }
+        if (!before.callSingleCache.equals(after.callSingleCache)) this.callSingleCache = new HashMap<>(after.callSingleCache);
+        // Headers/Cookies (shallow copy - could be function refs)
+        if (!Objects.equals(before.headers, after.headers)) this.headers = after.headers;
+        if (!Objects.equals(before.cookies, after.cookies)) this.cookies = after.cookies;
+        // HTTP retry
+        if (before.httpRetryEnabled != after.httpRetryEnabled) this.httpRetryEnabled = after.httpRetryEnabled;
+        // Execution control
+        if (before.continueOnStepFailure != after.continueOnStepFailure) this.continueOnStepFailure = after.continueOnStepFailure;
+        if (before.abortedStepsShouldPass != after.abortedStepsShouldPass) this.abortedStepsShouldPass = after.abortedStepsShouldPass;
+        if (before.abortSuiteOnFailure != after.abortSuiteOnFailure) this.abortSuiteOnFailure = after.abortSuiteOnFailure;
+        if (before.matchEachEmptyAllowed != after.matchEachEmptyAllowed) this.matchEachEmptyAllowed = after.matchEachEmptyAllowed;
+        // Mock settings
+        if (before.corsEnabled != after.corsEnabled) this.corsEnabled = after.corsEnabled;
+        if (!Objects.equals(before.responseHeaders, after.responseHeaders)) this.responseHeaders = after.responseHeaders;
+        if (!Objects.equals(before.beforeScenario, after.beforeScenario)) this.beforeScenario = after.beforeScenario;
+        if (!Objects.equals(before.afterScenario, after.afterScenario)) this.afterScenario = after.afterScenario;
+        if (!Objects.equals(before.afterScenarioOutline, after.afterScenarioOutline)) this.afterScenarioOutline = after.afterScenarioOutline;
+        if (!Objects.equals(before.afterFeature, after.afterFeature)) this.afterFeature = after.afterFeature;
+        if (!Objects.equals(before.onStepFailure, after.onStepFailure)) this.onStepFailure = after.onStepFailure;
+        // Driver
+        if (!Objects.equals(before.driverConfig, after.driverConfig)) this.driverConfig = after.driverConfig;
+    }
+
+    /**
+     * Apply configuration from a key-value pair.
+     *
+     * <p>This used to return whether the HTTP client needed rebuilding, and callers gated
+     * {@code HttpClient.apply} on it. Classifying by key cannot be done correctly here: the
+     * verdict was wrong for {@code retry} (which changes a setting baked into the client at build
+     * time) and for {@code auth} switching away from NTLM (which leaves stale credentials), and
+     * it could say nothing at all about the three paths that copy a whole config across a
+     * scenario boundary. {@code HttpClient.apply} is idempotent by contract and decides for
+     * itself; hand it the config and let it answer.
+     *
+     * @param key   the configure key (e.g., "ssl", "proxy", "readTimeout")
+     * @param value the value to set
+     * @throws RuntimeException if key is not recognized
+     */
+    @SuppressWarnings("unchecked")
+    public void configure(String key, Object value) {
+        key = key != null ? key.trim() : "";
+        switch (key) {
+            // HTTP client settings
+            case "ssl" -> {
+                configureSsl(value);
+            }
+            case "proxy" -> {
+                configureProxy(value);
+            }
+            case "readTimeout" -> {
+                this.readTimeout = toInt(value);
+            }
+            case "connectTimeout" -> {
+                this.connectTimeout = toInt(value);
+            }
+            case "followRedirects" -> {
+                this.followRedirects = toBoolean(value);
+            }
+            case "strictResponseParsing" -> {
+                this.strictResponseParsing = toBoolean(value);
+            }
+            case "localAddress" -> {
+                this.localAddress = toString(value);
+            }
+            case "charset" -> {
+                // null value means disable auto-charset (V1 compatibility)
+                this.charset = value == null ? null : Charset.forName(toString(value));
+            }
+            case "ntlmAuth" -> {
+                // Legacy support: convert ntlmAuth to auth with type: 'ntlm'
+                if (value instanceof Map<?, ?> map) {
+                    Map<String, Object> ntlm = new HashMap<>();
+                    ntlm.put("type", "ntlm");
+                    ntlm.putAll((Map<String, Object>) map);
+                    configureAuth(ntlm);
+                } else if (value == null) {
+                    configureAuth(null);
+                }
+            }
+            case "auth" -> configureAuth(value);
+
+            case "url" -> {
+                this.url = toString(value);
+            }
+            case "headers" -> {
+                this.headers = value;
+            }
+            case "cookies" -> {
+                this.cookies = value;
+            }
+            case "retry" -> {
+                configureRetry(value);
+            }
+            case "httpRetryEnabled" -> {
+                this.httpRetryEnabled = toBoolean(value);
+            }
+            case "report" -> {
+                configureReport(value);
+            }
+            case "logging" -> {
+                configureLogging(value);
+            }
+            case "callSingleCache" -> {
+                configureCallSingleCache(value);
+            }
+            case "continueOnStepFailure" -> {
+                this.continueOnStepFailure = toBoolean(value);
+            }
+            case "abortedStepsShouldPass" -> {
+                this.abortedStepsShouldPass = toBoolean(value);
+            }
+            case "abortSuiteOnFailure" -> {
+                this.abortSuiteOnFailure = toBoolean(value);
+            }
+            case "matchEachEmptyAllowed" -> {
+                this.matchEachEmptyAllowed = toBoolean(value);
+            }
+
+            // Mock settings
+            case "cors" -> {
+                this.corsEnabled = toBoolean(value);
+            }
+            case "responseHeaders" -> {
+                this.responseHeaders = value;
+            }
+            case "beforeScenario" -> {
+                this.beforeScenario = value;
+            }
+            case "afterScenario" -> {
+                this.afterScenario = value;
+            }
+            case "afterScenarioOutline" -> {
+                this.afterScenarioOutline = value;
+            }
+            case "afterFeature" -> {
+                this.afterFeature = value;
+            }
+            case "onStepFailure" -> {
+                this.onStepFailure = value;
+            }
+
+            // Driver configuration
+            case "driver" -> {
+                this.driverConfig = value;
+            }
+
+            // Deprecated v1 options - no-op with one-line migration hint
+            case "logPrettyRequest", "logPrettyResponse" -> {
+                logger.warn("configure '{}' is deprecated; use 'configure logging = {{ pretty: true|false }}'", key);
+            }
+            case "printEnabled" -> {
+                logger.warn("configure 'printEnabled' is deprecated; print/karate.log go to the 'karate.scenario' "
+                        + "SLF4J category - set its level to WARN in logback.xml to keep them off the console, "
+                        + "or 'configure logging = {{ console: \"warn\" }}' to quiet all karate console output");
+            }
+            case "lowerCaseResponseHeaders" -> {
+                logger.warn("configure 'lowerCaseResponseHeaders' is deprecated; "
+                        + "'match header X' is already case-insensitive and 'karate.lowerCase(responseHeaders)' "
+                        + "covers direct map access");
+            }
+            case "logModifier" -> {
+                logger.warn("configure 'logModifier' is removed; "
+                        + "use the declarative form: 'configure logging = {{ mask: {{ headers: [...], jsonPaths: [...], patterns: [...] }} }}'");
+            }
+
+            // No channel-type cases: channels (grpc, kafka, …) are configured via their rich
+            // JS object — karate.channel('kafka') / the boot.ext('kafka') object — not via global
+            // 'configure <type>'. 'configure' stays strict so key typos fail loudly.
+            default -> throw new RuntimeException("unexpected 'configure' key: '" + key + "'");
+        }
+    }
+
+    private void configureSsl(Object value) {
+        if (value == null) {
+            this.ssl.clear();
+            return;
+        }
+        if (value instanceof Boolean b) {
+            this.ssl.clear();
+            this.ssl.put("enabled", b);
+            this.ssl.put("trustAll", true);
+            return;
+        }
+        if (value instanceof String s) {
+            this.ssl.clear();
+            this.ssl.put("enabled", true);
+            this.ssl.put("algorithm", s);
+            this.ssl.put("trustAll", true);
+            return;
+        }
+        if (value instanceof Map<?, ?> map) {
+            this.ssl.clear();
+            this.ssl.put("enabled", true);
+            if (map.containsKey("algorithm")) {
+                this.ssl.put("algorithm", toString(map.get("algorithm")));
+            }
+            if (map.containsKey("keyStore")) {
+                this.ssl.put("keyStore", toString(map.get("keyStore")));
+            }
+            if (map.containsKey("keyStorePassword")) {
+                this.ssl.put("keyStorePassword", toString(map.get("keyStorePassword")));
+            }
+            if (map.containsKey("keyStoreType")) {
+                this.ssl.put("keyStoreType", toString(map.get("keyStoreType")));
+            }
+            if (map.containsKey("trustStore")) {
+                this.ssl.put("trustStore", toString(map.get("trustStore")));
+            }
+            if (map.containsKey("trustStorePassword")) {
+                this.ssl.put("trustStorePassword", toString(map.get("trustStorePassword")));
+            }
+            if (map.containsKey("trustStoreType")) {
+                this.ssl.put("trustStoreType", toString(map.get("trustStoreType")));
+            }
+            if (map.containsKey("trustAll")) {
+                this.ssl.put("trustAll", toBoolean(map.get("trustAll")));
+            } else {
+                this.ssl.put("trustAll", true);  // default
+            }
+        }
+    }
+
+    private void configureProxy(Object value) {
+        if (value == null) {
+            this.proxy.clear();
+            return;
+        }
+        if (value instanceof String s) {
+            this.proxy.clear();
+            this.proxy.put("uri", s);
+            return;
+        }
+        if (value instanceof Map<?, ?> map) {
+            this.proxy.clear();
+            if (map.containsKey("uri")) {
+                this.proxy.put("uri", toString(map.get("uri")));
+            }
+            if (map.containsKey("username")) {
+                this.proxy.put("username", toString(map.get("username")));
+            }
+            if (map.containsKey("password")) {
+                this.proxy.put("password", toString(map.get("password")));
+            }
+            if (map.containsKey("nonProxyHosts")) {
+                Object nph = map.get("nonProxyHosts");
+                if (nph instanceof List<?> list) {
+                    List<String> hosts = new ArrayList<>();
+                    for (Object item : list) {
+                        hosts.add(toString(item));
+                    }
+                    this.proxy.put("nonProxyHosts", hosts);
+                }
+            }
+        }
+    }
+
+    private void configureAuth(Object value) {
+        if (value == null) {
+            this.auth.clear();
+            return;
+        }
+        if (value instanceof Map<?, ?> map) {
+            this.auth.clear();
+            String type = toString(map.get("type"));
+            this.auth.put("type", type);
+
+            switch (type != null ? type : "") {
+                case "basic" -> {
+                    this.auth.put("username", toString(map.get("username")));
+                    this.auth.put("password", toString(map.get("password")));
+                }
+                case "bearer" -> {
+                    this.auth.put("token", toString(map.get("token")));
+                }
+                case "oauth2" -> {
+                    this.auth.put("grantType", toString(map.get("grantType")));
+                    this.auth.put("accessTokenUrl", toString(map.get("accessTokenUrl")));
+                    this.auth.put("clientId", toString(map.get("clientId")));
+                    this.auth.put("clientSecret", toString(map.get("clientSecret")));
+                    if (map.containsKey("scope")) {
+                        this.auth.put("scope", toString(map.get("scope")));
+                    }
+                }
+                case "ntlm" -> {
+                    this.auth.put("username", toString(map.get("username")));
+                    this.auth.put("password", toString(map.get("password")));
+                    if (map.containsKey("domain")) {
+                        this.auth.put("domain", toString(map.get("domain")));
+                    }
+                    if (map.containsKey("workstation")) {
+                        this.auth.put("workstation", toString(map.get("workstation")));
+                    }
+                }
+            }
+        }
+    }
+
+    private void configureRetry(Object value) {
+        if (value instanceof Map<?, ?> map) {
+            if (map.containsKey("interval")) {
+                this.retry.put("interval", toInt(map.get("interval")));
+            }
+            if (map.containsKey("count")) {
+                this.retry.put("count", toInt(map.get("count")));
+            }
+        }
+    }
+
+    private void configureReport(Object value) {
+        if (value instanceof Boolean b) {
+            this.report.put("showLog", b);
+            this.report.put("showAllSteps", b);
+            return;
+        }
+        if (value instanceof Map<?, ?> map) {
+            if (map.containsKey("logLevel")) {
+                throw new RuntimeException(
+                        "'configure report = { logLevel: ... }' is no longer supported; use "
+                                + "'configure logging = { report: \"info\" }' instead "
+                                + "(see docs/MIGRATION_GUIDE.md#logging)");
+            }
+            if (map.containsKey("showLog")) {
+                this.report.put("showLog", toBoolean(map.get("showLog")));
+            }
+            if (map.containsKey("showAllSteps")) {
+                this.report.put("showAllSteps", toBoolean(map.get("showAllSteps")));
+            }
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void configureLogging(Object value) {
+        if (!(value instanceof Map<?, ?> raw)) {
+            throw new RuntimeException("configure 'logging' expects a map, got: "
+                    + (value == null ? "null" : value.getClass().getName()));
+        }
+        Map<String, Object> map = (Map<String, Object>) raw;
+        if (map.containsKey("report")) {
+            String levelStr = toString(map.get("report"));
+            this.logging.put("report", levelStr);
+            LogContext.setLogLevel(LogLevel.valueOf(levelStr.toUpperCase()));
+        }
+        if (map.containsKey("console")) {
+            String levelStr = toString(map.get("console"));
+            this.logging.put("console", levelStr);
+            LogContext.setRuntimeLogLevel(levelStr);
+        }
+        if (map.containsKey("pretty")) {
+            boolean pretty = toBoolean(map.get("pretty"));
+            this.logging.put("pretty", pretty);
+            LogContext.get().setPretty(pretty);
+        }
+        if (map.containsKey("mask")) {
+            Object maskValue = map.get("mask");
+            if (maskValue == null) {
+                this.logging.remove("mask");
+                this.compiledMask = null;
+                LogContext.get().setMask(null);
+            } else if (maskValue instanceof Map<?, ?> maskMap) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> mm = (Map<String, Object>) maskMap;
+                LogMask compiled = LogMask.fromMap(mm);
+                this.logging.put("mask", mm);
+                this.compiledMask = compiled;
+                LogContext.get().setMask(compiled);
+            } else {
+                throw new RuntimeException("configure 'logging.mask' expects a map, got: " + maskValue.getClass().getName());
+            }
+        }
+    }
+
+    /**
+     * Push this config's logging settings into the given LogContext.
+     * Called by {@link ScenarioRuntime#call()} after it allocates a fresh thread-local
+     * LogContext, so any mask / pretty values set in karate-config.js (or a prior step)
+     * survive into the scenario's HTTP logging.
+     */
+    public void applyLoggingToContext(LogContext ctx) {
+        if (ctx == null) return;
+        ctx.setMask(compiledMask);
+        Object prettyVal = logging.get("pretty");
+        ctx.setPretty(prettyVal == null ? true : toBoolean(prettyVal));
+    }
+
+    /**
+     * Compiled HTTP log mask. Source of truth — {@link LogContext} mirrors this for
+     * per-thread reads by {@link io.karatelabs.output.HttpLogger}.
+     */
+    public LogMask getCompiledMask() {
+        return compiledMask;
+    }
+
+    private void configureCallSingleCache(Object value) {
+        if (value instanceof Map<?, ?> map) {
+            if (map.containsKey("minutes")) {
+                this.callSingleCache.put("minutes", toInt(map.get("minutes")));
+            }
+            if (map.containsKey("dir")) {
+                this.callSingleCache.put("dir", toString(map.get("dir")));
+            }
+        }
+    }
+
+    // ===== Type conversion helpers =====
+
+    private static String toString(Object value) {
+        return value == null ? null : value.toString();
+    }
+
+    private static boolean toBoolean(Object value) {
+        if (value == null) return false;
+        if (value instanceof Boolean b) return b;
+        return Boolean.parseBoolean(value.toString());
+    }
+
+    private static int toInt(Object value) {
+        if (value == null) return 0;
+        if (value instanceof Number n) return n.intValue();
+        return Integer.parseInt(value.toString());
+    }
+
+    // ===== SimpleObject implementation =====
+
+    @Override
+    public Collection<String> jsKeys() {
+        return KEYS;
+    }
+
+    @Override
+    public Object jsGet(String name) {
+        return switch (name) {
+            case "url" -> url;
+            case "readTimeout" -> readTimeout;
+            case "connectTimeout" -> connectTimeout;
+            case "followRedirects" -> followRedirects;
+            case "localAddress" -> localAddress;
+            case "charset" -> charset != null ? charset.name() : null;
+            case "strictResponseParsing" -> strictResponseParsing;
+            // Grouped settings
+            case "ssl" -> ssl;
+            case "proxy" -> proxy;
+            case "ntlmAuth" -> "ntlm".equals(auth.get("type")) ? auth : null;
+            case "auth" -> auth;
+            case "retry" -> retry;
+            case "report" -> report;
+            case "logging" -> logging;
+            case "callSingleCache" -> callSingleCache;
+            // Legacy accessors (for backward compatibility)
+            case "sslEnabled" -> ssl.getOrDefault("enabled", false);
+            case "sslAlgorithm" -> ssl.getOrDefault("algorithm", "TLS");
+            case "sslKeyStore" -> ssl.get("keyStore");
+            case "sslKeyStorePassword" -> ssl.get("keyStorePassword");
+            case "sslKeyStoreType" -> ssl.get("keyStoreType");
+            case "sslTrustStore" -> ssl.get("trustStore");
+            case "sslTrustStorePassword" -> ssl.get("trustStorePassword");
+            case "sslTrustStoreType" -> ssl.get("trustStoreType");
+            case "sslTrustAll" -> ssl.getOrDefault("trustAll", true);
+            case "proxyUri" -> proxy.get("uri");
+            case "proxyUsername" -> proxy.get("username");
+            case "proxyPassword" -> proxy.get("password");
+            case "nonProxyHosts" -> proxy.get("nonProxyHosts");
+            case "ntlmUsername" -> "ntlm".equals(auth.get("type")) ? auth.get("username") : null;
+            case "ntlmPassword" -> "ntlm".equals(auth.get("type")) ? auth.get("password") : null;
+            case "ntlmDomain" -> "ntlm".equals(auth.get("type")) ? auth.get("domain") : null;
+            case "ntlmWorkstation" -> "ntlm".equals(auth.get("type")) ? auth.get("workstation") : null;
+            case "authType" -> auth.get("type");
+            case "authUsername" -> auth.get("username");
+            case "authPassword" -> auth.get("password");
+            case "authToken" -> auth.get("token");
+            case "authAccessTokenUrl" -> auth.get("accessTokenUrl");
+            case "authClientId" -> auth.get("clientId");
+            case "authClientSecret" -> auth.get("clientSecret");
+            case "authScope" -> auth.get("scope");
+            case "retryInterval" -> retry.getOrDefault("interval", 3000);
+            case "retryCount" -> retry.getOrDefault("count", 3);
+            case "showLog" -> report.getOrDefault("showLog", true);
+            case "showAllSteps" -> report.getOrDefault("showAllSteps", true);
+            case "callSingleCacheMinutes" -> callSingleCache.getOrDefault("minutes", 0);
+            case "callSingleCacheDir" -> callSingleCache.get("dir");
+            // Other settings
+            case "headers" -> headers;
+            case "cookies" -> cookies;
+            case "httpRetryEnabled" -> httpRetryEnabled;
+            case "continueOnStepFailure" -> continueOnStepFailure;
+            case "abortedStepsShouldPass" -> abortedStepsShouldPass;
+            case "abortSuiteOnFailure" -> abortSuiteOnFailure;
+            case "matchEachEmptyAllowed" -> matchEachEmptyAllowed;
+            case "corsEnabled" -> corsEnabled;
+            case "responseHeaders" -> responseHeaders;
+            case "beforeScenario" -> beforeScenario;
+            case "afterScenario" -> afterScenario;
+            case "afterScenarioOutline" -> afterScenarioOutline;
+            case "afterFeature" -> afterFeature;
+            case "onStepFailure" -> onStepFailure;
+            case "driverConfig" -> driverConfig;
+            default -> null;
+        };
+    }
+
+    // ===== Getters =====
+
+    public String getUrl() {
+        return url;
+    }
+
+    public int getReadTimeout() {
+        return readTimeout;
+    }
+
+    public int getConnectTimeout() {
+        return connectTimeout;
+    }
+
+    public boolean isFollowRedirects() {
+        return followRedirects;
+    }
+
+    public boolean isStrictResponseParsing() {
+        return strictResponseParsing;
+    }
+
+    public String getLocalAddress() {
+        return localAddress;
+    }
+
+    public Charset getCharset() {
+        return charset;
+    }
+
+    // ===== SSL Getters =====
+
+    public Map<String, Object> getSsl() {
+        return ssl;
+    }
+
+    public boolean isSslEnabled() {
+        return toBoolean(ssl.get("enabled"));
+    }
+
+    public String getSslAlgorithm() {
+        Object val = ssl.get("algorithm");
+        return val != null ? val.toString() : "TLS";
+    }
+
+    public String getSslKeyStore() {
+        return toString(ssl.get("keyStore"));
+    }
+
+    public String getSslKeyStorePassword() {
+        return toString(ssl.get("keyStorePassword"));
+    }
+
+    public String getSslKeyStoreType() {
+        return toString(ssl.get("keyStoreType"));
+    }
+
+    public String getSslTrustStore() {
+        return toString(ssl.get("trustStore"));
+    }
+
+    public String getSslTrustStorePassword() {
+        return toString(ssl.get("trustStorePassword"));
+    }
+
+    public String getSslTrustStoreType() {
+        return toString(ssl.get("trustStoreType"));
+    }
+
+    public boolean isSslTrustAll() {
+        Object val = ssl.get("trustAll");
+        return val == null || toBoolean(val);  // default true
+    }
+
+    // ===== Proxy Getters =====
+
+    public Map<String, Object> getProxy() {
+        return proxy;
+    }
+
+    public String getProxyUri() {
+        return toString(proxy.get("uri"));
+    }
+
+    public String getProxyUsername() {
+        return toString(proxy.get("username"));
+    }
+
+    public String getProxyPassword() {
+        return toString(proxy.get("password"));
+    }
+
+    @SuppressWarnings("unchecked")
+    public List<String> getNonProxyHosts() {
+        Object val = proxy.get("nonProxyHosts");
+        return val instanceof List ? (List<String>) val : null;
+    }
+
+    // ===== NTLM Getters (legacy - reads from auth when type is 'ntlm') =====
+
+    public Map<String, Object> getNtlmAuth() {
+        return "ntlm".equals(auth.get("type")) ? auth : null;
+    }
+
+    public String getNtlmUsername() {
+        return "ntlm".equals(auth.get("type")) ? toString(auth.get("username")) : null;
+    }
+
+    public String getNtlmPassword() {
+        return "ntlm".equals(auth.get("type")) ? toString(auth.get("password")) : null;
+    }
+
+    public String getNtlmDomain() {
+        return "ntlm".equals(auth.get("type")) ? toString(auth.get("domain")) : null;
+    }
+
+    public String getNtlmWorkstation() {
+        return "ntlm".equals(auth.get("type")) ? toString(auth.get("workstation")) : null;
+    }
+
+    // ===== Auth Getters =====
+
+    public Map<String, Object> getAuth() {
+        return auth;
+    }
+
+    public String getAuthType() {
+        return toString(auth.get("type"));
+    }
+
+    public String getAuthUsername() {
+        return toString(auth.get("username"));
+    }
+
+    public String getAuthPassword() {
+        return toString(auth.get("password"));
+    }
+
+    public String getAuthToken() {
+        return toString(auth.get("token"));
+    }
+
+    public String getAuthAccessTokenUrl() {
+        return toString(auth.get("accessTokenUrl"));
+    }
+
+    public String getAuthClientId() {
+        return toString(auth.get("clientId"));
+    }
+
+    public String getAuthClientSecret() {
+        return toString(auth.get("clientSecret"));
+    }
+
+    public String getAuthScope() {
+        return toString(auth.get("scope"));
+    }
+
+    // ===== Retry Getters =====
+
+    public Map<String, Object> getRetry() {
+        return retry;
+    }
+
+    public int getRetryInterval() {
+        return toInt(retry.getOrDefault("interval", 3000));
+    }
+
+    public int getRetryCount() {
+        return toInt(retry.getOrDefault("count", 3));
+    }
+
+    // ===== Report Getters =====
+
+    public Map<String, Object> getReport() {
+        return report;
+    }
+
+    public boolean isShowLog() {
+        return toBoolean(report.getOrDefault("showLog", true));
+    }
+
+    public boolean isShowAllSteps() {
+        return toBoolean(report.getOrDefault("showAllSteps", true));
+    }
+
+    // ===== Logging Getters =====
+
+    public Map<String, Object> getLogging() {
+        return logging;
+    }
+
+    public String getLoggingReportLevel() {
+        return toString(logging.getOrDefault("report", "debug"));
+    }
+
+    public String getLoggingConsoleLevel() {
+        return toString(logging.getOrDefault("console", "info"));
+    }
+
+    public boolean isLoggingPretty() {
+        return toBoolean(logging.getOrDefault("pretty", true));
+    }
+
+    // ===== CallSingleCache Getters =====
+
+    public Map<String, Object> getCallSingleCache() {
+        return callSingleCache;
+    }
+
+    public int getCallSingleCacheMinutes() {
+        return toInt(callSingleCache.getOrDefault("minutes", 0));
+    }
+
+    public String getCallSingleCacheDir() {
+        return toString(callSingleCache.get("dir"));
+    }
+
+    // ===== Other Getters =====
+
+    public Object getHeaders() {
+        return headers;
+    }
+
+    public Object getCookies() {
+        return cookies;
+    }
+
+    public boolean isHttpRetryEnabled() {
+        return httpRetryEnabled;
+    }
+
+    public boolean isContinueOnStepFailure() {
+        return continueOnStepFailure;
+    }
+
+    public boolean isAbortedStepsShouldPass() {
+        return abortedStepsShouldPass;
+    }
+
+    public boolean isAbortSuiteOnFailure() {
+        return abortSuiteOnFailure;
+    }
+
+    public boolean isMatchEachEmptyAllowed() {
+        return matchEachEmptyAllowed;
+    }
+
+    public boolean isCorsEnabled() {
+        return corsEnabled;
+    }
+
+    public Object getResponseHeaders() {
+        return responseHeaders;
+    }
+
+    public Object getBeforeScenario() {
+        return beforeScenario;
+    }
+
+    public Object getAfterScenario() {
+        return afterScenario;
+    }
+
+    public Object getAfterScenarioOutline() {
+        return afterScenarioOutline;
+    }
+
+    public Object getAfterFeature() {
+        return afterFeature;
+    }
+
+    public Object getOnStepFailure() {
+        return onStepFailure;
+    }
+
+    public Object getDriverConfig() {
+        return driverConfig;
+    }
+
+}

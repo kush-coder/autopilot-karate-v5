@@ -1,0 +1,2342 @@
+/*
+ * The MIT License
+ *
+ * Copyright 2025 Karate Labs Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package io.karatelabs.core;
+
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+import static io.karatelabs.core.TestUtils.*;
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Tests for call and callonce feature execution.
+ */
+class StepCallTest {
+
+    @TempDir
+    Path tempDir;
+
+    @Test
+    void testCallFeatureWithResult() throws Exception {
+        // Create called feature
+        Path calledFeature = tempDir.resolve("called.feature");
+        Files.writeString(calledFeature, """
+            Feature: Called Feature
+            Scenario: Return data
+            * def result = { value: 42 }
+            """);
+
+        // Create caller feature
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller Feature
+            Scenario: Call another feature
+            * def response = call read('called.feature')
+            * match response.result == { value: 42 }
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "Suite should pass: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallFeatureWithArguments() throws Exception {
+        // Create called feature that uses arguments
+        Path calledFeature = tempDir.resolve("called.feature");
+        Files.writeString(calledFeature, """
+            Feature: Called with Args
+            Scenario: Use arguments
+            * def doubled = inputValue * 2
+            """);
+
+        // Create caller feature
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller with Args
+            Scenario: Pass arguments
+            * def response = call read('called.feature') { inputValue: 21 }
+            * match response.doubled == 42
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "Suite should pass: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallonce() throws Exception {
+        // Create a counter file to track calls
+        Path counterFeature = tempDir.resolve("counter.feature");
+        Files.writeString(counterFeature, """
+            Feature: Counter
+            Scenario: Increment
+            * def callCount = typeof callCount == 'undefined' ? 1 : callCount + 1
+            """);
+
+        // Create feature that calls the counter twice with callonce
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Callonce Test
+            Scenario: First scenario
+            * def response = callonce read('counter.feature')
+
+            Scenario: Second scenario
+            * def response2 = callonce read('counter.feature')
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        // Both scenarios should pass
+        assertTrue(result.isPassed());
+        assertEquals(2, result.getScenarioCount());
+    }
+
+    // ========== Doc-string as the call argument ==========
+    // v2 convenience (v1 did not support this): when a call/callonce step has no inline
+    // argument but carries a doc-string, the doc-string IS the argument. It routes
+    // through the standard call-arg path, so embedded #(...) expressions resolve.
+
+    @Test
+    void testCallFeatureWithDocStringArgument() throws Exception {
+        Path calledFeature = tempDir.resolve("called.feature");
+        Files.writeString(calledFeature, """
+            Feature: Called with doc-string arg
+            Scenario: Use arguments
+            * match newId == '1'
+            * def doubled = inputValue * 2
+            """);
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller with doc-string arg
+            Scenario: Pass a doc-string argument with an embedded expression
+            * def resourceId = '1'
+            * def response = call read('called.feature')
+            \"\"\"
+            { newId: '#(resourceId)', inputValue: 21 }
+            \"\"\"
+            * match response.doubled == 42
+            """);
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+        assertTrue(result.isPassed(), "doc-string call arg should resolve: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallKeywordWithDocStringArgument() throws Exception {
+        // bare `call` keyword (shared scope, no result var) with a doc-string arg
+        Path calledFeature = tempDir.resolve("called.feature");
+        Files.writeString(calledFeature, """
+            Feature: Called
+            Scenario:
+            * match newId == '1'
+            """);
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario:
+            * def resourceId = '1'
+            * call read('called.feature')
+            \"\"\"
+            { newId: '#(resourceId)' }
+            \"\"\"
+            """);
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+        assertTrue(result.isPassed(), "bare call keyword doc-string arg should resolve: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallonceWithDocStringArgument() throws Exception {
+        Path calledFeature = tempDir.resolve("called.feature");
+        Files.writeString(calledFeature, """
+            Feature: Called
+            Scenario:
+            * match newId == '1'
+            """);
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario:
+            * def resourceId = '1'
+            * def response = callonce read('called.feature')
+            \"\"\"
+            { newId: '#(resourceId)' }
+            \"\"\"
+            """);
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+        assertTrue(result.isPassed(), "callonce doc-string arg should resolve: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallonceWhenCallerHasNoResourceUri() {
+        // Regression: FeatureRuntime.featureKey() NPE'd on getUri().toString() when the
+        // calling feature's resource had no URI (in-memory / synthetically-loaded). The
+        // inline runner produces exactly such a caller; callonce must still work.
+        ScenarioRuntime sr = run("""
+            * def res = callonce read('classpath:io/karatelabs/core/callonce-uri-fallback.feature')
+            * match res.value == 42
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testCallSimple() throws Exception {
+        // Create a simple feature that sets variables
+        Path calledFeature = tempDir.resolve("simple.feature");
+        Files.writeString(calledFeature, """
+            Feature: Simple
+            Scenario: Set value
+            * def x = 100
+            """);
+
+        // Create caller
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Call Simple
+            Scenario: Call and check
+            * call read('simple.feature')
+            * def a = 1
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed());
+    }
+
+    @Test
+    void testNestedCall() throws Exception {
+        // Create innermost feature
+        Path inner = tempDir.resolve("inner.feature");
+        Files.writeString(inner, """
+            Feature: Inner
+            Scenario: Set inner value
+            * def innerValue = 'from-inner'
+            """);
+
+        // Create middle feature that calls inner
+        Path middle = tempDir.resolve("middle.feature");
+        Files.writeString(middle, """
+            Feature: Middle
+            Scenario: Call inner
+            * def middleResponse = call read('inner.feature')
+            * def middleValue = 'from-middle'
+            """);
+
+        // Create outer feature that calls middle
+        Path outer = tempDir.resolve("outer.feature");
+        Files.writeString(outer, """
+            Feature: Outer
+            Scenario: Call middle
+            * def outerResponse = call read('middle.feature')
+            * match outerResponse.middleValue == 'from-middle'
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, outer.toString());
+
+        assertTrue(result.isPassed(), "Nested calls should work: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testKarateMatchStringResolvesInCallingScopeAcrossFeatures() throws Exception {
+        // A condition closure is built in the caller feature (which owns `expectedResult`)
+        // and passed into a shared utility feature via `call ... filter`. The utility
+        // defines its own `response` and invokes condition(response). The string form
+        // karate.match("response.result contains expectedResult") inside the closure must
+        // resolve BOTH operands against the utility's (currently executing) scope — not
+        // the scope where the closure was defined. Using the defining scope surfaced a
+        // "ReferenceError: response is not defined". This is the standard reusable
+        // "poll until condition(response) is true" idiom.
+        Path utils = tempDir.resolve("user_utils.feature");
+        Files.writeString(utils, """
+            Feature: user utils
+
+              @getUserById
+              Scenario: applies the caller-provided condition to its own response
+                * def response = { result: { id: 'u-123', email: 'jane@example.com' } }
+                * def outcome = condition(response)
+            """);
+
+        Path caller = tempDir.resolve("check_user_updated.feature");
+        Files.writeString(caller, """
+            Feature: check user updated
+
+              Scenario: build a condition closure and hand it to the shared utility
+                * def expectedResult = { id: 'u-123', email: 'jane@example.com' }
+                * def condition =
+                  \"\"\"
+                  function(response){
+                    var isFound = karate.match("response.result contains expectedResult")
+                    return isFound.pass
+                  }
+                  \"\"\"
+                * def filter = { condition: "#(condition)", expectedResult: "#(expectedResult)" }
+                * def result = call read('user_utils.feature@getUserById') filter
+                * match result.outcome == true
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, caller.toString());
+
+        assertTrue(result.isPassed(),
+                "karate.match(String) in a cross-feature closure should resolve the calling scope: "
+                        + getFailureMessage(result));
+    }
+
+    @Test
+    void testKarateCallWithArguments() throws Exception {
+        // Create called feature that uses arguments
+        Path calledFeature = tempDir.resolve("called.feature");
+        Files.writeString(calledFeature, """
+            Feature: Called
+            Scenario: Use arg
+            * match foo == 'bar'
+            """);
+
+        // Create caller that uses karate.call() from JavaScript
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario: Call via JS
+            * def foo = null
+            * karate.call('called.feature', { foo: 'bar' })
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "karate.call() with args should work: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testKarateCallWithArrayLoop() throws Exception {
+        // karate.call(path, array) should iterate and invoke the callee per-element,
+        // matching the semantics of: call read('path') array
+        Path calledFeature = tempDir.resolve("called.feature");
+        Files.writeString(calledFeature, """
+            Feature: Called
+            Scenario:
+            * def received = username
+            * def index = __loop
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario:
+            * def users = [{ username: 'alice' }, { username: 'bob' }, { username: 'carol' }]
+            * def results = karate.call('called.feature', users)
+            * match results[*].received == ['alice', 'bob', 'carol']
+            * match results[*].index == [0, 1, 2]
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "karate.call() with array should loop: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testKarateCallOnceWithArrayLoop() throws Exception {
+        // karate.callonce(path, array) should also loop and cache the list result
+        Path calledFeature = tempDir.resolve("called.feature");
+        Files.writeString(calledFeature, """
+            Feature: Called
+            Scenario:
+            * def out = name + '-' + __loop
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Callonce Array
+            Background:
+            * def data = [{ name: 'A' }, { name: 'B' }]
+            * def cached = karate.callonce('called.feature', data)
+
+            Scenario: First
+            * match cached[*].out == ['A-0', 'B-1']
+
+            Scenario: Second
+            * match cached[*].out == ['A-0', 'B-1']
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "karate.callonce() with array should loop: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testKarateCallWithoutArguments() throws Exception {
+        // Create called feature
+        Path calledFeature = tempDir.resolve("called.feature");
+        Files.writeString(calledFeature, """
+            Feature: Called
+            Scenario: Simple
+            * def x = 1
+            """);
+
+        // Create caller that uses karate.call() without arguments
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario: Call via JS
+            * def result = karate.call('called.feature')
+            * match result.x == 1
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "karate.call() without args should work: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallFeatureVariableWithArrayLoop() throws Exception {
+        // Create called feature that uses 'foo' argument
+        Path calledFeature = tempDir.resolve("called.feature");
+        Files.writeString(calledFeature, """
+            Feature: Called
+            Scenario:
+            * def res = foo
+            """);
+
+        // Create caller that reads feature into variable and calls with array
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario: Call with array loop
+            * def called = read('called.feature')
+            * def data = [{ foo: 'first' }, { foo: 'second' }]
+            * def result = call called data
+            * def extracted = karate.jsonPath(result, '$[*].res')
+            * match extracted == ['first', 'second']
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "Call with feature var and array loop should work: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallByTag() throws Exception {
+        // Create called feature with multiple scenarios, each with a tag
+        Path calledFeature = tempDir.resolve("called.feature");
+        Files.writeString(calledFeature, """
+            Feature: Tagged Scenarios
+            @name=first
+            Scenario: First
+            * def bar = 1
+
+            @name=second
+            Scenario: Second
+            * def bar = 2
+
+            @name=third
+            Scenario: Third
+            * def bar = 3
+            """);
+
+        // Create caller that calls specific scenario by tag
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Call by Tag
+            Scenario: Call second scenario
+            * def foo = call read('called.feature@name=second')
+            * match foo.bar == 2
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "Call by tag should work: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallByTagSameFile() throws Exception {
+        // Create feature that calls a tagged scenario in the same file
+        Path feature = tempDir.resolve("sameFile.feature");
+        Files.writeString(feature, """
+            Feature: Same File Tag Call
+
+            Scenario: Caller
+            * def foo = call read('@target')
+            * match foo.bar == 42
+
+            @ignore @target
+            Scenario: Target
+            * def bar = 42
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+
+        assertTrue(result.isPassed(), "Same-file tag call should work: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testArgVariableInCalledFeature() throws Exception {
+        // Tests that __arg is available in called feature
+        Path calledFeature = tempDir.resolve("called.feature");
+        Files.writeString(calledFeature, """
+            Feature: Called
+            Scenario:
+            * match __arg == { foo: 'bar' }
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario:
+            * def params = { foo: 'bar' }
+            * call read('called.feature') params
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "__arg should be available: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testArgVariableIsNullWhenCalledWithoutArguments() throws Exception {
+        // A called scenario invoked WITHOUT arguments must see __arg as null and
+        // __loop as -1 — not a "__arg is not defined" ReferenceError. The docs
+        // promise __arg is null when no argument is passed.
+        Path calledFeature = tempDir.resolve("called.feature");
+        Files.writeString(calledFeature, """
+            Feature: Called
+            Scenario:
+            * match __arg == null
+            * match __loop == -1
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario:
+            * call read('called.feature')
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "__arg should be null when called without args: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testArgVariableNullViaSameFileTagCallWithoutArguments() throws Exception {
+        // The exact issue repro: an argument-less `call read('@tag')` to a same-file
+        // @ignore scenario. Runs with real tag filtering (not the skipTagFiltering test
+        // default) so @ignore keeps the callee from also running standalone.
+        Path feature = tempDir.resolve("sameFileNoArg.feature");
+        Files.writeString(feature, """
+            Feature: Same File Tag No-Arg Call
+
+            Scenario: Caller
+            * call read('@utils')
+
+            @ignore @utils
+            Scenario: Utils
+            * match __arg == null
+            * match __loop == -1
+            """);
+
+        SuiteResult result = Runner.builder()
+                .path(feature.toString())
+                .workingDir(tempDir)
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                .backupOutputDir(false)
+                .buildSuite().run();
+
+        assertTrue(result.isPassed(), "__arg should be null via same-file tag call without args: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testTopLevelRunFeatureWithArgSpreadsKeysAsVariables() throws Exception {
+        // The v2-native Runner.runFeature(path, arg) entry point — used by karate-gatling
+        // to inject session variables — spreads the argument map's keys as top-level
+        // variables even though the run has NO caller (isCalled() == false). This locks
+        // in that behavior independently of the v1 compatibility shim (V1CompatTest),
+        // so it survives even if the v1 shim is later removed.
+        Path feature = tempDir.resolve("topLevelArg.feature");
+        Files.writeString(feature, """
+            Feature:
+            Scenario:
+            * def result = input + 1
+            """);
+
+        FeatureResult fr = Runner.runFeature("file:" + feature, java.util.Map.of("input", 5));
+
+        assertTrue(fr.isPassed(), "top-level run with arg should pass: " + fr.getFailureMessage());
+        assertEquals(6, fr.getResultVariables().get("result"));
+    }
+
+    @Test
+    void testArgVariableWithAssignment() throws Exception {
+        // Tests that __arg is available even when call result is assigned to a variable
+        // See https://github.com/karatelabs/karate/pull/1436
+        Path calledFeature = tempDir.resolve("called.feature");
+        Files.writeString(calledFeature, """
+            Feature: Called
+            Scenario:
+            * match __arg == { foo: 'bar' }
+            * def result = 'done'
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario:
+            * def args = { foo: 'bar' }
+            * def response = call read('called.feature') args
+            * match response.result == 'done'
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "__arg should be available with assignment: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testKarateCallWithSharedScope() throws Exception {
+        // Tests karate.call(true, 'file') for shared scope
+        Path calledFeature = tempDir.resolve("called.feature");
+        Files.writeString(calledFeature, """
+            Feature: Called
+            Scenario:
+            * def sharedVar = 'from-called'
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario:
+            * karate.call(true, 'called.feature')
+            * match sharedVar == 'from-called'
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "Shared scope call should merge variables: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testKarateCallIsolatedScope() throws Exception {
+        // Tests that karate.call('file') is isolated - variable should NOT be in scope
+        Path calledFeature = tempDir.resolve("called.feature");
+        Files.writeString(calledFeature, """
+            Feature: Called
+            Scenario:
+            * def isolatedVar = 'from-called'
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario:
+            * def result = karate.call('called.feature')
+            * match result.isolatedVar == 'from-called'
+            * match karate.get('isolatedVar') == null
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "Isolated call should NOT merge variables: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallJsonPathOnParentVariable() throws Exception {
+        // Tests that called feature can use JSONPath on variables from caller scope
+        Path calledFeature = tempDir.resolve("called.feature");
+        Files.writeString(calledFeature, """
+            Feature: Called
+            Scenario:
+            * def vals = $foo[*].a
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario:
+            * def foo = [{a: 1}, {a: 2}]
+            * def bar = call read('called.feature')
+            * match bar.vals == [1, 2]
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "JSONPath on parent variable should work: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallReadJsFunction() throws Exception {
+        // Tests calling a JS function returned by read('file.js')
+        Path jsFile = tempDir.resolve("double.js");
+        Files.writeString(jsFile, """
+            function(x) {
+              return x * 2;
+            }
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario:
+            * def result = call read('double.js') 5
+            * match result == 10
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "call read('file.js') should work: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallReadJsImmediatelyInvoked() throws Exception {
+        // V1 syntax: call read('file.js')(arg) — the JS file is loaded and the returned
+        // function is immediately invoked with the argument. v1 split the expression at
+        // read()'s close paren, treating the trailing `(arg)` as the call argument. v2
+        // required a SPACE before the arg, so with the arg directly appended it tried to
+        // parse the .js file as a Gherkin feature and blew up.
+        Path jsFile = tempDir.resolve("helper.js");
+        Files.writeString(jsFile, """
+            function fn(input) {
+              return { processed: true, original: input };
+            }
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario:
+            * def input = { foo: 'bar' }
+            * def result = call read('helper.js')(input)
+            * match result == { processed: true, original: { foo: 'bar' } }
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "call read('file.js')(arg) should invoke the JS function: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallReadJsNamedFunction() throws Exception {
+        // Tests calling a named JS function returned by read('file.js')
+        Path jsFile = tempDir.resolve("helper.js");
+        Files.writeString(jsFile, """
+            function fn(x) {
+              return { doubled: x * 2 };
+            }
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario:
+            * def result = call read('helper.js') 7
+            * match result == { doubled: 14 }
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "call read('file.js') with named function should work: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testKarateCallJsApiInvokesJsFile() throws Exception {
+        // The karate.call() JS API must invoke a .js target and return its result, exactly
+        // like read()/callSingle and the `call` keyword (and v1, which dispatched on the
+        // resolved type). It previously parsed the .js as a feature and returned an empty
+        // result — so functions on the returned object silently went missing, breaking the
+        // common "helpers in a util.js attached to config" pattern.
+        Path jsFile = tempDir.resolve("util.js");
+        Files.writeString(jsFile, """
+            function fn() {
+              return {
+                add: function(a, b){ return a + b },
+                greeting: 'hello'
+              };
+            }
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario:
+            * def util = karate.call('util.js')
+            * match util.greeting == 'hello'
+            * def sum = util.add(2, 3)
+            * match sum == 5
+            * call util.add
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(),
+                "karate.call('file.js') should invoke the JS function and keep its returned functions callable: "
+                        + getFailureMessage(result));
+    }
+
+    @Test
+    void testKarateCallOnceJsApiInvokesJsFile() throws Exception {
+        // karate.callonce() delegates to the same path as karate.call(), so it must also
+        // invoke a .js target rather than mis-parsing it as a feature.
+        Path jsFile = tempDir.resolve("once.js");
+        Files.writeString(jsFile, """
+            function fn() {
+              return { token: 'abc-123' };
+            }
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario:
+            * def first = karate.callonce('once.js')
+            * match first.token == 'abc-123'
+            * def second = karate.callonce('once.js')
+            * match second.token == 'abc-123'
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(),
+                "karate.callonce('file.js') should invoke the JS function: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallReadJsWithMultipleLines() throws Exception {
+        // Tests calling a JS function with multiple lines and var declarations
+        Path jsFile = tempDir.resolve("multi-line.js");
+        Files.writeString(jsFile, """
+            function fn(x) {
+              var result = x + 1;
+              return result;
+            }
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Multi-line JS function
+            Scenario:
+            * def result = call read('multi-line.js') 5
+            * match result == 6
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "Multi-line JS function should work: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallReadJsWithJavaType() throws Exception {
+        // Tests calling a JS function that uses Java.type()
+        Path jsFile = tempDir.resolve("java-type.js");
+        Files.writeString(jsFile, """
+            function fn() {
+              var ArrayList = Java.type('java.util.ArrayList');
+              var list = new ArrayList();
+              list.add('hello');
+              return list.size();
+            }
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: JS with Java.type
+            Scenario:
+            * def result = call read('java-type.js')
+            * match result == 1
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "JS function with Java.type should work: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallReadJsWithJavaSort() throws Exception {
+        // Tests calling a JS function that uses Java Collections.sort (V1 sort-array.feature pattern)
+        Path jsFile = tempDir.resolve("sort-array.js");
+        Files.writeString(jsFile, """
+            function fn(array) {
+              var ArrayList = Java.type('java.util.ArrayList');
+              var Collections = Java.type('java.util.Collections');
+              var list = new ArrayList();
+              for (var i = 0; i < array.length; i++) {
+                list.add(array[i]);
+              }
+              Collections.sort(list, java.lang.String.CASE_INSENSITIVE_ORDER);
+              return list;
+            }
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Case insensitive sort
+            Scenario:
+            * def actual = ['C', 'b', 'A']
+            * def sorted = call read('sort-array.js') actual
+            * match sorted == ['A', 'b', 'C']
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "JS function with Java sort should work: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallFeatureWithEmbeddedExpression() throws Exception {
+        // Tests that embedded expressions like #(variable) are properly evaluated
+        Path calledFeature = tempDir.resolve("called.feature");
+        Files.writeString(calledFeature, """
+            Feature: Called
+            Scenario:
+            * def result = data
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario:
+            * def myData = { name: 'test', value: 42 }
+            * def response = call read('called.feature') { data: '#(myData)' }
+            * match response.result == { name: 'test', value: 42 }
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "Embedded expressions should be evaluated: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallFeatureWithUnquotedEmbeddedExpression() throws Exception {
+        // V1 accepted unquoted embedded expressions in inline call args, e.g.
+        //   call read('called.feature') { userId: #(userId) }
+        // (no quotes around #(userId)). In v2 this failed with `ReferenceError: # is not defined`
+        // because parseCallExpression evaluated the remainder as pure JS instead of going
+        // through the karate-expression path that recognises `{...}` as JSON-with-embedded.
+        Path calledFeature = tempDir.resolve("called.feature");
+        Files.writeString(calledFeature, """
+            Feature: Called
+            Scenario:
+            * def out = userId
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario:
+            * def userId = 1
+            * def result = call read('called.feature') { userId: #(userId) }
+            * match result.out == 1
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(),
+                "Unquoted #(...) in call arg should be resolved: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallOnceFeatureWithUnquotedEmbeddedExpression() throws Exception {
+        // Same fix must apply to the callonce variant — both flow through parseCallExpression.
+        Path calledFeature = tempDir.resolve("called.feature");
+        Files.writeString(calledFeature, """
+            Feature: Called
+            Scenario:
+            * def out = userId
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario:
+            * def userId = 7
+            * def result = callonce read('called.feature') { userId: #(userId) }
+            * match result.out == 7
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(),
+                "Unquoted #(...) in callonce arg should be resolved: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallFunctionWithUnquotedEmbeddedExpression() throws Exception {
+        // The JS-function branch of executeCallWithResult also routes args through
+        // evalKarateExpression, so unquoted #(...) works for `call fun { ... }` too.
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario:
+            * def token = 'abc'
+            * def fun = function(arg){ return arg.token + '-' + arg.n }
+            * def result = call fun { token: #(token), n: 1 }
+            * match result == 'abc-1'
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(),
+                "Unquoted #(...) in `call fun {...}` should be resolved: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallByTagWithUnquotedEmbeddedExpression() throws Exception {
+        // call-by-tag (`read('file.feature@tag') {...}`) must work with unquoted #(...).
+        Path calledFeature = tempDir.resolve("called.feature");
+        Files.writeString(calledFeature, """
+            Feature: Tagged
+            @target
+            Scenario:
+            * def out = userId
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario:
+            * def userId = 99
+            * def result = call read('called.feature@target') { userId: #(userId) }
+            * match result.out == 99
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(),
+                "Unquoted #(...) in call-by-tag arg should be resolved: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallArgBareIdentifierIsStringNotVariable() throws Exception {
+        // An unquoted bare identifier on the VALUE side of an inline call arg is Karate
+        // relaxed JSON, so it reads as the literal *string* with that name — NOT the
+        // variable's value. This is the documented v2 rule (see MIGRATION_GUIDE.md,
+        // "Karate-JSON vs JavaScript on the right-hand side") and is uniform across
+        // def/match/configure and call args alike. v2.0.9 happened to JS-eval call args,
+        // so a bare `{ locationId: locationId }` resolved the variable there; that call-arg
+        // path was the odd one out and was unified with the relaxed-JSON path, which is
+        // what this test pins down. The two documented ways to inject the variable's value
+        // — `#(...)` substitution and paren-wrapping to force JS — are asserted below.
+        Path calledFeature = tempDir.resolve("called.feature");
+        Files.writeString(calledFeature, """
+            Feature: Called
+            @list
+            Scenario:
+            * def received = __arg
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario:
+            * def locationId = '01484'
+
+            # bare identifier -> the literal string 'locationId', NOT the variable
+            * def bare = call read('called.feature') { locationId: locationId }
+            * match bare.received == { locationId: 'locationId' }
+
+            # documented escape #1: #(...) substitution resolves the variable
+            * def viaHash = call read('called.feature') { locationId: '#(locationId)' }
+            * match viaHash.received == { locationId: '01484' }
+
+            # documented escape #2: paren-wrap forces JavaScript, so the identifier resolves
+            * def viaParen = call read('called.feature') ({ locationId: locationId })
+            * match viaParen.received == { locationId: '01484' }
+
+            # the recommended escape composes with call-by-tag too
+            * def viaTagParen = call read('called.feature@list') ({ locationId: locationId })
+            * match viaTagParen.received == { locationId: '01484' }
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(),
+                "bare identifier in call arg is a string; #(...) and paren-wrap resolve it: "
+                        + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallFeatureWithSpacesInPathAndInlineArg() throws Exception {
+        // Path with a space + inline JSON arg — exercises the quote-aware close-paren
+        // finder. Before the fix, parseCallExpression used indexOf(')') which works
+        // here but the surrounding wrapping-as-JS still broke embedded args.
+        Path calledFeature = tempDir.resolve("my feature.feature");
+        Files.writeString(calledFeature, """
+            Feature: With spaces
+            Scenario:
+            * def out = userId
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario:
+            * def userId = 42
+            * def result = call read('my feature.feature') { userId: #(userId) }
+            * match result.out == 42
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(),
+                "Path with spaces + inline arg should work: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallFeatureWithCloseParenInPath() throws Exception {
+        // Path containing `)` — proves the quote-aware close-paren scan beats
+        // the old naive indexOf(')'). Rare but legal.
+        Path calledFeature = tempDir.resolve("foo)bar.feature");
+        Files.writeString(calledFeature, """
+            Feature: Funky name
+            Scenario:
+            * def out = 'ok'
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario:
+            * def result = call read('foo)bar.feature')
+            * match result.out == 'ok'
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(),
+                "Path containing ')' should not confuse the call-arg splitter: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallReadJsWithSpacesInPath() throws Exception {
+        // Tests that paths with spaces work correctly
+        Path jsFile = tempDir.resolve("my function.js");
+        Files.writeString(jsFile, """
+            function fn(x) {
+              return x * 3;
+            }
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario:
+            * def result = call read('my function.js') 7
+            * match result == 21
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "Path with spaces should work: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallReadWithVariable() throws Exception {
+        // Tests call read(variable) where variable holds the path
+        Path jsFile = tempDir.resolve("add.js");
+        Files.writeString(jsFile, """
+            function fn(x) {
+              return x + 10;
+            }
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario:
+            * def path = 'add.js'
+            * def result = call read(path) 5
+            * match result == 15
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "call read(variable) should work: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallReadFeatureWithVariable() throws Exception {
+        // Tests call read(variable) where variable holds a feature path
+        Path calledFeature = tempDir.resolve("target.feature");
+        Files.writeString(calledFeature, """
+            Feature: Target
+            Scenario:
+            * def output = input * 2
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario:
+            * def path = 'target.feature'
+            * def response = call read(path) { input: 21 }
+            * match response.output == 42
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "call read(variable) for feature should work: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallFunctionWithInlineJson() throws Exception {
+        // Tests V1 syntax: call fun { key: 'value' } with inline JSON argument
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Call with inline JSON
+            Scenario:
+            * def fun = function(arg){ return [arg.first, arg.second] }
+            * def result = call fun { first: 'dummy', second: 'other' }
+            * match result == ['dummy', 'other']
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "call with inline JSON should work: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallFunctionWithEmbeddedExpressionInArg() throws Exception {
+        // Tests V1 compatibility: embedded expressions like #(var) in function call arguments
+        // should be evaluated before passing to the function.
+        // This is used in demo/headers/headers.feature:75-82:
+        //   * header Authorization = call fun { first: 'dummy', second: '#(token + time + demoBaseUrl)' }
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Call with embedded expression in arg
+            Scenario:
+            * def token = 'abc'
+            * def time = '123'
+            * def url = 'http://test'
+            * def fun = function(arg){ return [arg.first, arg.second] }
+            * def result = call fun { first: 'dummy', second: '#(token + time + url)' }
+            * match result == ['dummy', 'abc123http://test']
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "Embedded expressions in function call args should be evaluated: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallInRhsOfHeader() throws Exception {
+        // Tests V1 syntax: header X = call fun { key: 'value' }
+        // The call expression in the RHS should be evaluated as Karate expression, not pure JS
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Call in header RHS
+            Scenario:
+            * def fun = function(arg){ return arg.first + '-' + arg.second }
+            * def expected = call fun { first: 'hello', second: 'world' }
+            * match expected == 'hello-world'
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "call in expression RHS should work: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallLoopWithReadFeature() throws Exception {
+        // Tests V1 syntax: call read('feature') array
+        // Each element in array should be passed to the called feature
+        // __loop should contain the iteration index (0, 1, 2, ...)
+        // __arg should contain the current element
+        Path calledFeature = tempDir.resolve("called.feature");
+        Files.writeString(calledFeature, """
+            Feature: Called
+            Scenario:
+            * def loopIndex = __loop
+            * def argValue = __arg
+            * def nameValue = name
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Call Loop
+            Scenario:
+            * def data = [{ name: 'Bob' }, { name: 'Alice' }, { name: 'Eve' }]
+            * def result = call read('called.feature') data
+            * match result[0].loopIndex == 0
+            * match result[1].loopIndex == 1
+            * match result[2].loopIndex == 2
+            * match result[0].nameValue == 'Bob'
+            * match result[1].nameValue == 'Alice'
+            * match result[2].nameValue == 'Eve'
+            * match result[0].argValue == { name: 'Bob' }
+            * match result[1].argValue == { name: 'Alice' }
+            * match result[2].argValue == { name: 'Eve' }
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "call loop with __loop and __arg should work: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallOnceLoopWithReadFeature() throws Exception {
+        // Tests V1 syntax: callonce read('feature') array
+        // Result should be cached and returned on subsequent calls
+        Path calledFeature = tempDir.resolve("called.feature");
+        Files.writeString(calledFeature, """
+            Feature: Called
+            Scenario:
+            * def result = name + '-' + __loop
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Callonce Loop
+            Background:
+            * def data = [{ name: 'A' }, { name: 'B' }]
+            * def result = callonce read('called.feature') data
+
+            Scenario: First
+            * match result[0].result == 'A-0'
+            * match result[1].result == 'B-1'
+
+            Scenario: Second
+            * match result[0].result == 'A-0'
+            * match result[1].result == 'B-1'
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "callonce loop should work: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallLoopAccessParentVariable() throws Exception {
+        // Tests that loop call can access parent variables via __arg reference
+        // V1 pattern: match __arg == parentVar[__loop]
+        Path calledFeature = tempDir.resolve("called.feature");
+        Files.writeString(calledFeature, """
+            Feature: Called
+            Scenario:
+            * match __arg == data[__loop]
+            * def processed = name + '-processed'
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Loop with parent access
+            Scenario:
+            * def data = [{ name: 'first' }, { name: 'second' }]
+            * def result = call read('called.feature') data
+            * match result[*].processed == ['first-processed', 'second-processed']
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "loop call should access parent variables: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallUpdatesConfigSharedScope() throws Exception {
+        // V1 compatibility: When using shared scope (callonce without assignment),
+        // configure statements in the called feature should affect the caller's config.
+        // This is the pattern used in call-updates-config.feature.
+        Path calledFeature = tempDir.resolve("common.feature");
+        Files.writeString(calledFeature, """
+            @ignore
+            Feature: Common routine that updates config
+            Scenario:
+            * def token = 'my-auth-token'
+            * configure headers = { 'Authorization': '#(token)' }
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Call updates config
+            Background:
+            * callonce read('common.feature')
+
+            Scenario: Config should be updated by called feature
+            * match karate.config.headers != null
+            * match karate.config.headers.Authorization == 'my-auth-token'
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "Shared scope call should propagate config: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallOnceUpdatesConfigCached() throws Exception {
+        // V1 compatibility: callonce should cache and restore config changes
+        // When a second scenario uses the same callonce, it should get the same config
+        Path calledFeature = tempDir.resolve("setup.feature");
+        Files.writeString(calledFeature, """
+            @ignore
+            Feature: Setup that configures headers
+            Scenario:
+            * def baseUrl = 'http://example.com'
+            * configure headers = { 'X-Custom': 'value' }
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Callonce config caching
+            Background:
+            * callonce read('setup.feature')
+
+            Scenario: First scenario gets config
+            * match karate.config.headers == { 'X-Custom': 'value' }
+
+            Scenario: Second scenario also gets cached config
+            * match karate.config.headers == { 'X-Custom': 'value' }
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertEquals(2, result.getScenarioCount());
+        assertTrue(result.isPassed(), "Callonce should cache and restore config: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallOnceSharedScopeWithHeadersFunction() throws Exception {
+        // V1 compatibility: When using shared scope, both variables and config should propagate.
+        // This tests the pattern from karate-demo where headers.js uses karate.get() to access variables.
+        Path headersJs = tempDir.resolve("headers.js");
+        Files.writeString(headersJs, """
+            function fn() {
+              var token = karate.get('token');
+              var time = karate.get('time');
+              if (token && time) {
+                return { 'Authorization': token + '-' + time };
+              } else {
+                return {};
+              }
+            }
+            """);
+
+        Path calledFeature = tempDir.resolve("common.feature");
+        Files.writeString(calledFeature, """
+            @ignore
+            Feature: Common routine that sets variables and headers function
+            Scenario:
+            * def token = 'my-token'
+            * def time = 'my-time'
+            * configure headers = read('headers.js')
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Shared scope with headers function
+            Background:
+            # Shared scope - config AND variables should propagate
+            * callonce read('common.feature')
+
+            Scenario: Variables and headers function should be available
+            # Variables should be accessible
+            * match token == 'my-token'
+            * match time == 'my-time'
+            # Headers function should return correct value using the variables
+            * def headersResult = karate.config.headers()
+            * match headersResult == { 'Authorization': 'my-token-my-time' }
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "Shared scope should propagate both vars and headers function: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallSharedScopePropagatesCookieJar() throws Exception {
+        // V1 compatibility: When using shared scope, cookies collected from HTTP responses
+        // in the called feature should be available in the caller's cookie jar.
+        // This is the pattern used in karate-demo's common.feature where responseCookies
+        // from a login request should be auto-sent on subsequent requests.
+        //
+        // We test this by using configure cookies in the called feature, which updates
+        // the cookie jar, and verifying it's accessible in the caller.
+        Path calledFeature = tempDir.resolve("common.feature");
+        Files.writeString(calledFeature, """
+            @ignore
+            Feature: Common routine that sets cookies
+            Scenario:
+            # Set a cookie via configure - this updates the cookie jar
+            * configure cookies = { session: 'abc123' }
+            * def setupDone = true
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Shared scope should propagate cookie jar
+            Scenario: Cookie config should propagate from called feature
+            # Shared scope - cookies should propagate
+            * call read('common.feature')
+            # Verify variable propagated
+            * match setupDone == true
+            # Verify cookie config propagated
+            * def cookies = karate.config.cookies
+            * match cookies == { session: 'abc123' }
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "Shared scope should propagate cookies config: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallOnceIsolatedScopeDoesNotPropagateConfig() throws Exception {
+        // V1 compatibility: When using isolated scope (def x = callonce read(...)),
+        // configure statements in the called feature should NOT affect the caller's config.
+        // This is the pattern used in call-isolated-config.feature.
+        Path calledFeature = tempDir.resolve("common.feature");
+        Files.writeString(calledFeature, """
+            @ignore
+            Feature: Common routine that updates config
+            Scenario:
+            * def token = 'my-auth-token'
+            * def time = 'my-time'
+            * configure headers = { 'Authorization': '#(token)' }
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Call with isolated scope does not update config
+            Background:
+            # Using assignment - should NOT propagate config
+            * def setup = callonce read('common.feature')
+
+            Scenario: Config should NOT be updated by called feature (isolated scope)
+            # Use intermediate variable to avoid match expression evaluation issue
+            * def actualHeaders = karate.config.headers
+            * match actualHeaders == null
+
+            Scenario: But the returned variables should be accessible
+            * match setup.token == 'my-auth-token'
+            * match setup.time == 'my-time'
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertEquals(2, result.getScenarioCount());
+        assertTrue(result.isPassed(), "Isolated scope call should NOT propagate config: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallIsolatedScopeDoesNotPropagateConfig() throws Exception {
+        // Same as above but with regular call (not callonce)
+        Path calledFeature = tempDir.resolve("common.feature");
+        Files.writeString(calledFeature, """
+            @ignore
+            Feature: Common routine that updates config
+            Scenario:
+            * def myVar = 'value'
+            * configure headers = { 'X-Test': 'from-called' }
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Call with isolated scope does not update config
+            Scenario: Config should NOT be updated by called feature (isolated scope)
+            # Using assignment - should NOT propagate config
+            * def result = call read('common.feature')
+            # Use intermediate variable to avoid match expression evaluation issue
+            * def actualHeaders = karate.config.headers
+            * match actualHeaders == null
+            * match result.myVar == 'value'
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "Isolated scope call should NOT propagate config: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallOnceWithFunctionInResult() throws Exception {
+        // Tests that functions in callonce results are preserved and not converted to Maps.
+        // JsFunction extends JsObject which implements Map, so deepCopy must check
+        // for JsCallable before checking for Map to avoid mangling functions.
+        Path jsFile = tempDir.resolve("utils.js");
+        Files.writeString(jsFile, """
+            function fn() {
+              return {
+                value: 42,
+                getValue: function() { return 42; },
+                process: function(x) { return x * 2; }
+              };
+            }
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Callonce with function in result
+            Background:
+            * callonce read('utils.js')
+            Scenario: First scenario - uses cached result
+            * def result = getValue()
+            * match result == 42
+            * match process(5) == 10
+            Scenario: Second scenario - also uses cached result
+            * def result = getValue()
+            * match result == 42
+            * match process(10) == 20
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "Functions in callonce results should be callable: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testDefWithFunctionInObjectLiteral() throws Exception {
+        // Tests that functions inside object literals are preserved when using def.
+        // This catches regressions in processEmbeddedExpressions which must check
+        // for JsCallable before checking for Map.
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Function in object literal
+            Scenario: Access function from object
+            * def foo = ({ bar: function(){ return 'baz' } })
+            * def result = foo.bar()
+            * match result == 'baz'
+            Scenario: Chained access
+            * def foo = ({ bar: { baz: function(){ return 'deep' } } })
+            * def result = foo.bar.baz()
+            * match result == 'deep'
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "Functions in object literals should be callable: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCrossReferencedSchemasLoadedViaCall() throws Exception {
+        // Schemas defined in a shared feature reference each other through the
+        // result-variable prefix (schemaList.X). The placeholders cannot resolve
+        // at def-time inside the called feature (schemaList does not exist yet) —
+        // they must survive as raw placeholders and resolve later in the caller's
+        // scope where schemaList is bound. A fail-fast walk of the called feature's
+        // returned variable map would drop the cross-ref keys (resolving to null)
+        // or throw ReferenceError; v1 resolved these lazily.
+        Path schemas = tempDir.resolve("schemas.feature");
+        Files.writeString(schemas, """
+            Feature: Schema definitions with cross-references
+            Scenario: Define schemas
+            * def AddressSchema =
+            ""\"
+            ({
+            street: '##string',
+            city: '##string'
+            })
+            ""\"
+            * def ItemSchema =
+            ""\"
+            ({
+            id: '##number',
+            name: '##string'
+            })
+            ""\"
+            * def OrderSchema =
+            ""\"
+            ({
+            orderId: '#number',
+            shipTo: '##(schemaList.AddressSchema)',
+            items: '##[] schemaList.ItemSchema'
+            })
+            ""\"
+            """);
+
+        Path caller = tempDir.resolve("caller.feature");
+        Files.writeString(caller, """
+            Feature: Schema cross-reference loaded via call read
+            Scenario: cross-referencing schemas resolve from caller scope
+            * def schemaList = call read('schemas.feature')
+            * def testOrder =
+            ""\"
+            {
+              orderId: 123,
+              shipTo: { street: '456 Oak Ave', city: 'Springfield' },
+              items: [{ id: 1, name: 'Widget' }, { id: 2, name: 'Gadget' }]
+            }
+            ""\"
+            * match testOrder == schemaList.OrderSchema
+            # nested schema genuinely validates: a wrong-typed item id must not match
+            * def badOrder = { orderId: 1, shipTo: { street: 'a', city: 'b' }, items: [{ id: 'x', name: 'Y' }] }
+            * match badOrder != schemaList.OrderSchema
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, caller.toString());
+        assertTrue(result.isPassed(), "cross-referenced schemas via call read should resolve: " + getFailureMessage(result));
+    }
+
+    private String getFailureMessage(SuiteResult result) {
+        if (result.isPassed()) return "none";
+        for (FeatureResult fr : result.getFeatureResults()) {
+            for (ScenarioResult sr : fr.getScenarioResults()) {
+                if (sr.isFailed()) {
+                    return sr.getFailureMessage();
+                }
+            }
+        }
+        return "unknown";
+    }
+
+    // ========== integer 0 passed as call argument arrives as undefined ==========
+
+    @Test
+    void testCallFeatureWithZeroArgument() throws Exception {
+        // Passing integer 0 as a call argument should work - not arrive as undefined
+        Path calledFeature = tempDir.resolve("called.feature");
+        Files.writeString(calledFeature, """
+            Feature: Called
+            Scenario:
+            * match pageNumber == 0
+            * match pageSize == 10
+            * match karate.typeOf(pageNumber) == 'number'
+            * def result = pageNumber
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario:
+            * def response = call read('called.feature') { pageNumber: 0, pageSize: 10 }
+            * match response.result == 0
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "Integer 0 should be passed correctly: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallFeatureWithZeroViaEmbeddedExpression() throws Exception {
+        // Passing 0 via embedded expression #(var) should also work
+        Path calledFeature = tempDir.resolve("called.feature");
+        Files.writeString(calledFeature, """
+            Feature: Called
+            Scenario:
+            * match pageNumber == 0
+            * match pageSize == 10
+            * match karate.typeOf(pageNumber) == 'number'
+            * def result = pageNumber
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario:
+            * def myPage = 0
+            * def response = call read('called.feature') { pageNumber: '#(myPage)', pageSize: 10 }
+            * match response.result == 0
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "Integer 0 via embedded expression should be passed correctly: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallFeatureWithFalsyArguments() throws Exception {
+        // All falsy values (0, false, null, empty string) should be passed correctly
+        Path calledFeature = tempDir.resolve("called.feature");
+        Files.writeString(calledFeature, """
+            Feature: Called
+            Scenario:
+            * match zero == 0
+            * match flag == false
+            * match empty == ''
+            * match nothing == null
+            * match karate.typeOf(zero) == 'number'
+            * match karate.typeOf(flag) == 'boolean'
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+            Scenario:
+            * def result = call read('called.feature') { zero: 0, flag: false, empty: '', nothing: null }
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "Falsy values should be passed correctly: " + getFailureMessage(result));
+    }
+
+    // ========== call read() should fail caller when called feature fails ==========
+
+    @Test
+    void testCallFailedFeatureFailsCaller() throws Exception {
+        Path child = tempDir.resolve("child.feature");
+        Files.writeString(child, """
+            Feature: child
+            Scenario:
+            * karate.fail('child failure')
+            """);
+
+        Path parent = tempDir.resolve("parent.feature");
+        Files.writeString(parent, """
+            Feature: parent
+            Scenario:
+            * call read('child.feature')
+            * def shouldNotRun = true
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, parent.toString());
+
+        assertFalse(result.isPassed(), "Parent should fail when called feature fails");
+        String msg = getFailureMessage(result);
+        assertTrue(msg.contains("child failure"), "Failure message should contain child error: " + msg);
+    }
+
+    @Test
+    void testCallWithResultFailedFeatureFailsCaller() throws Exception {
+        Path child = tempDir.resolve("child.feature");
+        Files.writeString(child, """
+            Feature: child
+            Scenario:
+            * karate.fail('child failure')
+            """);
+
+        Path parent = tempDir.resolve("parent.feature");
+        Files.writeString(parent, """
+            Feature: parent
+            Scenario:
+            * def response = call read('child.feature')
+            * def shouldNotRun = true
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, parent.toString());
+
+        assertFalse(result.isPassed(), "Parent should fail when called feature fails (with result var)");
+    }
+
+    @Test
+    void testCallFailedFeatureStopsExecution() throws Exception {
+        // Verify that steps after the failed call do NOT execute
+        Path child = tempDir.resolve("child.feature");
+        Files.writeString(child, """
+            Feature: child
+            Scenario:
+            * karate.fail('stop here')
+            """);
+
+        Path parent = tempDir.resolve("parent.feature");
+        Files.writeString(parent, """
+            Feature: parent
+            Scenario:
+            * def before = true
+            * call read('child.feature')
+            * def after = true
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, parent.toString());
+
+        assertFalse(result.isPassed(), "Parent should fail");
+        // The scenario should have failed at the call step, so 'after' should not have been set
+        assertEquals(1, result.getScenarioCount());
+    }
+
+    @Test
+    void testCallMatchFailureFailsCaller() throws Exception {
+        // Test that a match failure in child also propagates
+        Path child = tempDir.resolve("child.feature");
+        Files.writeString(child, """
+            Feature: child
+            Scenario:
+            * def actual = 1
+            * match actual == 2
+            """);
+
+        Path parent = tempDir.resolve("parent.feature");
+        Files.writeString(parent, """
+            Feature: parent
+            Scenario:
+            * call read('child.feature')
+            * def shouldNotRun = true
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, parent.toString());
+
+        assertFalse(result.isPassed(), "Parent should fail when called feature has match failure");
+    }
+
+    // ========== karate.call() must propagate failures from called feature ==========
+
+    @Test
+    void testKarateCallMatchFailureFailsCaller() throws Exception {
+        // karate.call(path) should propagate a match failure in the called feature
+        Path child = tempDir.resolve("child.feature");
+        Files.writeString(child, """
+            @ignore
+            Feature: Sub
+            Scenario:
+            * print '--- SUB: Before Match ---'
+            * match 1 == 2
+            * print '--- SUB: After Match ---'
+            """);
+
+        Path parent = tempDir.resolve("parent.feature");
+        Files.writeString(parent, """
+            Feature: Main
+            Scenario:
+            * print '--- MAIN: Starting Call ---'
+            * karate.call('child.feature')
+            * def shouldNotRun = true
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, parent.toString());
+
+        assertFalse(result.isPassed(), "Parent should fail when karate.call()ed feature has match failure");
+    }
+
+    @Test
+    void testKarateCallFailFailsCaller() throws Exception {
+        // karate.call(path) should propagate karate.fail() in the called feature
+        Path child = tempDir.resolve("child.feature");
+        Files.writeString(child, """
+            Feature: child
+            Scenario:
+            * karate.fail('child failure')
+            """);
+
+        Path parent = tempDir.resolve("parent.feature");
+        Files.writeString(parent, """
+            Feature: parent
+            Scenario:
+            * karate.call('child.feature')
+            * def shouldNotRun = true
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, parent.toString());
+
+        assertFalse(result.isPassed(), "Parent should fail when karate.call()ed feature fails");
+        String msg = getFailureMessage(result);
+        assertTrue(msg.contains("child failure"), "Failure message should contain child error: " + msg);
+    }
+
+    @Test
+    void testKarateCallWithResultFailedFeatureFailsCaller() throws Exception {
+        // def x = karate.call(path) should also propagate failure
+        Path child = tempDir.resolve("child.feature");
+        Files.writeString(child, """
+            Feature: child
+            Scenario:
+            * match 1 == 2
+            """);
+
+        Path parent = tempDir.resolve("parent.feature");
+        Files.writeString(parent, """
+            Feature: parent
+            Scenario:
+            * def response = karate.call('child.feature')
+            * def shouldNotRun = true
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, parent.toString());
+
+        assertFalse(result.isPassed(), "Parent should fail when karate.call() result is assigned");
+    }
+
+    @Test
+    void testCallByTagDoesNotReExecuteOnFailure() throws Exception {
+        // Regression: `call read('file.feature@tag')` was executing the called scenario twice
+        // when it failed. The JS-eval probe in executeCall() caught FeatureCall
+        // execution failures and silently fell through to the standard call path,
+        // running the same scenario a second time and masking the original error.
+        Path called = tempDir.resolve("called.feature");
+        Files.writeString(called, """
+            Feature: called
+            @target
+            Scenario: fail after one step
+            * def x = 1
+            * match 1 == 2
+            """);
+
+        Path caller = tempDir.resolve("caller.feature");
+        Files.writeString(caller, """
+            Feature: caller
+            Scenario: call once
+            * call read('called.feature@target')
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, caller.toString());
+
+        assertTrue(result.isFailed(), "Suite should fail");
+
+        // Walk the failed step's call results: there must be exactly one feature
+        // call, not two. Two would indicate the swallowed-exception fall-through
+        // re-running the called scenario.
+        long calleeRuns = result.getFeatureResults().stream()
+                .flatMap(fr -> fr.getScenarioResults().stream())
+                .flatMap(sr -> sr.getStepResults().stream())
+                .filter(step -> step.getCallResults() != null)
+                .mapToLong(step -> step.getCallResults().size())
+                .sum();
+        assertEquals(1, calleeRuns,
+                "Called scenario should execute exactly once on failure, got " + calleeRuns);
+    }
+
+    @Test
+    void testKarateCallonceFailedFeatureFailsCaller() throws Exception {
+        // karate.callonce(path) should also propagate failures
+        Path child = tempDir.resolve("child.feature");
+        Files.writeString(child, """
+            Feature: child
+            Scenario:
+            * match 1 == 2
+            """);
+
+        Path parent = tempDir.resolve("parent.feature");
+        Files.writeString(parent, """
+            Feature: parent
+            Scenario:
+            * karate.callonce('child.feature')
+            * def shouldNotRun = true
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, parent.toString());
+
+        assertFalse(result.isPassed(), "Parent should fail when karate.callonce()ed feature fails");
+    }
+
+    @Test
+    void testCallOnceInBackgroundDoesNotLeakOutlineVariables() throws Exception {
+        // Regression: when `callonce` is invoked in a Background and the scenario is a
+        // Scenario Outline, the example-row variable (e.g. `variable`) leaked across
+        // rows. The first row's value got cached on the callonce result map and the
+        // restore step in `applyCachedCallOnceResult` overwrote the next row's value.
+        // Placeholder substitution `<variable>` was fine (resolved at parse time),
+        // but bare `variable` was stuck at the first row's value.
+        Path helper = tempDir.resolve("helper.feature");
+        Files.writeString(helper, """
+            Feature: helper
+            Scenario:
+            * print 'callonce executed'
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: outline + callonce
+
+            Background:
+            * callonce read('helper.feature')
+
+            Scenario Outline:
+            * match variable == '<variable>'
+
+            Examples:
+            | variable  |
+            | a         |
+            | something |
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(),
+                "Outline row binding should match its example value even with callonce in Background: "
+                        + getFailureMessage(result));
+        assertEquals(2, result.getScenarioCount());
+        assertEquals(2, result.getScenarioPassedCount());
+    }
+
+    @Test
+    void testCallByLineFromKeyword() throws Exception {
+        // `call read('file.feature:N')` selects one scenario by line, mirroring
+        // the suite-side `Runner.path("file.feature:N")` syntax.
+        Path child = tempDir.resolve("child.feature");
+        Files.writeString(child, """
+            Feature: child
+
+            Scenario: alpha
+            * def val = 1
+
+            Scenario: beta
+            * def val = 2
+
+            Scenario: gamma
+            * def val = 3
+            """);
+
+        Path parent = tempDir.resolve("parent.feature");
+        Files.writeString(parent, """
+            Feature: parent
+            Scenario:
+            * def alpha = call read('child.feature:3')
+            * match alpha.val == 1
+            * def beta = call read('child.feature:6')
+            * match beta.val == 2
+            * def gamma = call read('child.feature:9')
+            * match gamma.val == 3
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, parent.toString());
+        assertTrue(result.isPassed(), "call by line should select the right scenario: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallByLineFromJs() throws Exception {
+        // `karate.call('file.feature:N')` — same syntax, JS surface.
+        Path child = tempDir.resolve("child.feature");
+        Files.writeString(child, """
+            Feature: child
+
+            Scenario: alpha
+            * def val = 1
+
+            Scenario: beta
+            * def val = 2
+            """);
+
+        Path parent = tempDir.resolve("parent.feature");
+        Files.writeString(parent, """
+            Feature: parent
+            Scenario:
+            * def alpha = karate.call('child.feature:3')
+            * match alpha.val == 1
+            * def beta = karate.call('child.feature:6')
+            * match beta.val == 2
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, parent.toString());
+        assertTrue(result.isPassed(), "karate.call by line should select the right scenario: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallByLineMultipleLinesSelectsAll() throws Exception {
+        // `call read('file.feature:N:M')` matches Runner's multi-line syntax —
+        // selects every scenario whose line is in the set. The callee's last
+        // scenario wins the returned variables (matches plain `call` semantics).
+        Path child = tempDir.resolve("child.feature");
+        Files.writeString(child, """
+            Feature: child
+
+            Scenario: a
+            * def val = 1
+
+            Scenario: b
+            * def val = 2
+
+            Scenario: c
+            * def val = 3
+            """);
+
+        Path parent = tempDir.resolve("parent.feature");
+        Files.writeString(parent, """
+            Feature: parent
+            Scenario:
+            * def result = call read('child.feature:3:6')
+            * match result.val == 2
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, parent.toString());
+        assertTrue(result.isPassed(), "multi-line call should run both scenarios: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testNestedCallWithByteArrayInScenarioOutline() throws Exception {
+        Path child = tempDir.resolve("child.feature");
+        Files.writeString(child, """
+            Feature: child
+            @someScenario
+            Scenario: someScenario
+            * def calleeReceived = rowData
+            * def calleeVal = 42
+            """);
+
+        Path parent = tempDir.resolve("parent.feature");
+        Files.writeString(parent, """
+            Feature: parent
+            @setup
+            Scenario:
+            * def datasource = [{ id: '1', desc: 'first' }, { id: '2', desc: 'second' }]
+
+            Scenario Outline: <desc> <id>
+            * def rowData = Java.type('java.nio.charset.StandardCharsets').UTF_8.encode('raw_bytes_' + '<id>').array()
+            * def result = call read('child.feature@someScenario')
+            * match result.calleeVal == 42
+            * match result.calleeReceived == rowData
+
+            Examples:
+            | karate.setup().datasource |
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, parent.toString());
+        assertTrue(result.isPassed(), "scenario outline with byte[] and nested call should pass: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallSingleWithByteArrayResult() throws Exception {
+        Path setup = tempDir.resolve("setup.feature");
+        Files.writeString(setup, """
+            Feature: setup
+            Scenario:
+            * def binaryData = Java.type('java.nio.charset.StandardCharsets').UTF_8.encode('secret-bytes').array()
+            * def config = ({ data: binaryData })
+            """);
+
+        Path caller = tempDir.resolve("caller.feature");
+        Files.writeString(caller, """
+            Feature: caller
+            Scenario: first
+            * def expected = Java.type('java.nio.charset.StandardCharsets').UTF_8.encode('secret-bytes').array()
+            * def res1 = karate.callSingle('setup.feature')
+            * match res1.config.data == expected
+            * eval res1.config.data[0] = 88
+
+            Scenario: second
+            * def expected = Java.type('java.nio.charset.StandardCharsets').UTF_8.encode('secret-bytes').array()
+            * def res2 = karate.callSingle('setup.feature')
+            * match res2.config.data == expected
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, caller.toString());
+        assertTrue(result.isPassed(), "mutating a callSingle byte[] result must not corrupt the cache: "
+                + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallOnceWithByteArrayResultIsolatedFromMutation() throws Exception {
+        Path setup = tempDir.resolve("setup.feature");
+        Files.writeString(setup, """
+            Feature: setup
+            Scenario:
+            * def binaryData = Java.type('java.nio.charset.StandardCharsets').UTF_8.encode('secret-bytes').array()
+            """);
+
+        Path caller = tempDir.resolve("caller.feature");
+        Files.writeString(caller, """
+            Feature: caller
+            Scenario: first
+            * def result = callonce read('setup.feature')
+            * eval result.binaryData[0] = 88
+
+            Scenario: second
+            * def expected = Java.type('java.nio.charset.StandardCharsets').UTF_8.encode('secret-bytes').array()
+            * def result = callonce read('setup.feature')
+            * match result.binaryData == expected
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, caller.toString());
+        assertTrue(result.isPassed(), "mutating a callonce byte[] result must not corrupt the cache: "
+                + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallReadWithConcatenatedPathExpression() throws Exception {
+        Path calledFeature = tempDir.resolve("called-xlsx.feature");
+        Files.writeString(calledFeature, """
+            Feature: Called with Args
+            Scenario: Use arguments
+            * def doubled = inputValue * 2
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller with dynamic read path
+            Scenario: Path built by string concatenation
+            * def ext = 'xlsx'
+            * def response = call read('called-' + ext + '.feature') { inputValue: 21 }
+            * match response.doubled == 42
+            * call read('called-' + ext + '.feature') { inputValue: 5 }
+            * match doubled == 10
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "Suite should pass: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallReadFallbackKeepsConcatenatedPathIntact() throws Exception {
+        // when the call-target probe fails (here: the file does not exist), the
+        // fallback parser must still evaluate a concatenated path expression -
+        // the failure must name the resolved path, never the raw JS fragment
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: dynamic path to a missing file
+            Scenario:
+            * def ext = 'pdf'
+            * call read('missing-' + ext + '.feature')
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertFalse(result.isPassed(), "call of a missing feature must fail");
+        String message = getFailureMessage(result);
+        assertTrue(message.contains("missing-pdf.feature"),
+                "failure should name the evaluated path: " + message);
+        assertFalse(message.contains("' + ext + '"),
+                "failure must not leak the unevaluated expression: " + message);
+    }
+
+    @Test
+    void testCallReadWithConcatenatedPathInsideCalledFeature() throws Exception {
+        Path fileDir = Files.createDirectories(tempDir.resolve("file"));
+        Files.writeString(fileDir.resolve("upload-xlsx-file.reusable.feature"), """
+            Feature: innermost
+            Scenario:
+            * def doubled = inputValue * 2
+            """);
+
+        Path statementDir = Files.createDirectories(tempDir.resolve("statement"));
+        Files.writeString(statementDir.resolve("create-statement.reusable.feature"), """
+            Feature: middle - builds the read path dynamically
+            Scenario:
+            * def ext = testData.file.name.substring(testData.file.name.lastIndexOf('.') + 1)
+            * call read('this:../file/upload-' + ext + '-file.reusable.feature') { inputValue: #(testData.value) }
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: outermost
+            Scenario:
+            * def testData = { file: { name: 'data.xlsx' }, value: 21 }
+            * call read('statement/create-statement.reusable.feature') { testData: '#(testData)' }
+            * match doubled == 42
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "Suite should pass: " + getFailureMessage(result));
+    }
+
+    @Test
+    void testCallReadWithConcatenatedThisPrefixedPath() throws Exception {
+        Path subDir = Files.createDirectories(tempDir.resolve("file"));
+        Path calledFeature = subDir.resolve("upload-xlsx-file.feature");
+        Files.writeString(calledFeature, """
+            Feature: Called with Args
+            Scenario: Use arguments
+            * def doubled = inputValue * 2
+            """);
+
+        Path callerDir = Files.createDirectories(tempDir.resolve("statement"));
+        Path callerFeature = callerDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller with dynamic relative read path
+            Scenario: Path built by string concatenation
+            * def ext = 'xlsx'
+            * call read('this:../file/upload-' + ext + '-file.feature') { inputValue: 21 }
+            * match doubled == 42
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+
+        assertTrue(result.isPassed(), "Suite should pass: " + getFailureMessage(result));
+    }
+
+}

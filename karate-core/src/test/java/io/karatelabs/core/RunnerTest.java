@@ -1,0 +1,865 @@
+/*
+ * The MIT License
+ *
+ * Copyright 2025 Karate Labs Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package io.karatelabs.core;
+
+import io.karatelabs.common.Resource;
+import io.karatelabs.gherkin.Feature;
+import io.karatelabs.output.Console;
+import io.karatelabs.test.LogSilencer;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+class RunnerTest {
+
+    @TempDir
+    Path tempDir;
+
+    @BeforeEach
+    void setup() {
+        // Disable colors for cleaner test output
+        Console.setColorsEnabled(false);
+    }
+
+    @Test
+    void prebuiltFeaturesAreReRootedToWorkingDirForLeadingSlashRefs() throws Exception {
+        // Runner.features(prebuiltFeature) must anchor a leading-'/' reference (read/callSingle/karate.start,
+        // incl. config-eval) at the Builder's workingDir — the same anchoring the path-loading flow gets via
+        // Resource.from(file, workingDir). A feature built from a CWD-rooted Resource (Feature.read(
+        // Resource.path(...))) and run under an explicit workingDir gets re-rooted to it. Regression guard for
+        // the Runner.features() gap where an explicit .workingDir(...) was ignored and '/' leaked to the CWD.
+        Path featureFile = Files.createDirectories(tempDir.resolve("checks")).resolve("t.feature");
+        Files.writeString(featureFile, "Feature: t\n\n  Scenario: s\n    * def x = 1\n");
+        Feature prebuilt = Feature.read(Resource.path(featureFile.toString()));   // CWD-rooted (the precondition)
+        assertNotEquals(tempDir.toAbsolutePath().normalize(), prebuilt.getResource().getRoot(),
+                "precondition: a prebuilt feature is not workingDir-rooted");
+
+        Feature resolved = Runner.features(prebuilt).workingDir(tempDir).getResolvedFeatures().get(0);
+        assertEquals(tempDir.toAbsolutePath().normalize(), resolved.getResource().getRoot(),
+                "the prebuilt feature is re-rooted to workingDir so a leading-'/' ref anchors at the project root");
+    }
+
+    @Test
+    void testRunnerWithSingleFeature() throws Exception {
+        Path feature = tempDir.resolve("simple.feature");
+        Files.writeString(feature, """
+            Feature: Simple test
+
+            Scenario: Basic assertion
+            * def a = 1
+            * match a == 1
+            """);
+
+        SuiteResult result = Runner.path(feature.toString())
+                .workingDir(tempDir)
+                .outputDir(tempDir.resolve("reports"))
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed());
+        assertEquals(1, result.getFeatureCount());
+        assertEquals(1, result.getScenarioPassedCount());
+    }
+
+    @Test
+    void testRunnerWithMultipleFeatures() throws Exception {
+        Path feature1 = tempDir.resolve("first.feature");
+        Files.writeString(feature1, """
+            Feature: First
+            Scenario: Test 1
+            * def x = 1
+            """);
+
+        Path feature2 = tempDir.resolve("second.feature");
+        Files.writeString(feature2, """
+            Feature: Second
+            Scenario: Test 2
+            * def y = 2
+            """);
+
+        SuiteResult result = Runner.path(tempDir.toString())
+                .workingDir(tempDir)
+                .outputDir(tempDir.resolve("reports"))
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed());
+        assertEquals(2, result.getFeatureCount());
+        assertEquals(2, result.getScenarioPassedCount());
+    }
+
+    @Test
+    void testRunnerWithFailure() throws Exception {
+        Path feature = tempDir.resolve("failing.feature");
+        Files.writeString(feature, """
+            Feature: Failing test
+
+            Scenario: This will fail
+            * def a = 1
+            * match a == 999
+            """);
+
+        SuiteResult result = Runner.path(feature.toString())
+                .workingDir(tempDir)
+                .outputDir(tempDir.resolve("reports"))
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        assertTrue(result.isFailed());
+        assertEquals(1, result.getScenarioFailedCount());
+        assertFalse(result.getErrors().isEmpty());
+    }
+
+    @Test
+    void testRunnerWithFeatureObjects() throws Exception {
+        Path featurePath = tempDir.resolve("direct.feature");
+        Files.writeString(featurePath, """
+            Feature: Direct feature
+
+            Scenario: Direct test
+            * def value = 42
+            * match value == 42
+            """);
+
+        Feature feature = Feature.read(Resource.from(featurePath, tempDir));
+
+        SuiteResult result = Runner.features(feature)
+                .workingDir(tempDir)
+                .outputDir(tempDir.resolve("reports"))
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed());
+        assertEquals(1, result.getFeatureCount());
+    }
+
+    @Test
+    void testRunnerBuilderChaining() throws Exception {
+        Path feature = tempDir.resolve("chained.feature");
+        Files.writeString(feature, """
+            Feature: Chained builder
+
+            Scenario: Test chaining
+            * def val = 1
+            """);
+
+        Runner.Builder builder = Runner.builder()
+                .path(feature.toString())
+                .workingDir(tempDir)
+                .karateEnv("test")
+                .tags("@smoke")
+                .dryRun(false)
+                .outputDir(tempDir.resolve("reports").toString());
+
+        Suite suite = builder.buildSuite();
+        assertNotNull(suite);
+        assertEquals("test", suite.env);
+    }
+
+    @Test
+    void testRunnerWithClasspathDirectory() {
+        // This directory contains feature files in test resources
+        // One has an intentionally failing scenario for report testing
+        // @ignore features (helper, data-setup) are completely skipped
+        // (silenced: hooks-demo.feature deliberately fails its afterScenario hook)
+        SuiteResult result = LogSilencer.silenced("karate.runtime", () -> Runner.path("classpath:io/karatelabs/report")
+                .outputDir(tempDir.resolve("reports"))
+                .outputHtmlReport(false)
+                .outputConsoleSummary(false)
+                .outputConsoleSummary(false)
+                .parallel(1));
+
+        // Should find only non-@ignore features: test-report, second-feature, third-feature, http-demo, skipped-scenarios, hooks-demo
+        assertEquals(6, result.getFeatureCount());
+        // Total scenarios: 13 + 4 + 4 + 5 + 3 + 4 = 33
+        assertEquals(33, result.getScenarioCount());
+    }
+
+    @Test
+    void testRunnerWithClasspathDirectoryTrailingSlash() {
+        // Same test but with trailing slash
+        // Contains intentionally failing scenario for report testing
+        // (silenced: hooks-demo.feature deliberately fails its afterScenario hook)
+        SuiteResult result = LogSilencer.silenced("karate.runtime", () -> Runner.path("classpath:io/karatelabs/report/")
+                .outputDir(tempDir.resolve("reports"))
+                .outputHtmlReport(false)
+                .outputConsoleSummary(false)
+                .outputConsoleSummary(false)
+                .parallel(1));
+
+        // @ignore features are skipped, http-demo and skipped-scenarios included
+        assertEquals(6, result.getFeatureCount());
+    }
+
+    @Test
+    void testRunnerWithClasspathSingleFile() {
+        // Test single classpath file (existing behavior)
+        SuiteResult result = Runner.path("classpath:io/karatelabs/report/second-feature.feature")
+                .outputDir(tempDir.resolve("reports"))
+                .outputHtmlReport(false)
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        assertEquals(1, result.getFeatureCount());
+        assertEquals(4, result.getScenarioPassedCount());  // Payment Processing has 4 scenarios
+    }
+
+    @Test
+    void testRunnerWithClasspathNestedDirectory() {
+        // Test that features/ directory only contains 1 feature
+        SuiteResult result = Runner.path("classpath:feature")
+                .outputDir(tempDir.resolve("reports"))
+                .outputHtmlReport(false)
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        // Should find http-simple.feature (or may be 0 if it requires HTTP)
+        assertTrue(result.getFeatureCount() >= 0);
+    }
+
+    @Test
+    void testRunnerMixedPaths() throws Exception {
+        // Mix file system and classpath paths
+        Path feature = tempDir.resolve("local.feature");
+        Files.writeString(feature, """
+            Feature: Local feature
+            Scenario: Local test
+            * def x = 1
+            """);
+
+        SuiteResult result = Runner.path(feature.toString(), "classpath:io/karatelabs/report/second-feature.feature")
+                .workingDir(tempDir)
+                .outputDir(tempDir.resolve("reports"))
+                .outputHtmlReport(false)
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        // 1 local + 1 classpath
+        assertEquals(2, result.getFeatureCount());
+    }
+
+    @Test
+    void testRunnerWithMissingDataFile() throws Exception {
+        // Test to verify Runner doesn't crash on data-driven scenarios with missing data
+        // Create a feature with Scenario Outline that references non-existent data file
+
+        // Write karate-config.js
+        Files.writeString(tempDir.resolve("karate-config.js"), """
+            function fn() {
+              return { baseUrl: 'https://httpbin.org' };
+            }
+            """);
+
+        // Write a feature with Scenario Outline that references non-existent data
+        Path feature = tempDir.resolve("data-driven.feature");
+        Files.writeString(feature, """
+            Feature: Data Driven Test
+
+            Scenario Outline: Test with <username>
+              * def result = '<username>'
+              * match result == '#string'
+
+            Examples:
+              | read('missing-file.csv') |
+            """);
+
+        // This should NOT throw - it should return a SuiteResult with failures
+        SuiteResult result = LogSilencer.silenced("karate.runtime", () -> Runner.path(tempDir.toString())
+                .workingDir(tempDir)
+                .configDir(tempDir.toString())
+                .outputDir(tempDir.resolve("reports"))
+                .outputHtmlReport(false)
+                .outputConsoleSummary(false)
+                .outputConsoleSummary(false)
+                .parallel(1));
+
+        // The suite should complete (not crash) with the scenario marked as failed
+        assertNotNull(result);
+        assertFalse(result.isPassed()); // Should fail gracefully, not throw
+    }
+
+    @Test
+    void testRunnerWithLineNumberFilter() throws Exception {
+        // Create a feature with multiple scenarios
+        Path feature = tempDir.resolve("multi-scenario.feature");
+        Files.writeString(feature, """
+            Feature: Multiple scenarios
+
+            Scenario: First scenario
+            * def a = 1
+            * match a == 1
+
+            Scenario: Second scenario
+            * def b = 2
+            * match b == 2
+
+            Scenario: Third scenario
+            * def c = 3
+            * match c == 3
+            """);
+
+        // Run only the second scenario (line 8 is where "Scenario: Second scenario" is)
+        SuiteResult result = Runner.path(feature.toString() + ":8")
+                .workingDir(tempDir)
+                .outputDir(tempDir.resolve("reports"))
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed());
+        assertEquals(1, result.getFeatureCount());
+        // Only the second scenario should run
+        assertEquals(1, result.getScenarioPassedCount());
+    }
+
+    @Test
+    void testRunnerWithLineNumberFilterMultipleLines() throws Exception {
+        // Create a feature with multiple scenarios
+        Path feature = tempDir.resolve("multi-scenario2.feature");
+        Files.writeString(feature, """
+            Feature: Multiple scenarios
+
+            Scenario: First scenario
+            * def a = 1
+            * match a == 1
+
+            Scenario: Second scenario
+            * def b = 2
+            * match b == 2
+
+            Scenario: Third scenario
+            * def c = 3
+            * match c == 3
+            """);
+
+        // Run first and third scenarios (lines 3 and 12)
+        SuiteResult result = Runner.path(feature.toString() + ":3:12")
+                .workingDir(tempDir)
+                .outputDir(tempDir.resolve("reports"))
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed());
+        assertEquals(1, result.getFeatureCount());
+        // Two scenarios should run
+        assertEquals(2, result.getScenarioPassedCount());
+    }
+
+    @Test
+    void testRunnerWithLineNumberFilterIgnoresTags() throws Exception {
+        // Create a feature with @ignore tag
+        Path feature = tempDir.resolve("ignore-scenario.feature");
+        Files.writeString(feature, """
+            Feature: Ignore test
+
+            @ignore
+            Scenario: Ignored scenario
+            * def a = 1
+            * match a == 1
+            """);
+
+        // Run the @ignore scenario by line number - should bypass tag filter
+        SuiteResult result = Runner.path(feature.toString() + ":4")
+                .workingDir(tempDir)
+                .outputDir(tempDir.resolve("reports"))
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed());
+        assertEquals(1, result.getScenarioPassedCount());
+    }
+
+    @Test
+    void testRunnerWithLineNumberFilterScenarioOutline() throws Exception {
+        // Create a feature with Scenario Outline
+        Path feature = tempDir.resolve("outline.feature");
+        Files.writeString(feature, """
+            Feature: Outline test
+
+            Scenario Outline: Parameterized test
+            * def val = <value>
+            * match val == <expected>
+
+            Examples:
+            | value | expected |
+            | 1     | 1        |
+            | 2     | 2        |
+            | 3     | 3        |
+            """);
+
+        // Run targeting the Examples table line (line 7)
+        // This should run all examples in that table
+        SuiteResult result = Runner.path(feature.toString() + ":7")
+                .workingDir(tempDir)
+                .outputDir(tempDir.resolve("reports"))
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed());
+        // All 3 examples should run
+        assertEquals(3, result.getScenarioPassedCount());
+    }
+
+    @Test
+    void testRunnerWithLineNumberFilterScenarioOutlineDeclaration() throws Exception {
+        // Create a feature with Scenario Outline
+        Path feature = tempDir.resolve("outline2.feature");
+        Files.writeString(feature, """
+            Feature: Outline test
+
+            Scenario Outline: Parameterized test
+            * def val = <value>
+            * match val == <expected>
+
+            Examples:
+            | value | expected |
+            | 1     | 1        |
+            | 2     | 2        |
+            | 3     | 3        |
+            """);
+
+        // Run targeting the Scenario Outline declaration line (line 3)
+        // This should run all examples from that outline
+        SuiteResult result = Runner.path(feature.toString() + ":3")
+                .workingDir(tempDir)
+                .outputDir(tempDir.resolve("reports"))
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed());
+        // All 3 examples should run
+        assertEquals(3, result.getScenarioPassedCount());
+    }
+
+    @Test
+    void testRunnerWithLineNumberFilterSpecificExampleRow() throws Exception {
+        // Create a feature with Scenario Outline
+        Path feature = tempDir.resolve("outline-row.feature");
+        Files.writeString(feature, """
+            Feature: Outline row test
+
+            Scenario Outline: Parameterized test
+            * def val = <value>
+            * match val == <expected>
+
+            Examples:
+            | value | expected |
+            | 1     | 1        |
+            | 2     | 2        |
+            | 3     | 3        |
+            """);
+
+        // Run targeting a specific example row line (line 9 = "| 1 | 1 |")
+        SuiteResult result = Runner.path(feature.toString() + ":9")
+                .workingDir(tempDir)
+                .outputDir(tempDir.resolve("reports"))
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed());
+        // Only 1 example should run
+        assertEquals(1, result.getScenarioPassedCount());
+    }
+
+    @Test
+    void testRunnerWithLineNumberFilterMultipleExampleRows() throws Exception {
+        // Create a feature with Scenario Outline
+        Path feature = tempDir.resolve("outline-multi-row.feature");
+        Files.writeString(feature, """
+            Feature: Outline multi row test
+
+            Scenario Outline: Parameterized test
+            * def val = <value>
+            * match val == <expected>
+
+            Examples:
+            | value | expected |
+            | 1     | 1        |
+            | 2     | 2        |
+            | 3     | 3        |
+            """);
+
+        // Run targeting two specific example rows (lines 9 and 11)
+        SuiteResult result = Runner.path(feature.toString() + ":9:11")
+                .workingDir(tempDir)
+                .outputDir(tempDir.resolve("reports"))
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed());
+        // 2 examples should run
+        assertEquals(2, result.getScenarioPassedCount());
+    }
+
+    // ========== Scenario name filter ==========
+
+    @Test
+    void testRunnerWithScenarioNameFilter() throws Exception {
+        Path feature = tempDir.resolve("name-filter.feature");
+        Files.writeString(feature, """
+            Feature: Multiple scenarios
+
+            Scenario: First scenario
+            * def a = 1
+
+            Scenario: Second scenario
+            * def b = 2
+
+            Scenario: Third scenario
+            * def c = 3
+            """);
+
+        SuiteResult result = Runner.path(feature.toString())
+                .scenarioName("Second scenario")
+                .workingDir(tempDir)
+                .outputDir(tempDir.resolve("reports"))
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed());
+        assertEquals(1, result.getScenarioPassedCount());
+    }
+
+    @Test
+    void testRunnerWithScenarioNameFilterTrimsInput() throws Exception {
+        Path feature = tempDir.resolve("name-trim.feature");
+        Files.writeString(feature, """
+            Feature: Trim test
+
+            Scenario: Login happy path
+            * def a = 1
+            """);
+
+        // Leading/trailing whitespace on the input must not prevent a match
+        SuiteResult result = Runner.path(feature.toString())
+                .scenarioName("  Login happy path  ")
+                .workingDir(tempDir)
+                .outputDir(tempDir.resolve("reports"))
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed());
+        assertEquals(1, result.getScenarioPassedCount());
+    }
+
+    @Test
+    void testRunnerWithScenarioNameFilterRunsAllDuplicates() throws Exception {
+        Path feature = tempDir.resolve("name-dup.feature");
+        Files.writeString(feature, """
+            Feature: Duplicate names
+
+            Scenario: Same name
+            * def a = 1
+
+            Scenario: Other
+            * def x = 1
+
+            Scenario: Same name
+            * def b = 2
+            """);
+
+        SuiteResult result = Runner.path(feature.toString())
+                .scenarioName("Same name")
+                .workingDir(tempDir)
+                .outputDir(tempDir.resolve("reports"))
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed());
+        assertEquals(2, result.getScenarioPassedCount());
+    }
+
+    @Test
+    void testRunnerWithScenarioNameFilterBypassesIgnoreTag() throws Exception {
+        Path feature = tempDir.resolve("name-ignore.feature");
+        Files.writeString(feature, """
+            Feature: Ignore bypass
+
+            @ignore
+            Scenario: Target
+            * def a = 1
+            """);
+
+        // Same bypass semantics as :LINE filter
+        SuiteResult result = Runner.path(feature.toString())
+                .scenarioName("Target")
+                .workingDir(tempDir)
+                .outputDir(tempDir.resolve("reports"))
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed());
+        assertEquals(1, result.getScenarioPassedCount());
+    }
+
+    @Test
+    void testRunnerWithScenarioNameFilterOutlineRunsAllRows() throws Exception {
+        Path feature = tempDir.resolve("name-outline.feature");
+        Files.writeString(feature, """
+            Feature: Outline name match
+
+            Scenario Outline: Parameterized check
+            * def val = <value>
+
+            Examples:
+            | value |
+            | 1     |
+            | 2     |
+            | 3     |
+            """);
+
+        SuiteResult result = Runner.path(feature.toString())
+                .scenarioName("Parameterized check")
+                .workingDir(tempDir)
+                .outputDir(tempDir.resolve("reports"))
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed());
+        assertEquals(3, result.getScenarioPassedCount());
+    }
+
+    @Test
+    void testRunnerWithScenarioNameFilterNoMatch() throws Exception {
+        Path feature = tempDir.resolve("name-nomatch.feature");
+        Files.writeString(feature, """
+            Feature: No match
+
+            Scenario: Alpha
+            * def a = 1
+            """);
+
+        SuiteResult result = Runner.path(feature.toString())
+                .scenarioName("Beta")
+                .workingDir(tempDir)
+                .outputDir(tempDir.resolve("reports"))
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        assertEquals(0, result.getScenarioCount());
+    }
+
+    @Test
+    void testRunnerWithScenarioNameFilterAcrossMultipleFeatures() throws Exception {
+        Path f1 = tempDir.resolve("a.feature");
+        Files.writeString(f1, """
+            Feature: A
+            Scenario: Shared
+            * def x = 1
+            Scenario: Only in A
+            * def y = 1
+            """);
+        Path f2 = tempDir.resolve("b.feature");
+        Files.writeString(f2, """
+            Feature: B
+            Scenario: Shared
+            * def x = 2
+            Scenario: Only in B
+            * def y = 2
+            """);
+
+        // Scannable across features: one name, picks matches from both files
+        SuiteResult result = Runner.path(tempDir.toString())
+                .scenarioName("Shared")
+                .workingDir(tempDir)
+                .outputDir(tempDir.resolve("reports"))
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed());
+        assertEquals(2, result.getFeatureCount());
+        assertEquals(2, result.getScenarioPassedCount());
+    }
+
+    @Test
+    void testRunnerWithScenarioNameAndLineFilterIntersect() throws Exception {
+        Path feature = tempDir.resolve("name-and-line.feature");
+        Files.writeString(feature, """
+            Feature: Name + line intersect
+
+            Scenario: Same name
+            * def a = 1
+
+            Scenario: Other
+            * def x = 1
+
+            Scenario: Same name
+            * def b = 2
+            """);
+
+        // :LINE narrows to one of the two duplicate "Same name" scenarios.
+        // Intersection semantics: both filters must match.
+        SuiteResult result = Runner.path(feature.toString() + ":3")
+                .scenarioName("Same name")
+                .workingDir(tempDir)
+                .outputDir(tempDir.resolve("reports"))
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed());
+        assertEquals(1, result.getScenarioPassedCount());
+    }
+
+    @Test
+    void testRunnerLineFilterDoesNotCascadeIntoCalledFeature() throws Exception {
+        // Regression: a suite-level :LINE filter must not narrow scenario
+        // selection inside `call`ed features. Same bypass semantics as the
+        // scenarioName filter — applies at top level only.
+        Path feature = tempDir.resolve("line-and-call-to-self.feature");
+        Files.writeString(feature, """
+            Feature: Line and call to self
+
+            @ignore @callee
+            Scenario: Callee
+            * def x = 1
+
+            Scenario: Caller
+            * def result = karate.call('@callee')
+            * match result.x == 1
+            """);
+
+        // :8 targets only "Caller". Without the caller-null guard, the suite
+        // line filter would also exclude "Callee" when the same file is
+        // reached via the `karate.call('@callee')` step — failing the match.
+        SuiteResult result = Runner.path(feature.toString() + ":8")
+                .workingDir(tempDir)
+                .outputDir(tempDir.resolve("reports"))
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed());
+        assertEquals(1, result.getScenarioPassedCount());
+    }
+
+    /**
+     * Demonstrate it is possible to resolve individual scenarios at runtime. This is only needed until
+     * in-suite orchestration hooks via karate-boot.js land.
+     *
+     * <p>Caveat: the JS below filters via {@code TagSelector} only — it bypasses
+     * {@code FeatureRuntime.shouldSelect} and so does NOT honour {@code @ignore},
+     * {@code @setup}, {@code @envnot}, or suite-level line/name filters.
+     * Production discovery should mirror {@code shouldSelect} for parity with
+     * what would actually run.
+     */
+    @Test
+    void testRunnerResolveFeatures() throws Exception {
+        Path subDir = tempDir.resolve("sub");
+        Files.createDirectory(subDir);
+        Files.writeString(tempDir.resolve("sub/a.feature"), """
+            Feature:
+            Scenario: no tags
+            * def result = 1
+            @smoke
+            Scenario: smoke test
+            * def result = 2
+            """);
+
+        Path feature = tempDir.resolve("feature.feature");
+        Files.writeString(feature, """
+            Feature:
+            Background:
+            * def resolveScenarios =
+            \"\"\"
+            function({ workingDir, path, tags, env }) {
+              workingDir = workingDir ?? null
+              path = Array.isArray(path) ? path : [path]
+              tags = Array.isArray(tags) ? tags : [tags]
+              env = env ?? null
+
+              const features = io.karatelabs.core.Runner.builder()
+                .workingDir(workingDir)
+                .path(path)
+                .tags(tags)
+                .getResolvedFeatures()
+
+              if (features == null) return []
+
+              const scenarioPaths = {}
+              const tagFilter = io.karatelabs.core.TagSelector.fromKarateOptionsTags(tags)
+
+              for (const feature of features) {
+                const sections = feature.getSections()
+                if (sections === null) continue
+
+                for (const section of sections) {
+                  const selector = new io.karatelabs.core.TagSelector(
+                    section.isOutline()
+                    ? section.getScenarioOutline().getTags()
+                    : section.getScenario().getTags())
+
+                  if (selector.evaluate(tagFilter, env)) {
+                    scenarioPaths[feature.getResource().getPrefixedPath() + ":" + section.getLine()] = true
+                  }
+                }
+              }
+
+              return Object.keys(scenarioPaths)
+            }
+            \"\"\"
+            Scenario:
+            * def result = resolveScenarios({ path: "${subDir}", tags: "@smoke" })
+            * match result == ["${subDir}/a.feature:5"]
+            """.replace("${subDir}", subDir.toString()));
+
+        SuiteResult result = Runner.path(feature.toString())
+                .workingDir(tempDir)
+                .outputDir(tempDir.resolve("reports"))
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed());
+    }
+
+    @Test
+    void aDryRunResultKnowsItWasParseOnlySoNothingReadsAsAPass() throws Exception {
+        // A dry run cannot fail (no step executes) and its skipped scenarios count toward `passed`, so
+        // every consumer of the result — the console summary, a CI gate, a coverage ext — would otherwise
+        // see an ordinary green for a suite that never touched the system under test. The result carries
+        // the parse-only fact so it can be reported honestly.
+        Path feature = tempDir.resolve("declared.feature");
+        Files.writeString(feature, """
+            Feature: declared
+
+            Scenario: would fail if it ran
+            * match 1 == 2
+            """);
+
+        SuiteResult result = Runner.path(feature.toString())
+                .workingDir(tempDir)
+                .outputDir(tempDir.resolve("reports"))
+                .outputConsoleSummary(false)
+                .dryRun(true)
+                .parallel(1);
+
+        assertTrue(result.isDryRun(), "the result reports that nothing was executed");
+        assertEquals(0, result.getScenarioFailedCount(), "the failing scenario never ran");
+        assertEquals(1, result.getScenarioSkippedCount(), "it was skipped, not passed");
+        assertTrue(result.isPassed(), "and the suite still settles clean — exactly why isDryRun() exists");
+    }
+
+}

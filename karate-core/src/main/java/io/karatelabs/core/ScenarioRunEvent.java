@@ -1,0 +1,138 @@
+/*
+ * The MIT License
+ *
+ * Copyright 2025 Karate Labs Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package io.karatelabs.core;
+
+import io.karatelabs.gherkin.Feature;
+import io.karatelabs.gherkin.Scenario;
+
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+/**
+ * Scenario-level events (SCENARIO_ENTER, SCENARIO_EXIT).
+ */
+public record ScenarioRunEvent(
+        RunEventType type,
+        ScenarioRuntime source,
+        ScenarioResult result,  // null for ENTER
+        long timeStamp
+) implements RunEvent {
+
+    public static ScenarioRunEvent enter(ScenarioRuntime sr) {
+        return new ScenarioRunEvent(RunEventType.SCENARIO_ENTER, sr, null, System.currentTimeMillis());
+    }
+
+    public static ScenarioRunEvent exit(ScenarioRuntime sr, ScenarioResult result) {
+        return new ScenarioRunEvent(RunEventType.SCENARIO_EXIT, sr, result, System.currentTimeMillis());
+    }
+
+    @Override
+    public RunEventType getType() {
+        return type;
+    }
+
+    @Override
+    public long getTimeStamp() {
+        return timeStamp;
+    }
+
+    /**
+     * Serializes a thin per-scenario envelope: identity (feature path, slug,
+     * line, refId), name, description, tags, and (on EXIT) pass/fail + duration.
+     * For outline-examples, {@code outlineSlug} + {@code exampleIndex} let
+     * receivers stitch back to the parent OUTLINE_ENTER event without
+     * denormalising outline metadata into every example.
+     *
+     * <p>Step results — and any embeds attached to them by exts (e.g.
+     * {@code openapi-match}, {@code grpc-match}) — are deliberately
+     * <strong>not</strong> emitted here. They reach receivers inside
+     * {@code FEATURE_EXIT.data.scenarioResults[i].stepResults[j].embeds[]} via
+     * {@link FeatureResult#toJson()}, which already serializes the full scenario
+     * detail. Duplicating embeds onto {@code SCENARIO_EXIT} would double the
+     * on-wire bytes for typical HTTP-heavy runs without giving consumers any new
+     * information — keep them at exactly one location on the wire. See
+     * {@code karate/docs/DESIGN.md} §JSONL stream for the cross-ext convention.</p>
+     */
+    @Override
+    public Map<String, Object> toJson() {
+        Map<String, Object> map = new LinkedHashMap<>();
+        if (source != null && source.getScenario() != null) {
+            Scenario scenario = source.getScenario();
+            var fr = source.getFeatureRuntime();
+            Feature feature = fr != null ? fr.getFeature() : null;
+            boolean reportDisabled = result != null && result.isReportDisabled();
+            if (feature != null && feature.getResource() != null) {
+                map.put("feature", feature.getResource().getRelativePath());
+            }
+            // Cross-run-stable slug so receivers can upsert by identity without
+            // re-reading source. On EXIT, an author-set __id captured on the
+            // result (resolved by ScenarioRuntime while the engine was live)
+            // wins verbatim — it lets an Examples: column or a `* def __id` step
+            // pin a rename-proof identity. ENTER is provisional identity (the
+            // scenario body hasn't run yet) so it always uses the derived slug;
+            // the authoritative, possibly-overridden identity lands on EXIT.
+            String stableId = result != null ? result.getStableId() : null;
+            map.put("slug", RunUtils.effectiveSlug(stableId, scenario, feature));
+            // the run-unique execution index — the same on ENTER, EXIT and the FEATURE_EXIT result entry
+            ScenarioResult own = result != null ? result : source.getResult();
+            if (own != null && own.getExecutionIndex() > 0) {
+                map.put("executionIndex", own.getExecutionIndex());
+            }
+            map.put("name", scenario.getName());
+            // Description is redacted under @report=false so secrets in the
+            // scenario's description block don't leak into uploaded CI artifacts.
+            map.put("description", reportDisabled ? null : scenario.getDescription());
+            map.put("line", scenario.getLine());
+            map.put("refId", scenario.getRefId());
+            map.put("callDepth", fr != null ? fr.getCallDepth() : 0);
+            map.put("tags", RunUtils.tagTexts(scenario.getTagsEffective()));
+            // Outline-example fields. Parent outline metadata (name, description,
+            // tags, numExamples) is on the OUTLINE_ENTER event — stitch by outlineSlug.
+            if (scenario.isOutlineExample()) {
+                map.put("isOutlineExample", true);
+                map.put("exampleIndex", scenario.getExampleIndex());
+                map.put("outlineSlug", RunUtils.outlineSlug(
+                        RunUtils.parentOutline(scenario), feature));
+            }
+        }
+        if (type == RunEventType.SCENARIO_EXIT && result != null) {
+            map.put("passed", !result.isFailed());
+            map.put("skipped", result.isSkipped());
+            map.put("durationMillis", result.getDurationMillis());
+            if (result.isFailed()) {
+                // @report=false: emit only the redacted message in the JSONL stream so
+                // CI artifacts uploaded from this run don't leak the underlying values.
+                if (result.isReportDisabled()) {
+                    map.put("error", ScenarioResult.SUPPRESSED_FAILURE_MESSAGE);
+                    map.put("errorReason", ScenarioResult.SUPPRESSED_FAILURE_MESSAGE);
+                } else {
+                    map.put("error", result.getFailureMessageWithLocation());
+                    // the suffix of error, for consumers that render the location, step and label apart
+                    map.put("errorReason", result.getFailureReason());
+                }
+            }
+        }
+        return map;
+    }
+}

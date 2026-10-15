@@ -1,0 +1,446 @@
+/*
+ * The MIT License
+ *
+ * Copyright 2025 Karate Labs Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package io.karatelabs.http;
+
+import io.karatelabs.common.FileUtils;
+import io.karatelabs.common.Resource;
+import io.karatelabs.common.ResourceType;
+import io.karatelabs.markup.Markup;
+import io.karatelabs.markup.MarkupConfig;
+import io.karatelabs.markup.ResourceResolver;
+import io.karatelabs.markup.HxDialect;
+import io.karatelabs.output.HttpLogger;
+import io.karatelabs.output.LogContext;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.function.Function;
+
+/**
+ * Main request handler implementing routing for static files, API endpoints, and HTML templates.
+ * Implements Function&lt;HttpRequest, HttpResponse&gt; for use with HttpServer.
+ * <p>
+ * Routing logic:
+ * <ol>
+ *   <li>If path starts with static prefix (e.g., /pub/) → serve static file</li>
+ *   <li>If path starts with API prefix (e.g., /api/) → execute JS file</li>
+ *   <li>Otherwise → render HTML template</li>
+ * </ol>
+ * <p>
+ * Usage:
+ * <pre>
+ * ServerConfig config = new ServerConfig()
+ *     .resourceRoot("classpath:web")
+ *     .sessionStore(new InMemorySessionStore())
+ *     .engineSupplier(Engine::new);
+ *
+ * ServerRequestHandler handler = new ServerRequestHandler(config, resolver);
+ * HttpServer server = HttpServer.start(8080, handler);
+ * </pre>
+ */
+public class ServerRequestHandler implements Function<HttpRequest, HttpResponse> {
+
+    private static final Logger logger = LoggerFactory.getLogger(ServerRequestHandler.class);
+
+    private final ServerConfig config;
+    private final ResourceResolver resolver;
+    private final Markup markup;
+    private final HttpLogger httpLogger = new HttpLogger(LogContext.SERVER_LOGGER);
+
+    public ServerRequestHandler(ServerConfig config, ResourceResolver resolver) {
+        this.config = config;
+        this.resolver = resolver;
+        // Initialize markup with HxDialect for HTMX support
+        MarkupConfig markupConfig = new MarkupConfig();
+        markupConfig.setResolver(resolver);
+        markupConfig.setDevMode(config.isDevMode());
+        markupConfig.setDevTrace(config.isDevTrace());
+        markupConfig.setEngineSupplier(config.getEngineSupplier());
+        this.markup = Markup.init(markupConfig, new HxDialect(markupConfig));
+        if (config.isDevMode()) {
+            logger.warn("karate dev-mode enabled — templates hot-reload on every request");
+            if (config.isDevTrace()) {
+                logger.info("karate dev-trace enabled — fragment boundaries emitted as HTML comments (never enable in production)");
+            }
+        } else if (config.isDevTrace()) {
+            logger.info("karate dev-trace ignored — requires devMode(true)");
+        }
+    }
+
+    @Override
+    public HttpResponse apply(HttpRequest request) {
+        long start = System.currentTimeMillis();
+        httpLogger.logRequest(request);
+        HttpResponse response = handle(request);
+        response.setRequest(request);
+        response.setStartTime(start);
+        response.setResponseTime(System.currentTimeMillis() - start);
+        httpLogger.logResponse(response);
+        return response;
+    }
+
+    private HttpResponse handle(HttpRequest request) {
+        HttpResponse response = new HttpResponse();
+        String path = request.getPath();
+
+        try {
+            // Process form/multipart body if present
+            request.processBody();
+
+            // 1. Static files - handle early, no session/engine needed
+            if (config.isStaticPath(path)) {
+                return handleStatic(request, response);
+            }
+
+            // Create context for this request
+            ServerMarkupContext context = createContext(request, response);
+
+            // Load existing session from cookie if present
+            loadSession(request, context);
+
+            // Load flash messages from previous request (if any)
+            context.loadFlashFromSession();
+
+            // Call request filter if configured (runs with session loaded)
+            if (config.getRequestFilter() != null) {
+                HttpResponse filterResponse = config.getRequestFilter().apply(request, context);
+                if (filterResponse != null) {
+                    return filterResponse;
+                }
+            }
+
+            // CSRF validation for state-changing requests
+            HttpResponse csrfError = validateCsrf(request, context);
+            if (csrfError != null) {
+                return csrfError;
+            }
+
+            // Call request interceptor if configured
+            if (config.getRequestInterceptor() != null) {
+                config.getRequestInterceptor().accept(request);
+            }
+
+            // 2. Create RequestCycle and delegate routing (API or HTML)
+            ServerRequestCycle rc = ServerRequestCycle.init(config, context, resolver, markup);
+            HttpResponse result = rc.handle();
+
+            // Handle redirect if set
+            if (context.hasRedirect()) {
+                // Persist flash messages to session so they survive the redirect
+                context.persistFlashToSession();
+                applyRedirect(request, result, context.getRedirectPath());
+            }
+
+            // Save session if modified
+            saveSession(context, result);
+
+            // Apply security headers for HTML responses
+            if (SecurityHeaders.isHtmlResponse(result.getHeader("Content-Type"))) {
+                SecurityHeaders.apply(result, config);
+            }
+
+            return result;
+
+        } catch (RedirectException e) {
+            applyRedirect(request, response, e.getLocation());
+            return response;
+
+        } catch (Exception e) {
+            response.setStatus(500);
+            response.setBody("Internal Server Error: " + e.getMessage(), ResourceType.TEXT);
+            return response;
+        }
+    }
+
+    private ServerMarkupContext createContext(HttpRequest request, HttpResponse response) {
+        ServerMarkupContext context = new ServerMarkupContext(request, response, config);
+        context.setResourceResolver(path -> resolver.resolve(path, null));
+        return context;
+    }
+
+    private void loadSession(HttpRequest request, ServerMarkupContext context) {
+        if (!config.isSessionEnabled()) {
+            return;
+        }
+        String sessionId = getSessionIdFromCookie(request);
+        if (sessionId != null) {
+            Session session = config.getSessionStore().get(sessionId);
+            if (session != null) {
+                context.setSession(session);
+            }
+        }
+    }
+
+    private String getSessionIdFromCookie(HttpRequest request) {
+        String cookieHeader = request.getHeader("Cookie");
+        if (cookieHeader == null) {
+            return null;
+        }
+        // Parse cookie header: "name1=value1; name2=value2"
+        String cookieName = config.getSessionCookieName();
+        for (String part : cookieHeader.split(";")) {
+            String trimmed = part.trim();
+            if (trimmed.startsWith(cookieName + "=")) {
+                return trimmed.substring(cookieName.length() + 1);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Write a redirect into {@code response}. For an htmx-originated request
+     * (one carrying the {@code HX-Request} header) this emits an
+     * {@code HX-Redirect} header with status 200 — htmx interprets that as a
+     * full window navigation, which re-renders the document {@code <head>}
+     * and any other shell content that a {@code hx-target}-scoped swap would
+     * leave stale (e.g. a {@code <meta name="csrf-token">} tag refreshed by
+     * a {@code context.init()} during the same request). For a non-htmx
+     * request it falls back to a standard {@code 302 Location} response so
+     * native form submits and direct navigation continue to work.
+     */
+    static void applyRedirect(HttpRequest request, HttpResponse response, String location) {
+        if (request != null && request.isAjax()) {
+            response.setStatus(200);
+            response.setHeader("HX-Redirect", location);
+        } else {
+            response.setStatus(302);
+            response.setHeader("Location", location);
+        }
+    }
+
+    /**
+     * Validate CSRF token for state-changing requests.
+     *
+     * @return null if valid or not required, HttpResponse with 403 if invalid
+     */
+    private HttpResponse validateCsrf(HttpRequest request, ServerMarkupContext context) {
+        // Skip if CSRF protection is disabled
+        if (!config.isCsrfEnabled()) {
+            return null;
+        }
+
+        // Only validate state-changing methods
+        String method = request.getMethod();
+        if (!CsrfProtection.requiresValidation(method)) {
+            return null;
+        }
+
+        // Skip if the path is explicitly exempt (e.g. OAuth form_post callback,
+        // signature-verified webhook). The path is responsible for its own
+        // CSRF defense (OAuth state, webhook signature, etc.).
+        if (config.isCsrfExemptPath(request.getPath())) {
+            return null;
+        }
+
+        // Skip if no session or temporary session - nothing to protect from CSRF
+        // This allows signin/signup pages and public API endpoints to work
+        Session session = context.getSession();
+        if (session == null || session.isTemporary()) {
+            return null;
+        }
+
+        if (!CsrfProtection.validate(request, session)) {
+            return HttpResponse.text(403, "Forbidden: Invalid or missing CSRF token");
+        }
+
+        return null;
+    }
+
+    private void saveSession(ServerMarkupContext context, HttpResponse response) {
+        Session session = context.getSession();
+        if (session == null || session.isTemporary()) {
+            // If a template explicitly called context.close() this request
+            // (signout flow), clear the session cookie in the browser too.
+            // The server-side record is already gone; clearing the cookie
+            // makes the signout definite from the client side instead of
+            // leaving a defunct cookie hanging around.
+            if (context.wasExplicitlyClosed()) {
+                clearSessionCookie(context.getRequest(), response);
+            }
+            return;
+        }
+        // Save to store
+        config.getSessionStore().save(session);
+
+        // Set cookie. SameSite=Lax is the safe default — Strict drops the
+        // cookie on cross-site top-level navigations (OAuth response_mode=query
+        // callbacks are GETs back from the IdP and would lose state). Apps
+        // that need cross-site POST callbacks (OAuth response_mode=form_post,
+        // e.g. Microsoft via MSAL4J >=1.18) opt in to SameSite=None via
+        // ServerConfig.sessionSameSite(SameSite.NONE).
+        SameSite sameSite = config.getSessionSameSite();
+        String cookieValue = config.getSessionCookieName() + "=" + session.getId()
+                + "; Path=/; HttpOnly; SameSite=" + sameSite.headerValue();
+        if (isSecure(context.getRequest(), sameSite)) {
+            cookieValue += "; Secure";
+        }
+        appendSetCookie(response, cookieValue);
+    }
+
+    /**
+     * Emit a {@code Set-Cookie} that clears the session cookie in the browser.
+     * Mirrors the attributes used by {@link #saveSession} so the browser
+     * matches and removes the existing cookie — most browsers ignore a clear
+     * whose {@code Path}/{@code SameSite}/{@code Secure} don't match.
+     */
+    private void clearSessionCookie(HttpRequest request, HttpResponse response) {
+        SameSite sameSite = config.getSessionSameSite();
+        String cookieValue = config.getSessionCookieName() + "=; Path=/; HttpOnly; Max-Age=0"
+                + "; SameSite=" + sameSite.headerValue();
+        if (isSecure(request, sameSite)) {
+            cookieValue += "; Secure";
+        }
+        appendSetCookie(response, cookieValue);
+    }
+
+    /**
+     * Secure only over https (direct TLS or {@code X-Forwarded-Proto}, see
+     * {@link HttpServerHandler#toRequest}): browsers drop a Secure cookie set over
+     * plain http on any host but localhost. SameSite=None is always Secure —
+     * browsers reject None without it.
+     */
+    private static boolean isSecure(HttpRequest request, SameSite sameSite) {
+        if (sameSite == SameSite.NONE) {
+            return true;
+        }
+        String urlBase = request == null ? null : request.getUrlBase();
+        return urlBase != null && urlBase.regionMatches(true, 0, "https:", 0, 6);
+    }
+
+    /**
+     * Append a {@code Set-Cookie} value while preserving any cookies a template
+     * already set during rendering. {@link HttpResponse#setHeader} replaces the
+     * existing list, so a naive {@code setHeader("Set-Cookie", sessionCookie)}
+     * would silently drop e.g. an SSO-bookmark cookie the page wrote. Two
+     * Set-Cookie headers are spec-compliant and standard.
+     */
+    private static void appendSetCookie(HttpResponse response, String cookieValue) {
+        java.util.Map<String, java.util.List<String>> headers = response.getHeaders();
+        java.util.List<String> existing = headers == null ? null : headers.get("Set-Cookie");
+        if (existing == null || existing.isEmpty()) {
+            response.setHeader("Set-Cookie", cookieValue);
+            return;
+        }
+        java.util.List<String> merged = new java.util.ArrayList<>(existing);
+        merged.add(cookieValue);
+        response.setHeader("Set-Cookie", merged);
+    }
+
+    private HttpResponse handleStatic(HttpRequest request, HttpResponse response) {
+        String path = request.getPath();
+
+        // Path traversal protection
+        if (!PathSecurity.isSafe(path)) {
+            return forbidden(response, "Invalid path");
+        }
+
+        // Use path without leading slash as resource path
+        // e.g., /pub/app.js -> pub/app.js
+        String resourcePath = path.startsWith("/") ? path.substring(1) : path;
+
+        try {
+            Resource resource = resolver.resolve(resourcePath, null);
+            if (resource == null) {
+                return notFound(response, path);
+            }
+
+            byte[] content = FileUtils.toBytes(resource.getStream());
+
+            // Determine content type based on extension
+            ResourceType resourceType = ResourceType.fromFileExtension(resourcePath);
+            if (resourceType != null) {
+                response.setBody(content, resourceType);
+            } else {
+                // Fallback for unknown types
+                response.setBody(content, ResourceType.BINARY);
+                response.setHeader("Content-Type", getContentType(resourcePath));
+            }
+
+            // Cache headers
+            if (config.isDevMode()) {
+                response.setHeader("Cache-Control", "no-cache, no-store");
+            } else {
+                response.setHeader("Cache-Control", "public, max-age=86400"); // 1 day
+            }
+
+            return response;
+
+        } catch (Exception e) {
+            return notFound(response, path);
+        }
+    }
+
+    private HttpResponse notFound(HttpResponse response, String path) {
+        response.setStatus(404);
+        response.setBody("Not Found: " + path, ResourceType.TEXT);
+        return response;
+    }
+
+    private HttpResponse forbidden(HttpResponse response, String message) {
+        response.setStatus(403);
+        response.setBody("Forbidden: " + message, ResourceType.TEXT);
+        return response;
+    }
+
+    private String getContentType(String path) {
+        ResourceType type = ResourceType.fromFileExtension(path);
+        if (type != null) {
+            return type.contentType;
+        }
+        // Fallback for common types
+        if (path.endsWith(".js")) return "application/javascript";
+        if (path.endsWith(".css")) return "text/css";
+        if (path.endsWith(".html")) return "text/html";
+        if (path.endsWith(".json")) return "application/json";
+        if (path.endsWith(".png")) return "image/png";
+        if (path.endsWith(".jpg") || path.endsWith(".jpeg")) return "image/jpeg";
+        if (path.endsWith(".svg")) return "image/svg+xml";
+        if (path.endsWith(".ico")) return "image/x-icon";
+        if (path.endsWith(".woff")) return "font/woff";
+        if (path.endsWith(".woff2")) return "font/woff2";
+        return "application/octet-stream";
+    }
+
+    // Getter for testing
+    public ServerConfig getConfig() {
+        return config;
+    }
+
+    /**
+     * Exception used internally to signal a redirect.
+     */
+    public static class RedirectException extends RuntimeException {
+        private final String location;
+
+        public RedirectException(String location) {
+            super("Redirect to: " + location);
+            this.location = location;
+        }
+
+        public String getLocation() {
+            return location;
+        }
+    }
+
+}

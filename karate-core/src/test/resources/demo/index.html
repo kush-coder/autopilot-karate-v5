@@ -1,0 +1,21 @@
+<!--
+    Fragment page. The layout.html shell wraps this on full-page navigation;
+    HTMX requests (HX-Request: true) get the bare fragment.
+-->
+<section id="index-page">
+    <!-- Request method detection -->
+    <div th:if="request.get" id="method-get">This is a GET request</div>
+    <div th:if="request.post" id="method-post">This is a POST request</div>
+
+    <!-- AJAX detection -->
+    <div th:if="request.ajax" id="ajax-request">This is an AJAX request</div>
+    <div th:unless="request.ajax" id="full-request">This is a full page request</div>
+
+    <!-- UUID generation -->
+    <div id="uuid" th:text="context.uuid()">uuid here</div>
+
+    <nav>
+        <a href="/items">View Items</a>
+        <a href="/form">Submit Form</a>
+    </nav>
+</section>

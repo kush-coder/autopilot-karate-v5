@@ -1,0 +1,538 @@
+package io.karatelabs.js;
+
+import org.junit.jupiter.api.Test;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+class JsArrayTest extends EvalBase {
+
+    @Test
+    void testDev() {
+
+    }
+
+    @Test
+    void testFunctionHoistingWithPrototypeAssignmentBeforeDeclaration() {
+        // Function declarations hoist; assignments to the hoisted function (e.g.
+        // setting its `.prototype`) before the lexical declaration must survive.
+        // Re-evaluating the FN_EXPR in normal flow would replace the binding and
+        // drop the property assignment. test262 has dozens of "subclassed array"
+        // tests in this exact shape under test/built-ins/Array/prototype/<method>/.
+        matchEval("foo.prototype = [1, 2, 3];\n"
+                + "function foo() {}\n"
+                + "var f = new foo();\n"
+                + "f.reduce(function (a, b) { return a + b; })", "6");
+        // Order-independent: declaration first should still work.
+        matchEval("function foo() {}\n"
+                + "foo.prototype = [10, 20];\n"
+                + "var f = new foo();\n"
+                + "f.length", "2");
+    }
+
+    @Test
+    void testBuiltinPrototypeExtensionVisibleToInstances() {
+        // Spec: built-in prototype methods are configurable: true / writable: true.
+        // Adding a method to Array.prototype must be visible on every array instance
+        // via the prototype chain.
+        matchEval("Array.prototype.first = function () { return this[0]; };\n"
+                + "[10, 20, 30].first()", "10");
+        matchEval("Array.prototype.lastEl = function () { return this[this.length - 1]; };\n"
+                + "[1, 2, 3, 4].lastEl()", "4");
+        // Object.prototype extensions are visible on every object literal.
+        matchEval("Object.prototype.tag = 'tagged';\n"
+                + "({}).tag", "'tagged'");
+    }
+
+    @Test
+    void testArray() {
+        matchEval("[]", "[]");
+        matchEval("[ 1 ]", "[ 1 ]");
+        matchEval("[ 1, 2, 3 ]", "[ 1, 2, 3 ]");
+        matchEval("[ true ]", "[ true ]");
+        matchEval("[ 'a' ]", "[ 'a' ]");
+        matchEval("[ \"a\" ]", "[ 'a' ]");
+        matchEval("[ (1 + 2) ]", "[ 3 ]");
+        matchEval("[ a ]", "[ 5 ]", "{ a: 5 }");
+    }
+
+    @Test
+    void testArraySparse() {
+        // `[,]` is a sparse array with one HOLE; spec reads the absent slot as
+        // `undefined`. NodeUtils.match now compares against the raw element
+        // value (was previously seeing `null` via the auto-unwrap on List.get).
+        matchEval("[,]", "[undefined]");
+    }
+
+    @Test
+    void testArrayToMapIsOwnPropertyView() {
+        // an embedder that inspects a result through ObjectLike must see the
+        // elements, not an empty map (the List remains the primary conversion)
+        assertEquals(new LinkedHashMap<>(), ((ObjectLike) eval("[]")).toMap());
+        Map<String, Object> plain = ((ObjectLike) eval("[1, 2, 3]")).toMap();
+        assertEquals(List.of("0", "1", "2"), new ArrayList<>(plain.keySet()));
+        assertEquals(List.of(1, 2, 3), new ArrayList<>(plain.values()));
+        // indices first, then named properties
+        Map<String, Object> named = ((ObjectLike) eval("var a = [1, 2]; a.x = 'y'; a")).toMap();
+        assertEquals(List.of("0", "1", "x"), new ArrayList<>(named.keySet()));
+        assertEquals("y", named.get("x"));
+        // a hole is null at its index, as List.get() reports it
+        Map<String, Object> sparse = ((ObjectLike) eval("[1, , 3]")).toMap();
+        assertEquals(List.of("0", "1", "2"), new ArrayList<>(sparse.keySet()));
+        assertNull(sparse.get("1"));
+    }
+
+    @Test
+    void testArrayKeyEnumerationUnaffectedByToMapView() {
+        // toMap()'s index keys are a host-facing view — JS key semantics
+        // (holes are not own properties) must not shift with it
+        matchEval("JSON.stringify(Object.keys([1, 2, 3]))", "'[\"0\",\"1\",\"2\"]'");
+        matchEval("JSON.stringify(Object.keys([1, , 3]))", "'[\"0\",\"2\"]'");
+        matchEval("JSON.stringify(Object.getOwnPropertyNames([1, , 3]))", "'[\"0\",\"2\",\"length\"]'");
+        matchEval("JSON.stringify([1, 2, 3])", "'[1,2,3]'");
+        matchEval("JSON.stringify([1, , 3])", "'[1,null,3]'");
+        matchEval("var s = ''; for (var k in [1, , 3]) s += k + ','; s", "'0,2,'");
+        matchEval("JSON.stringify({ ...[1, , 3] })", "'{\"0\":1,\"2\":3}'");
+        matchEval("JSON.stringify(Object.assign({}, [1, , 3]))", "'{\"0\":1,\"2\":3}'");
+    }
+
+    @Test
+    void testArraySpread() {
+        matchEval("var arr1 = [1, 2, 3]; var arr2 = [...arr1]; arr2", "[1, 2, 3]");
+        matchEval("var arr1 = [1, 2]; var arr2 = [...arr1, 3, 4]; arr2", "[1, 2, 3, 4]");
+        matchEval("var arr1 = [2, 3]; var arr2 = [1, ...arr1, 4]; arr2", "[1, 2, 3, 4]");
+        matchEval("var arr1 = [3, 4]; var arr2 = [1, 2, ...arr1]; arr2", "[1, 2, 3, 4]");
+        matchEval("var arr1 = [1, 2]; var arr2 = [3, 4]; var arr3 = [...arr1, ...arr2]; arr3", "[1, 2, 3, 4]");
+        matchEval("var arr1 = [1, [2, 3]]; var arr2 = [...arr1, 4]; arr2", "[1, [2, 3], 4]");
+        // strings also get spread
+        matchEval("var str = 'abc'; var arr = [...str]; arr", "['a', 'b', 'c']");
+    }
+
+    @Test
+    void testArrayProp() {
+        assertEquals(2, eval("a = [1, 2]; a[1]"));
+        assertEquals("bar", eval("a = ['bar']; a[0]"));
+    }
+
+    @Test
+    void testArrayMutation() {
+        eval("var a = [1, 2]; a[1] = 3");
+        match(get("a"), "[1, 3]");
+    }
+
+    @Test
+    void testArrayIndexedAssignGrowsLength() {
+        // new Array() + indexed assignment past length extends the array
+        eval("var a = new Array(); a[0] = 'x'; a[1] = 'y'; a[2] = 'z'");
+        match(get("a"), "['x', 'y', 'z']");
+        assertEquals(3, eval("var a = new Array(); a[0] = 'x'; a[1] = 'y'; a[2] = 'z'; a.length"));
+        // sparse growth leaves undefined holes
+        assertEquals(4, eval("var b = []; b[3] = 'end'; b.length"));
+        assertEquals("end", eval("var b = []; b[3] = 'end'; b[3]"));
+    }
+
+    @Test
+    void testArrayApi() {
+        match(eval("[1, 2, 3].length"), "3");
+        match(eval("[1, 2, 3].map(x => x * 2)"), "[2, 4, 6]");
+        match(eval("Array.prototype.map.call([1, 2, 3], x => x * 2)"), "[2, 4, 6]");
+        match(eval("[].map.call([1, 2, 3], x => x * 2)"), "[2, 4, 6]");
+        match(eval("[].map.call([1, 2, 3], String)"), "['1', '2', '3']");
+        match(eval("[1, 2, 3].join()"), "1,2,3");
+        match(eval("[1, 2, 3].join(', ')"), "1, 2, 3");
+        // Spec §23.1.3.21: map iterates 0..length-1; an object literal with
+        // no `length` property has length=0, so map returns an empty array
+        // (test262 `15.4.4.19-8-8.js` pins this for `{0:11, 1:12, length:0}`).
+        // Add `length: 2` to opt into iteration.
+        match(eval("[].map.call({0:'a',1:'b',length:2}, (x, i) => x + i)"), "['a0','b1']");
+        match(eval("Array.from([1, 2, 3])"), "[1, 2, 3]");
+        match(eval("Array.from([1, 2, 3], x => x * 2)"), "[2, 4, 6]");
+        match(eval("Array.from({ length: 3 }, (v, i) => i)"), "[0, 1, 2]");
+        // todo prevent leaking undefined like this
+        match(eval("Array.from({ length: 3 })"), "[undefined, undefined, undefined]");
+        assertEquals(2, eval("[1, 2, 3].find(x => x % 2 === 0)"));
+        assertNull(eval("[1, 2, 3].find(x => x % 5 === 0)"));
+        assertEquals(1, eval("[1, 2, 3].findIndex(x => x % 2 === 0)"));
+        assertEquals(-1, eval("[1, 2, 3].findIndex(x => x % 5 === 0)"));
+        assertEquals(2, eval("[1, 2, 3].findIndex((val, idx, arr) => idx === 2)"));
+        assertEquals(4, eval("[1, 2, 3].push(2)"));
+        eval("var a = []; var b = a.push(1, 2, 3);");
+        match(get("a"), "[1, 2, 3]");
+        assertEquals(3, get("b"));
+        match(eval("[1, 2, 3].reverse()"), "[3, 2, 1]");
+        assertEquals(true, eval("[1, 2, 3].includes(2)"));
+        assertEquals(1, eval("[1, 2, 3].indexOf(2)"));
+        assertEquals(-1, eval("[1, 2, 3].indexOf(5)"));
+        match(eval("[1, 2, 3, 4, 5].slice(1, 4)"), "[2, 3, 4]");
+        match(eval("[1, 2, 3, 4, 5].slice(2)"), "[3, 4, 5]");
+        match(eval("[1, 2, 3, 4, 5].slice(1, -1)"), "[2, 3, 4]");
+        match(eval("[1, 2, 3, 4, 5].slice(-3, -1)"), "[3, 4]");
+        match(eval("[1, 2, 3, 4, 5].slice(-3)"), "[3, 4, 5]");
+        match(eval("[1, 2, 3, 4, 5].slice(0, 10)"), "[1, 2, 3, 4, 5]");
+        match(eval("[1, 2, 3, 4, 5].slice(10, 1)"), "[]");
+        eval("var sum = 0; [1, 2, 3].forEach(function(value) { sum += value; });");
+        assertEquals(6, get("sum"));
+        eval("var result = []; [1, 2, 3].forEach(function(value, index) { result.push(value * index); });");
+        match(get("result"), "[0, 2, 6]");
+        match(eval("[1, 2, 3].concat([4, 5])"), "[1, 2, 3, 4, 5]");
+        match(eval("[1, 2, 3].concat(4, 5)"), "[1, 2, 3, 4, 5]");
+        match(eval("[1, 2, 3].concat([4, 5], 6, [7, 8])"), "[1, 2, 3, 4, 5, 6, 7, 8]");
+        match(eval("[].concat('a', 'b', 'c')"), "['a', 'b', 'c']");
+        assertEquals(true, eval("[2, 4, 6].every(x => x % 2 === 0)"));
+        assertEquals(false, eval("[2, 3, 6].every(x => x % 2 === 0)"));
+        assertEquals(true, eval("[].every(x => false)"));
+        assertEquals(true, eval("[1, 2, 3].every((val, idx, arr) => arr.length === 3)"));
+        assertEquals(true, eval("[1, 2, 3].some(x => x % 2 === 0)"));
+        assertEquals(false, eval("[1, 3, 5].some(x => x % 2 === 0)"));
+        assertEquals(false, eval("[].some(x => true)"));
+        assertEquals(true, eval("[1, 2, 3].some((val, idx, arr) => idx === 1)"));
+        assertEquals(6, eval("[1, 2, 3].reduce((acc, val) => acc + val)"));
+        assertEquals(10, eval("[1, 2, 3].reduce((acc, val) => acc + val, 4)"));
+        assertEquals("123", eval("[1, 2, 3].reduce((acc, val) => acc + val, '')"));
+        assertEquals("0-1-2-3", eval("[1, 2, 3].reduce((acc, val, idx) => acc + '-' + val, 0)"));
+        eval("var indices = []; var arrayFirstItems = []; [10, 20, 30].reduce((acc, val, idx, arr) => { indices.push(idx); arrayFirstItems.push(arr[0]); return acc + val; }, 0);");
+        NodeUtils.match(get("indices"), "[0, 1, 2]");
+        NodeUtils.match(get("arrayFirstItems"), "[10, 10, 10]"); // verifying we receive the actual array
+        try {
+            eval("[].reduce((acc, val) => acc + val)");
+            fail("should throw exception for empty array with no initial value");
+        } catch (Exception e) {
+            assertTrue(e.getMessage().contains("empty array"));
+        }
+        assertEquals("initial", eval("[].reduce((acc, val) => acc + val, 'initial')"));
+        assertEquals(6, eval("[1, 2, 3].reduceRight((acc, val) => acc + val)"));
+        assertEquals("321", eval("[1, 2, 3].reduceRight((acc, val) => acc + val, '')"));
+        try {
+            eval("[].reduceRight((acc, val) => acc + val)");
+            fail("should throw exception for empty array with no initial value");
+        } catch (Exception e) {
+            assertTrue(e.getMessage().contains("empty array"));
+        }
+        assertEquals("initial", eval("[].reduceRight((acc, val) => acc + val, 'initial')"));
+        eval("var indices = []; [10, 20, 30].reduceRight((acc, val, idx) => { indices.push(idx); return acc + val; }, 0);");
+        NodeUtils.match(get("indices"), "[2, 1, 0]"); // indices are in reverse order
+        match(eval("[1, 2, [3, 4]].flat()"), "[1, 2, 3, 4]");
+        match(eval("[1, 2, [3, [4, 5]]].flat()"), "[1, 2, 3, [4, 5]]");
+        match(eval("[1, 2, [3, [4, 5]]].flat(2)"), "[1, 2, 3, 4, 5]");
+        // match(eval("[1, 2, [3, [4, [5, 6]]]].flat(Infinity)"), "[1, 2, 3, 4, 5, 6]");
+        match(eval("[1, 2, [3, 4]].flat(0)"), "[1, 2, [3, 4]]");
+        match(eval("[].flat()"), "[]");
+        match(eval("[1, 2, null, undefined, [3, 4]].flat()"), "[1, 2, null, undefined, 3, 4]");
+        // test flatMap() method
+        match(eval("[1, 2, 3].flatMap(x => [x, x * 2])"), "[1, 2, 2, 4, 3, 6]");
+        match(eval("[1, 2, 3].flatMap(x => x * 2)"), "[2, 4, 6]"); // non-array results are also valid
+        match(eval("[\"hello\", \"world\"].flatMap(word => word.split(''))"), "['h', 'e', 'l', 'l', 'o', 'w', 'o', 'r', 'l', 'd']");
+        match(eval("[].flatMap(x => [x, x * 2])"), "[]");
+        match(eval("[[1], [2, 3], [4, 5, 6]].flatMap(x => x)"), "[1, 2, 3, 4, 5, 6]");
+        match(eval("[1, 2, 3].flatMap((x, i) => [x, i])"), "[1, 0, 2, 1, 3, 2]"); // check index is passed correctly
+        eval("var data = [{id: 1, values: [10, 20]}, {id: 2, values: [30, 40]}];"
+                + "var result = data.flatMap(item => item.values.map(val => ({id: item.id, value: val})));");
+        NodeUtils.match(get("result"), "[{id: 1, value: 10}, {id: 1, value: 20}, {id: 2, value: 30}, {id: 2, value: 40}]");
+        match(eval("[3, 1, 4, 1, 5, 9].sort()"), "[1, 1, 3, 4, 5, 9]");
+        match(eval("['banana', 'apple', 'orange', 'grape'].sort()"), "['apple', 'banana', 'grape', 'orange']");
+        match(eval("[10, 2, 5, 1].sort((a, b) => a - b)"), "[1, 2, 5, 10]"); // numeric sort
+        match(eval("[10, 2, 5, 1].sort((a, b) => b - a)"), "[10, 5, 2, 1]"); // descending numeric sort
+        // sort() with objects
+        eval("var items = [{name: 'Edward', value: 21}, {name: 'Sharpe', value: 37}, {name: 'And', value: 45}, {name: 'The', value: -12}];" +
+                "items.sort((a, b) => a.value - b.value);");
+        NodeUtils.match(get("items"), "[{name: 'The', value: -12}, {name: 'Edward', value: 21}, {name: 'Sharpe', value: 37}, {name: 'And', value: 45}]");
+        // fill() tests
+        match(eval("[1, 2, 3].fill(4)"), "[4, 4, 4]");
+        match(eval("[1, 2, 3].fill(4, 1)"), "[1, 4, 4]");
+        match(eval("[1, 2, 3].fill(4, 1, 2)"), "[1, 4, 3]");
+        match(eval("[1, 2, 3].fill(4, 1, 1)"), "[1, 2, 3]");
+        match(eval("[1, 2, 3].fill(4, -3, -2)"), "[4, 2, 3]");
+        match(eval("[1, 2, 3].fill(4, NaN, NaN)"), "[1, 2, 3]");
+        match(eval("[1, 2, 3].fill(4, 3, 3)"), "[1, 2, 3]");
+        // splice() tests
+        match(eval("var a = [1, 2, 3]; a.splice(1, 1); a"), "[1, 3]");
+        match(eval("var a = [1, 2, 3]; a.splice(1, 1, 'a', 'b'); a"), "[1, 'a', 'b', 3]");
+        match(eval("var a = [1, 2, 3]; a.splice(1, 0, 'a'); a"), "[1, 'a', 2, 3]");
+        match(eval("var a = [1, 2, 3]; a.splice(0, 3); a"), "[]");
+        match(eval("var a = [1, 2, 3]; a.splice(-1, 1); a"), "[1, 2]");
+        match(eval("var a = [1, 2, 3]; a.splice(10, 1); a"), "[1, 2, 3]");
+        match(eval("var a = [1, 2, 3]; a.splice(0, 0, 'a', 'b'); a"), "['a', 'b', 1, 2, 3]");
+        match(eval("var a = [1, 2, 3]; var removed = a.splice(0, 2); removed"), "[1, 2]");
+        // shift() tests
+        match(eval("var a = [1, 2, 3]; var shifted = a.shift(); shifted"), "1");
+        match(eval("var a = [1, 2, 3]; a.shift(); a"), "[2, 3]");
+        match(eval("var a = []; var shifted = a.shift(); shifted"), "null");
+        // unshift() tests
+        match(eval("var a = [1, 2, 3]; var newLength = a.unshift(4, 5); newLength"), "5");
+        match(eval("var a = [1, 2, 3]; a.unshift(4, 5); a"), "[4, 5, 1, 2, 3]");
+        match(eval("var a = []; a.unshift(1); a"), "[1]");
+        match(eval("var a = []; var newLength = a.unshift(); newLength"), "0");
+        // pop() tests
+        match(eval("var a = [1, 2, 3]; var popped = a.pop(); popped"), "3");
+        match(eval("var a = [1, 2, 3]; a.pop(); a"), "[1, 2]");
+        match(eval("var a = []; var popped = a.pop(); popped"), null);
+        // at() tests
+        assertEquals(2, eval("[1, 2, 3].at(1)"));
+        assertEquals(3, eval("[1, 2, 3].at(-1)"));
+        assertEquals(2, eval("[1, 2, 3].at(-2)"));
+        assertNull(eval("[1, 2, 3].at(3)"));
+        assertNull(eval("[1, 2, 3].at(-4)"));
+        assertNull(eval("[].at(0)"));
+        // copyWithin() tests
+        match(eval("[1, 2, 3, 4, 5].copyWithin(0, 3)"), "[4, 5, 3, 4, 5]");
+        match(eval("[1, 2, 3, 4, 5].copyWithin(1, 3)"), "[1, 4, 5, 4, 5]");
+        match(eval("[1, 2, 3, 4, 5].copyWithin(0, 3, 4)"), "[4, 2, 3, 4, 5]");
+        match(eval("[1, 2, 3, 4, 5].copyWithin(1, 2, 4)"), "[1, 3, 4, 4, 5]");
+        match(eval("[1, 2, 3, 4, 5].copyWithin(-2, 0, 2)"), "[1, 2, 3, 1, 2]");
+        // keys(), values(), entries() tests
+        match(eval("[1, 2, 3].keys()"), "[0, 1, 2]");
+        // values() returns a spec Array Iterator object (next/value/done), not the raw list
+        match(eval("[...[1, 2, 3].values()]"), "[1, 2, 3]");
+        match(eval("[...[].values()]"), "[]");
+        assertEquals(1, eval("[1, 2, 3].values().next().value"));
+        assertEquals(true, eval("[].values().next().done"));
+        match(eval("[1, 2, 3].entries()"), "[[0, 1], [1, 2], [2, 3]]");
+        // Array.isArray() and Array.of() tests
+        assertEquals(true, eval("Array.isArray([])"));
+        assertEquals(true, eval("Array.isArray([1, 2, 3])"));
+        assertEquals(false, eval("Array.isArray({})"));
+        assertEquals(false, eval("Array.isArray('foo')"));
+        assertEquals(false, eval("Array.isArray(123)"));
+        match(eval("Array.of(1, 2, 3)"), "[1, 2, 3]");
+        match(eval("Array.of('a', 'b', 'c')"), "['a', 'b', 'c']");
+        match(eval("Array.of(1, 'a', true)"), "[1, 'a', true]");
+        match(eval("Array.of()"), "[]");
+        // findLast() and findLastIndex() tests
+        assertEquals(4, eval("[1, 2, 3, 4, 5].findLast(x => x % 2 === 0)"));
+        assertNull(eval("[1, 3, 5, 7].findLast(x => x % 2 === 0)"));
+        assertNull(eval("[].findLast(x => true)"));
+        assertEquals(4, eval("[1, 2, 3, 4, 2].findLastIndex(x => x % 2 === 0)"));
+        assertEquals(2, eval("[1, 2, 3, 4, 2].findLastIndex(x => x === 3)"));
+        assertEquals(-1, eval("[1, 3, 5, 7].findLastIndex(x => x % 2 === 0)"));
+        assertEquals(-1, eval("[].findLastIndex(x => true)"));
+        // group() tests
+        eval("var result = [1, 2, 3, 4, 5].group(x => x % 2 === 0 ? 'even' : 'odd');");
+        match(get("result"), "{ even: [2, 4], odd: [1, 3, 5] }");
+        eval("var result = ['apple', 'banana', 'cherry'].group(x => x[0]);");
+        match(get("result"), "{ a: ['apple'], b: ['banana'], c: ['cherry'] }");
+        eval("var result = [].group(x => x);");
+        match(get("result"), "{}");
+        // with() tests
+        match(eval("[1, 2, 3, 4].with(1, 'a')"), "[1, 'a', 3, 4]");
+        match(eval("[1, 2, 3, 4].with(-1, 'a')"), "[1, 2, 3, 'a']");
+        match(eval("[1, 2, 3, 4].with(10, 'a')"), "[1, 2, 3, 4]"); // index out of bounds, returns copy
+        match(eval("[1, 2, 3, 4].with(-10, 'a')"), "[1, 2, 3, 4]"); // negative index out of bounds
+        match(eval("[].with(0, 'a')"), "[]"); // empty array returns copy
+        // indexOf with fromIndex
+        assertEquals(1, eval("[1, 2, 3, 2].indexOf(2)"));
+        assertEquals(3, eval("[1, 2, 3, 2].indexOf(2, 2)"));
+        assertEquals(-1, eval("[1, 2, 3, 2].indexOf(2, 4)"));
+        assertEquals(1, eval("[1, 2, 3, 2].indexOf(2, -4)"));
+        assertEquals(3, eval("[1, 2, 3, 2].indexOf(2, -2)"));
+        assertEquals(-1, eval("[1, 2, 3, 2].indexOf(4, 0)"));
+        // lastIndexOf with fromIndex
+        assertEquals(3, eval("[1, 2, 3, 2].lastIndexOf(2)"));
+        assertEquals(1, eval("[1, 2, 3, 2].lastIndexOf(2, 2)"));
+        assertEquals(1, eval("[1, 2, 3, 2].lastIndexOf(2, 1)"));
+        assertEquals(-1, eval("[1, 2, 3, 2].lastIndexOf(2, 0)"));
+        assertEquals(1, eval("[1, 2, 3, 2].lastIndexOf(2, -2)"));
+        assertEquals(-1, eval("[1, 2, 3, 2].lastIndexOf(4, 0)"));
+    }
+
+    @Test
+    void testArrayConstructor() {
+        match(eval("new Array(1, 2, 3)"), "[1, 2, 3]");
+        // new Array(n) produces n HOLE slots; spec reads each as undefined.
+        match(eval("new Array(3)"), "[undefined, undefined, undefined]");
+    }
+
+    @Test
+    void testJavaNativeArrayMethods() {
+        // Test that Java native arrays (String[], int[], etc.) work with JS array methods
+        // This exercises Terms.toJsArray() conversion in JsArrayPrototype
+        Engine engine = new Engine();
+
+        // String array
+        String[] strings = {"a", "b", "c"};
+        engine.put("items", strings);
+        assertEquals(3, engine.eval("items.length"));
+        assertEquals("a", engine.eval("items[0]"));
+        NodeUtils.match(engine.eval("items.map(x => x.toUpperCase())"), "['A', 'B', 'C']");
+        NodeUtils.match(engine.eval("items.filter(x => x !== 'b')"), "['a', 'c']");
+        assertEquals("a-b-c", engine.eval("items.join('-')"));
+
+        // int array
+        int[] numbers = {1, 2, 3, 4, 5};
+        engine.put("nums", numbers);
+        assertEquals(5, engine.eval("nums.length"));
+        assertEquals(1, engine.eval("nums[0]"));
+        assertEquals(15, engine.eval("nums.reduce((a, b) => a + b, 0)"));
+        NodeUtils.match(engine.eval("nums.map(x => x * 2)"), "[2, 4, 6, 8, 10]");
+        NodeUtils.match(engine.eval("nums.filter(x => x % 2 === 0)"), "[2, 4]");
+
+        // Object array with mixed types
+        Object[] mixed = {"hello", 42, true};
+        engine.put("mixed", mixed);
+        assertEquals(3, engine.eval("mixed.length"));
+        assertEquals("hello", engine.eval("mixed[0]"));
+        assertEquals(42, engine.eval("mixed[1]"));
+        assertEquals(true, engine.eval("mixed[2]"));
+        // forEach should work
+        engine.eval("var result = []; mixed.forEach(x => result.push(x))");
+        NodeUtils.match(engine.get("result"), "['hello', 42, true]");
+    }
+
+    @Test
+    void testUint8ArrayLength() {
+        // Test that byte[] converted to JsUint8Array reports correct length
+        // This exercises the fix in JsUint8Array.getMember()
+        Engine engine = new Engine();
+        engine.setExternalBridge(new ExternalBridge() {});
+
+        byte[] bytes = new byte[]{1, 2, 3, (byte) 255};
+        engine.put("bytes", bytes);
+
+        // Length should be correct
+        assertEquals(4, engine.eval("bytes.length"));
+
+        // Element access should work
+        assertEquals(1, engine.eval("bytes[0]"));
+        assertEquals(2, engine.eval("bytes[1]"));
+        assertEquals(3, engine.eval("bytes[2]"));
+        assertEquals(255, engine.eval("bytes[3]")); // unsigned byte
+
+        // Array methods should work on byte arrays
+        assertEquals(true, engine.eval("bytes.includes(255)"));
+        assertEquals(3, engine.eval("bytes.indexOf(255)"));
+    }
+
+    @Test
+    void testDefinePropertyIndexedAttrs() {
+        // defineProperty with writable: false at a numeric index — subsequent
+        // [[Set]] is silently ignored, value persists.
+        assertEquals(1, eval(
+                "var a = [];"
+                        + " Object.defineProperty(a, '0', {value: 1, writable: false, configurable: true});"
+                        + " a[0] = 99;"
+                        + " a[0]"));
+        // Descriptor reads back the recorded attributes (writable=false here).
+        assertEquals(false, eval(
+                "var a = [];"
+                        + " Object.defineProperty(a, '0', {value: 1, writable: false, configurable: true});"
+                        + " Object.getOwnPropertyDescriptor(a, '0').writable"));
+        // Default-attrs writes (plain `arr[i] = x`) keep writable=true.
+        assertEquals(true, eval(
+                "var a = [10];"
+                        + " Object.getOwnPropertyDescriptor(a, '0').writable"));
+        // Re-defining the index with default attrs (CreateDataPropertyOrThrow shape:
+        // all-true) overwrites a prior writable=false entry.
+        assertEquals(99, eval(
+                "var a = [];"
+                        + " Object.defineProperty(a, '0', {value: 1, writable: false, configurable: true});"
+                        + " Object.defineProperty(a, '0', {value: 99, writable: true, enumerable: true, configurable: true});"
+                        + " a[0]"));
+    }
+
+
+    @Test
+    void testIndexOfIsStrictEquality() {
+        // Spec §23.1.3.16 / §23.1.3.18 compare with IsStrictlyEqual, so NaN
+        // never matches itself and no coercion happens.
+        assertEquals(-1, eval("[NaN].indexOf(NaN)"));
+        assertEquals(-1, eval("[NaN].lastIndexOf(NaN)"));
+        assertEquals(-1, eval("[1, 2].indexOf('1')"));
+        assertEquals(-1, eval("[1, 2].lastIndexOf('2')"));
+        assertEquals(1, eval("[NaN, 3].indexOf(3)"));
+        // includes() is SameValueZero instead — NaN DOES match, '1' does not.
+        assertEquals(true, eval("[NaN].includes(NaN)"));
+        assertEquals(false, eval("[1, 2].includes('1')"));
+        assertEquals(true, eval("[-0].includes(0)"));
+        assertEquals(0, eval("[-0].indexOf(0)"));
+    }
+
+    // ===== near-2^32 / pathological-index hardening: every failure here must
+    // be a JS error (or correct behavior), never a raw Java exception =====
+
+    @Test
+    void testHugeIndexWriteBecomesNamedPropertyNotCrash() {
+        // 4294967294 overflows int; it used to wrap negative and crash with a
+        // raw IndexOutOfBounds. Now it's an ordinary own property.
+        assertEquals(true, eval("var a = [];\na[4294967294] = 'x';\n"
+                + "a[4294967294] === 'x' && a.length === 0 && a.indexOf('x') === -1"));
+    }
+
+    @Test
+    void testHugeIndexViaStringKeySafe() {
+        assertEquals("y", eval("var a = [];\na['4294967294'] = 'y';\na['4294967294']"));
+    }
+
+    @Test
+    void testIndexOfWithInfinityFromIndexOnSparseHugeArray() {
+        assertEquals(-1, eval("var a = [];\na[4294967294] = true;\na.indexOf(true, Infinity)"));
+    }
+
+    @Test
+    void testNegativeIndexIsNamedProperty() {
+        assertEquals(true, eval("var a = [1, 2];\na[-1] = 'neg';\n"
+                + "a[-1] === 'neg' && a.length === 2"));
+    }
+
+    @Test
+    void testFractionalIndexIsNamedProperty() {
+        assertEquals(true, eval("var a = [1, 2];\na[1.5] = 'f';\n"
+                + "a[1.5] === 'f' && a.length === 2 && a[1] === 2"));
+    }
+
+    @Test
+    void testSparsePadBeyondLimitIsRangeError() {
+        // a write that would append >10M holes is refused with a catchable
+        // RangeError instead of dying in a Java OutOfMemoryError
+        assertEquals("RangeError", eval("var a = [];\n"
+                + "try { a[1073741824] = 1 } catch (e) { e.name }"));
+    }
+
+    @Test
+    void testModestSparsePadStillWorks() {
+        assertEquals(true, eval("var a = [];\na[100] = 1;\n"
+                + "a.length === 101 && a[100] === 1 && !(50 in a)"));
+    }
+
+    @Test
+    void testMapOnHugeLengthArrayLikeIsRangeError() {
+        assertEquals("RangeError", eval("var o = { length: 4294967296 };\n"
+                + "try { Array.prototype.map.call(o, function(x) { return x }) } catch (e) { e.name }"));
+    }
+
+    @Test
+    void testToSplicedOnHugeLengthIsRangeError() {
+        assertEquals("RangeError", eval("var o = { length: 4294967295 };\n"
+                + "try { Array.prototype.toSpliced.call(o, 0, 0) } catch (e) { e.name }"));
+    }
+
+    @Test
+    void testIncDecAtAbsentIndexExtendsInsteadOfCrashing() {
+        // a[1]++ on [] used to raw-crash with IndexOutOfBounds; the write now
+        // routes through the guarded path (external-review round 4)
+        assertEquals(true, eval("var a = [];\na[1]++;\n"
+                + "a.length === 2 && isNaN(a[1]) && !(0 in a)"));
+        assertEquals(4, eval("var b = [];\n++b[3];\nb.length"));
+    }
+
+    @Test
+    void testIncDecAtHugeIndexIsRangeErrorNotCrash() {
+        assertEquals("RangeError", eval("var a = [];\n"
+                + "try { a[2147483646]++ } catch (e) { e.name }"));
+    }
+
+    @Test
+    void testUnshiftBeyondMaxSafeIntegerIsTypeError() {
+        assertEquals("TypeError", eval("var o = { length: Math.pow(2, 53) };\n"
+                + "try { Array.prototype.unshift.call(o, null) } catch (e) { e.name }"));
+    }
+
+    @Test
+    void testSpliceBeyondMaxSafeIntegerIsTypeError() {
+        assertEquals("TypeError", eval("var o = { length: Math.pow(2, 53) + 2 };\n"
+                + "try { Array.prototype.splice.call(o, 0, 0, null) } catch (e) { e.name }"));
+    }
+
+}

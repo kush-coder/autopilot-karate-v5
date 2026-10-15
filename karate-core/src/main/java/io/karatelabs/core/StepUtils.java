@@ -1,0 +1,782 @@
+/*
+ * The MIT License
+ *
+ * Copyright 2025 Karate Labs Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package io.karatelabs.core;
+
+import io.karatelabs.common.Json;
+import io.karatelabs.common.Xml;
+import io.karatelabs.js.JavaCallable;
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
+import org.w3c.dom.Node;
+
+import java.lang.reflect.Array;
+import java.util.ArrayList;
+import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * Static utility methods for step execution.
+ */
+public class StepUtils {
+
+    private StepUtils() {
+        // Utility class
+    }
+
+    /**
+     * Parsed result of a feature path with optional tag selector or line filter.
+     * Used by both StepExecutor (call keyword) and ScenarioRuntime (callSingle).
+     * {@code lineFilters} is non-null only for {@code file.feature:N(:N)*} form.
+     */
+    public record ParsedFeaturePath(String path, String tagSelector, boolean sameFile,
+                                    java.util.Set<Integer> lineFilters) {}
+
+    /**
+     * Parse a feature path into path and tag/line components.
+     * Supports:
+     * - file.feature@tag - call specific scenario by tag
+     * - file.feature:10 / file.feature:10:25 - call by line number(s); matches
+     *   Runner.path(...) suite-side syntax. Tag and line are mutually exclusive
+     *   on the same path; tag suffix wins by parse order.
+     * - @tag - call scenario in same file by tag
+     * - file.feature - normal call without tag
+     *
+     * @param rawPath the raw path string (may contain @tag or :N suffix)
+     * @return ParsedFeaturePath with separated path and selector components
+     */
+    public static ParsedFeaturePath parseFeaturePath(String rawPath) {
+        if (rawPath.startsWith("@")) {
+            // Same-file tag call: @tagname
+            return new ParsedFeaturePath(null, rawPath, true, null);
+        }
+        // Check for tag suffix: file.feature@tag
+        int tagPos = rawPath.indexOf(".feature@");
+        if (tagPos != -1) {
+            String path = rawPath.substring(0, tagPos + 8);  // "file.feature"
+            String tag = "@" + rawPath.substring(tagPos + 9);  // "@tag"
+            return new ParsedFeaturePath(path, tag, false, null);
+        }
+        // Check for line-number suffix: file.feature:10 or file.feature:10:25
+        // Mirrors Runner.resolveFeatures parsing for consistency.
+        int linePos = rawPath.indexOf(".feature:");
+        if (linePos != -1) {
+            String path = rawPath.substring(0, linePos + 8);  // "file.feature"
+            String remainder = rawPath.substring(linePos + 9);
+            if (remainder.matches("\\d+(:\\d+)*")) {
+                java.util.Set<Integer> lines = new java.util.LinkedHashSet<>();
+                for (String part : remainder.split(":")) {
+                    lines.add(Integer.parseInt(part));
+                }
+                return new ParsedFeaturePath(path, null, false, lines);
+            }
+            // Not numeric — fall through and treat as plain path (preserves
+            // edge-case behavior for paths that happen to contain ".feature:").
+        }
+        // No selector - normal call
+        return new ParsedFeaturePath(rawPath, null, false, null);
+    }
+
+    /**
+     * Check if a string is a valid Karate variable name.
+     * Must start with letter or underscore, followed by letters, digits, or underscores.
+     */
+    public static boolean isValidVariableName(String name) {
+        return name != null && !name.isEmpty()
+                && name.matches("[a-zA-Z_][a-zA-Z0-9_]*");
+    }
+
+    /**
+     * Find the index of the `)` that matches the leading `read(` in {@code text},
+     * skipping anything inside single- or double-quoted strings and tracking
+     * nested parens. Returns -1 if {@code text} does not start with {@code read(}
+     * or no matching paren is found. Used to safely split {@code read(path) arg}
+     * even when the path contains characters like {@code )} inside quotes.
+     */
+    public static int findReadCloseParen(String text) {
+        if (!text.startsWith("read(")) return -1;
+        int parenDepth = 0;
+        boolean inSingleQuote = false;
+        boolean inDoubleQuote = false;
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c == '\'' && !inDoubleQuote) {
+                inSingleQuote = !inSingleQuote;
+            } else if (c == '"' && !inSingleQuote) {
+                inDoubleQuote = !inDoubleQuote;
+            }
+            if (inSingleQuote || inDoubleQuote) continue;
+            if (c == '(') parenDepth++;
+            else if (c == ')') {
+                parenDepth--;
+                if (parenDepth == 0) return i;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * The callable target and (optional) argument expression of a call step, e.g.
+     * {@code call read('x.feature') {...}} splits into {@code read('x.feature')} and
+     * {@code {...}}. {@code arg} is null when the step carries no argument.
+     */
+    public record CallParts(String callable, String arg) {}
+
+    /**
+     * Split a call expression into its callable target and argument, mirroring v1's
+     * {@code parseCallArgs}. For a {@code read(...)} expression the split is at read()'s
+     * close paren, so the argument may be either space-separated ({@code read('x') arg})
+     * or directly appended ({@code read('x.js')(arg)} — the V1 immediately-invoke form).
+     * Otherwise the split is at the first space.
+     */
+    public static CallParts splitCallExpr(String text) {
+        int splitAfter; // index of the last char belonging to the callable target
+        if (text.startsWith("read(")) {
+            int closeParen = findReadCloseParen(text);
+            if (closeParen < 0) {
+                return new CallParts(text, null);
+            }
+            splitAfter = closeParen;
+        } else {
+            int space = text.indexOf(' ');
+            if (space < 0) {
+                return new CallParts(text, null);
+            }
+            // the space itself is a separator, not part of either side
+            splitAfter = space - 1;
+        }
+        String callable = text.substring(0, splitAfter + 1).trim();
+        String arg = text.substring(splitAfter + 1).trim();
+        return new CallParts(callable, arg.isEmpty() ? null : arg);
+    }
+
+    /**
+     * True when {@code text} is exactly one quoted string literal — an opening quote
+     * whose first matching close quote is the final character. A concatenation like
+     * {@code 'a-' + ext + '.feature'} also starts <em>and</em> ends with a quote, so
+     * boundary checks alone cannot distinguish it from a literal; anything that fails
+     * this test must be evaluated as a JS expression, not quote-stripped.
+     */
+    public static boolean isSingleQuotedLiteral(String text) {
+        if (text.length() < 2) {
+            return false;
+        }
+        char quote = text.charAt(0);
+        if (quote != '\'' && quote != '"') {
+            return false;
+        }
+        return text.indexOf(quote, 1) == text.length() - 1;
+    }
+
+    /**
+     * Check if text is a literal feature file read like read('file.feature').
+     */
+    public static boolean isLiteralFeatureRead(String text) {
+        if (!text.startsWith("read(")) return false;
+        int openParen = text.indexOf('(');
+        if (openParen == -1) return false;
+        int nextChar = openParen + 1;
+        if (nextChar >= text.length()) return false;
+        char c = text.charAt(nextChar);
+        if (c != '\'' && c != '"') return false;
+        int end = text.indexOf(c, nextChar + 1);
+        if (end == -1) return false;
+        String path = text.substring(nextChar + 1, end);
+        return path.endsWith(".feature");
+    }
+
+    /**
+     * The bindings a called feature actually added or replaced — its contribution minus the
+     * caller state it merely inherited. A called feature runs with the caller's visible
+     * variables in scope, so {@code calleeVars} echoes them back; caching that full set leaks
+     * caller state into a shared cache (Scenario Outline example-row columns frozen to the
+     * first row, config-level {@code Java.type(...)} refs, etc.). Shared by the {@code callonce}
+     * and {@code callSingle} caches so both isolate the callee's delta the same way.
+     * <p>
+     * Identity comparison is intentional: an untouched inherited binding keeps the same Object
+     * reference, while a callee {@code def}/assign produces a new one — so a key absent from the
+     * caller, or present but pointing at a different object, is part of the delta.
+     * <p>
+     * Identity alone is not enough, though: a callee that assigns the very object it was handed
+     * ({@code * def x = seed}, where the caller passed its own {@code x} in as {@code seed}) leaves
+     * the binding identity-equal to the inherited one, so its own {@code def} vanished from the
+     * result. {@code assignedNames} carries the names the callee bound for itself
+     * ({@link ScenarioRuntime#getAssignedVariables()}) and is unioned in. The two rules only ever
+     * add to the delta; an inherited binding the callee never touched still stays out.
+     */
+    public static Map<String, Object> calleeDelta(Map<String, Object> callerVars, Map<String, Object> calleeVars) {
+        return calleeDelta(callerVars, calleeVars, Set.of());
+    }
+
+    public static Map<String, Object> calleeDelta(Map<String, Object> callerVars, Map<String, Object> calleeVars,
+                                                  Set<String> assignedNames) {
+        Map<String, Object> delta = new LinkedHashMap<>();
+        for (Map.Entry<String, Object> entry : calleeVars.entrySet()) {
+            String key = entry.getKey();
+            Object value = entry.getValue();
+            if (!callerVars.containsKey(key) || callerVars.get(key) != value || assignedNames.contains(key)) {
+                delta.put(key, value);
+            }
+        }
+        return delta;
+    }
+
+    /**
+     * Deep copy a value (Map, List, Set, array, XML Node, or primitive).
+     */
+    public static Object deepCopy(Object value) {
+        // The memo is what makes the walk cycle-safe: a self-referential container (a JS object
+        // that holds itself, two nodes pointing at each other) used to recurse until the stack
+        // blew. It also keeps the copy's shape faithful to the original — when one list is
+        // reachable by two paths, the original's two paths alias the same list, and so do the
+        // copy's, instead of the copy silently splitting them into two independent lists.
+        // Allocated lazily: scalars and immutables (the common case for a variable) never
+        // recurse, so they never pay for the map.
+        return deepCopy(value, null);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Object deepCopy(Object value, Copies seen) {
+        if (value == null) {
+            return null;
+        }
+        // JsCallable functions shouldn't be deep-copied - return them unchanged
+        if (value instanceof JavaCallable) {
+            return value;
+        }
+        // XML variables are mutable via `set <var> /xpath/...` — share the reference and a
+        // callonce/callSingle cache (or a `copy` clone) is corrupted by the next mutation.
+        // Cloned through the memo like any other mutable value, so two variables holding one
+        // document still hold one document after the copy
+        if (value instanceof Node) {
+            Object existing = alreadyCopied(seen, value);
+            if (existing != null) {
+                return existing;
+            }
+            Object copy;
+            if (value instanceof Element element && !(value instanceof Document)) {
+                // cloneNode alone is not enough for a non-Document node: the clone keeps the
+                // ORIGINAL ownerDocument, and set-by-xpath resolves through getOwnerDocument(),
+                // so an xpath write on the "copy" would still hit the original tree
+                copy = Xml.toNewDocument(element).getDocumentElement();
+            } else {
+                copy = ((Node) value).cloneNode(true);
+            }
+            if (seen != null) {
+                seen.put(value, copy);
+            }
+            return copy;
+        }
+        if (value.getClass().isArray()) {
+            Class<?> componentType = value.getClass().getComponentType();
+            if (componentType.isPrimitive()) {
+                // elements are values, so a primitive array cannot take part in a cycle — but it
+                // is still mutable, so two paths onto the same byte[] have to stay one byte[]
+                Object existing = alreadyCopied(seen, value);
+                if (existing != null) {
+                    return existing;
+                }
+                int length = Array.getLength(value);
+                Object copy = Array.newInstance(componentType, length);
+                System.arraycopy(value, 0, copy, 0, length);
+                if (seen != null) {
+                    // only inside a graph walk — a copy of a bare byte[] has nothing to alias,
+                    // so the top-level case still allocates no memo
+                    seen.put(value, copy);
+                }
+                return copy;
+            }
+            Object[] arr = (Object[]) value;
+            Object[] existing = (Object[]) alreadyCopied(seen, arr);
+            if (existing != null) {
+                return existing;
+            }
+            // The copy is built in an Object[], which holds anything, and only becomes a
+            // component-typed array at the end — the array has to be registered before its
+            // elements are walked, and a back-edge that grabs it must not later find itself
+            // holding a different array than the one returned. So the type is preserved only
+            // when nothing else in the graph took this copy: an array reachable twice, or from
+            // inside itself, stays Object[] rather than handing out two different arrays.
+            Object[] copy = new Object[arr.length];
+            seen = remember(seen, arr, copy);
+            boolean typePreserved = componentType != Object.class;
+            for (int i = 0; i < arr.length; i++) {
+                copy[i] = deepCopy(arr[i], seen);
+                // a copied element may change concrete type (e.g. a Map subtype copies to
+                // LinkedHashMap) — a typed component array would reject it with ArrayStoreException
+                if (copy[i] != null && !componentType.isInstance(copy[i])) {
+                    typePreserved = false;
+                }
+            }
+            if (typePreserved && !seen.wasShared(arr)) {
+                Object[] typed = (Object[]) Array.newInstance(componentType, arr.length);
+                System.arraycopy(copy, 0, typed, 0, arr.length);
+                seen.put(arr, typed);
+                return typed;
+            }
+            return copy;
+        }
+        if (value instanceof Map) {
+            Object existing = alreadyCopied(seen, value);
+            if (existing != null) {
+                return existing;
+            }
+            Map<String, Object> copy = new LinkedHashMap<>();
+            seen = remember(seen, value, copy);
+            for (Map.Entry<String, Object> entry : ((Map<String, Object>) value).entrySet()) {
+                copy.put(entry.getKey(), deepCopy(entry.getValue(), seen));
+            }
+            return copy;
+        }
+        if (value instanceof List) {
+            Object existing = alreadyCopied(seen, value);
+            if (existing != null) {
+                return existing;
+            }
+            List<Object> copy = new ArrayList<>();
+            seen = remember(seen, value, copy);
+            for (Object item : (List<Object>) value) {
+                copy.add(deepCopy(item, seen));
+            }
+            return copy;
+        }
+        if (value instanceof Set) {
+            Object existing = alreadyCopied(seen, value);
+            if (existing != null) {
+                return existing;
+            }
+            Set<Object> copy = new LinkedHashSet<>();
+            seen = remember(seen, value, copy);
+            for (Object item : (Set<Object>) value) {
+                copy.add(deepCopy(item, seen));
+            }
+            return copy;
+        }
+        return value;
+    }
+
+    private static Object alreadyCopied(Copies seen, Object value) {
+        return seen == null ? null : seen.get(value);
+    }
+
+    /**
+     * Register a container's copy before its contents are walked — a back-edge reached during
+     * that walk then resolves to this copy instead of recursing forever. Returns the memo to
+     * carry down, creating it on the first container so a scalar copy allocates nothing.
+     */
+    private static Copies remember(Copies seen, Object value, Object copy) {
+        if (seen == null) {
+            seen = new Copies();
+        }
+        seen.put(value, copy);
+        return seen;
+    }
+
+    /**
+     * The originals a {@link #deepCopy} walk has already copied, by identity, so that a value
+     * reached twice — a back-edge into a container being copied, or simply two paths onto one
+     * list — yields the same copy both times instead of recursing forever or splitting into
+     * two independent values. Also records which originals were actually handed out a second
+     * time, which is what tells the array branch whether its copy is safe to retype.
+     */
+    private static final class Copies {
+
+        private final IdentityHashMap<Object, Object> copies = new IdentityHashMap<>();
+        private final IdentityHashMap<Object, Boolean> shared = new IdentityHashMap<>();
+
+        Object get(Object original) {
+            Object copy = copies.get(original);
+            if (copy != null) {
+                shared.put(original, Boolean.TRUE);
+            }
+            return copy;
+        }
+
+        void put(Object original, Object copy) {
+            copies.put(original, copy);
+        }
+
+        boolean wasShared(Object original) {
+            return shared.containsKey(original);
+        }
+
+    }
+
+    /**
+     * Navigate to or create a nested path in a map structure.
+     * Creates intermediate maps as needed.
+     */
+    @SuppressWarnings("unchecked")
+    public static Object getOrCreatePath(Map<String, Object> target, String path) {
+        String[] parts = path.split("\\.");
+        Map<String, Object> current = target;
+        for (String part : parts) {
+            Object next = current.get(part);
+            if (next == null) {
+                next = new LinkedHashMap<>();
+                current.put(part, next);
+            }
+            if (next instanceof Map) {
+                current = (Map<String, Object>) next;
+            } else {
+                return next;
+            }
+        }
+        return current;
+    }
+
+    /**
+     * Set a value at a nested path, handling both dot notation and array brackets.
+     */
+    @SuppressWarnings("unchecked")
+    public static void setValueAtPath(Object target, String path, Object value) {
+        if (target instanceof Map) {
+            Map<String, Object> map = (Map<String, Object>) target;
+            if (path.contains("[")) {
+                int bracketIdx = path.indexOf('[');
+                String key = path.substring(0, bracketIdx);
+                int closeIdx = path.indexOf(']');
+                int arrayIdx = Integer.parseInt(path.substring(bracketIdx + 1, closeIdx));
+                String remainder = closeIdx + 1 < path.length() ? path.substring(closeIdx + 1) : "";
+
+                Object arr = map.get(key);
+                if (arr == null) {
+                    arr = new ArrayList<>();
+                    map.put(key, arr);
+                }
+                if (arr instanceof List) {
+                    List<Object> list = (List<Object>) arr;
+                    while (list.size() <= arrayIdx) {
+                        list.add(remainder.isEmpty() ? null : new LinkedHashMap<>());
+                    }
+                    if (remainder.isEmpty()) {
+                        list.set(arrayIdx, value);
+                    } else {
+                        String nextPath = remainder.startsWith(".") ? remainder.substring(1) : remainder;
+                        setValueAtPath(list.get(arrayIdx), nextPath, value);
+                    }
+                }
+            } else if (path.contains(".")) {
+                int dotIdx = path.indexOf('.');
+                String key = path.substring(0, dotIdx);
+                String remainder = path.substring(dotIdx + 1);
+                Object next = map.get(key);
+                if (next == null) {
+                    next = new LinkedHashMap<>();
+                    map.put(key, next);
+                }
+                setValueAtPath(next, remainder, value);
+            } else {
+                map.put(path, value);
+            }
+        }
+    }
+
+    /**
+     * Remove a value at a nested path in a map.
+     */
+    @SuppressWarnings("unchecked")
+    public static void removeAtPath(Map<String, Object> map, String path) {
+        if (path.startsWith("[")) {
+            int closeIdx = path.indexOf(']');
+            if (closeIdx > 0) {
+                String key = path.substring(1, closeIdx);
+                if ((key.startsWith("'") && key.endsWith("'")) ||
+                    (key.startsWith("\"") && key.endsWith("\""))) {
+                    key = key.substring(1, key.length() - 1);
+                }
+                String remainder = closeIdx + 1 < path.length() ? path.substring(closeIdx + 1) : "";
+                if (remainder.isEmpty()) {
+                    map.remove(key);
+                } else {
+                    Object nested = map.get(key);
+                    if (nested instanceof Map) {
+                        String nextPath = remainder.startsWith(".") ? remainder.substring(1) : remainder;
+                        removeAtPath((Map<String, Object>) nested, nextPath);
+                    }
+                }
+            }
+        } else if (path.contains(".")) {
+            int dotIdx = path.indexOf('.');
+            String key = path.substring(0, dotIdx);
+            String remainder = path.substring(dotIdx + 1);
+            Object nested = map.get(key);
+            if (nested instanceof Map) {
+                removeAtPath((Map<String, Object>) nested, remainder);
+            }
+        } else {
+            map.remove(path);
+        }
+    }
+
+    /**
+     * Find the first '=' that's an assignment operator (not {@code ==, !=, <=, >=}).
+     *
+     * @param text the text to search
+     * @return index of '=' or -1 if not found
+     */
+    public static int findAssignmentOperator(String text) {
+        int i = 0;
+        while (i < text.length()) {
+            char c = text.charAt(i);
+            if (c == '=' && i > 0) {
+                char prev = text.charAt(i - 1);
+                if (prev != '=' && prev != '!' && prev != '<' && prev != '>') {
+                    // Check not followed by '='
+                    if (i + 1 >= text.length() || text.charAt(i + 1) != '=') {
+                        return i;
+                    }
+                }
+            }
+            i++;
+        }
+        return -1;
+    }
+
+    /**
+     * Check if string contains JS expression punctuation like . ( [ ] ' "
+     *
+     * @param s the string to check
+     * @return true if contains punctuation
+     */
+    public static boolean hasPunctuation(String s) {
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '.' || c == '(' || c == ')' || c == '[' || c == ']' || c == '\'' || c == '"') {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Convert a value to its string representation.
+     * - null -> "null"
+     * - String -> as-is
+     * - Map/List -> JSON
+     * - Node -> XML
+     * - Other -> toString()
+     *
+     * @param value the value to stringify
+     * @return string representation
+     */
+    public static String stringify(Object value) {
+        if (value == null) {
+            return "null";
+        } else if (value instanceof String) {
+            return (String) value;
+        } else if (value instanceof Map || value instanceof List) {
+            return Json.stringifyStrict(value);
+        } else if (value instanceof Node) {
+            return Xml.toString((Node) value, false);
+        } else {
+            return value.toString();
+        }
+    }
+
+    /**
+     * True when an LHS path uses a JsonPath construct that JS can't evaluate:
+     * {@code [*]} (array wildcard), {@code ..} (recursive descent), or {@code [?(...)]} (filter).
+     * Used by `set` / `remove` to fall back to Jayway when a step like
+     * {@code set body[*].parent = 'test'} would otherwise hit the JS parser.
+     */
+    public static boolean containsJsonPathWildcard(String s) {
+        return s.contains("[*]") || s.contains("[?") || s.contains("..");
+    }
+
+    /**
+     * True if {@code s} is a bare identifier — letter/_/$ followed by letters/digits/_/$.
+     * Used by `set` to distinguish full-replacement (`set foo = ...`) from path/JS forms
+     * (`set foo.b = ...`, `set arr[0] = ...`).
+     */
+    public static boolean isPlainIdentifier(String s) {
+        if (s == null) return false;
+        s = s.trim();
+        int n = s.length();
+        if (n == 0) return false;
+        char c0 = s.charAt(0);
+        if (!(Character.isLetter(c0) || c0 == '_' || c0 == '$')) return false;
+        for (int i = 1; i < n; i++) {
+            char c = s.charAt(i);
+            if (!(Character.isLetterOrDigit(c) || c == '_' || c == '$')) return false;
+        }
+        return true;
+    }
+
+    /**
+     * True if {@code lhs} is a "pure" JSON path expression: an identifier followed by
+     * zero or more path segments where every segment is one of
+     * {@code .ident}, {@code [int]}, {@code [int:int]}, {@code ['str']}, {@code ["str"]},
+     * {@code [*]}, {@code ..}, {@code [?(...)]}. JS-style dynamic indices (e.g. {@code [i]},
+     * {@code [i+1]}) deliberately fail this check so they continue to route through the
+     * JS engine. Used by `set` / `remove` to route LHS paths through Jayway, which mirrors
+     * v1 semantics — most importantly, auto-vivifying intermediate objects when the
+     * target path doesn't yet exist.
+     */
+    public static boolean isPureJsonPath(String lhs) {
+        if (lhs == null) return false;
+        String s = lhs.trim();
+        int n = s.length();
+        if (n == 0) return false;
+        // leading identifier
+        char c0 = s.charAt(0);
+        if (!(Character.isLetter(c0) || c0 == '_' || c0 == '$')) return false;
+        int i = 1;
+        while (i < n) {
+            char c = s.charAt(i);
+            if (Character.isLetterOrDigit(c) || c == '_' || c == '$') i++;
+            else break;
+        }
+        boolean hasSegment = false;
+        while (i < n) {
+            char c = s.charAt(i);
+            if (c == '.') {
+                hasSegment = true;
+                i++;
+                if (i < n && s.charAt(i) == '.') { // recursive descent: `..`
+                    i++;
+                    if (i >= n) return false;
+                    char next = s.charAt(i);
+                    if (next == '[') continue; // `..[*]` etc. — let the next loop iter parse it
+                    if (!(Character.isLetter(next) || next == '_' || next == '$')) return false;
+                }
+                if (i >= n) return false;
+                char id = s.charAt(i);
+                if (!(Character.isLetter(id) || id == '_' || id == '$')) return false;
+                i++;
+                // Allow '-' inside a dot segment so a hyphenated JSON key like
+                // `obj.hyphen-key` routes through Jayway instead of the JS engine,
+                // which would read it as subtraction (`obj.hyphen - key`) and throw
+                // "MATH_ADD_EXPR is not a valid assignment target" (issue #2896).
+                // The segment must still start with an identifier char (above), so a
+                // bare `a - b` with spaces is unaffected — the space breaks the scan.
+                while (i < n) {
+                    char cc = s.charAt(i);
+                    if (Character.isLetterOrDigit(cc) || cc == '_' || cc == '$' || cc == '-') i++;
+                    else break;
+                }
+            } else if (c == '[') {
+                hasSegment = true;
+                i++;
+                if (i >= n) return false;
+                char inner = s.charAt(i);
+                if (inner == '\'' || inner == '"') {
+                    char quote = inner;
+                    i++;
+                    while (i < n && s.charAt(i) != quote) {
+                        if (s.charAt(i) == '\\' && i + 1 < n) i++; // skip escape
+                        i++;
+                    }
+                    if (i >= n) return false;
+                    i++; // consume closing quote
+                } else if (inner == '*') {
+                    i++;
+                } else if (inner == '?') {
+                    int depth = 1;
+                    i++;
+                    while (i < n && depth > 0) {
+                        char cc = s.charAt(i);
+                        if (cc == '[') depth++;
+                        else if (cc == ']') {
+                            depth--;
+                            if (depth == 0) break;
+                        }
+                        i++;
+                    }
+                    if (i >= n) return false;
+                } else if (inner == '-' || Character.isDigit(inner)) {
+                    if (inner == '-') i++;
+                    while (i < n && Character.isDigit(s.charAt(i))) i++;
+                    if (i < n && s.charAt(i) == ':') {
+                        i++;
+                        if (i < n && s.charAt(i) == '-') i++;
+                        while (i < n && Character.isDigit(s.charAt(i))) i++;
+                    }
+                } else {
+                    return false; // [ident], [expr], ... — JS dynamic, not pure JsonPath
+                }
+                if (i >= n || s.charAt(i) != ']') return false;
+                i++;
+            } else {
+                return false;
+            }
+        }
+        return hasSegment;
+    }
+
+    public static final class VarAndPath {
+        public final String var;
+        public final String path;
+
+        VarAndPath(String var, String path) {
+            this.var = var;
+            this.path = path;
+        }
+    }
+
+    /**
+     * Split an LHS like {@code body[*].parent} into variable {@code body} and JsonPath
+     * {@code $[*].parent}. Mirrors v1's {@code parseVariableAndPath}: variable is the leading
+     * identifier ({@code [A-Za-z_$][A-Za-z0-9_$]*}); the rest becomes the path, prefixed
+     * with {@code $} unless it already starts with one.
+     */
+    public static VarAndPath splitVarAndJsonPath(String lhs) {
+        lhs = lhs.trim();
+        int i = 0;
+        int n = lhs.length();
+        if (n == 0) {
+            return new VarAndPath("", "$");
+        }
+        char first = lhs.charAt(0);
+        if (!(Character.isLetter(first) || first == '_' || first == '$')) {
+            return new VarAndPath("", "$");
+        }
+        i = 1;
+        while (i < n) {
+            char c = lhs.charAt(i);
+            if (Character.isLetterOrDigit(c) || c == '_' || c == '$') {
+                i++;
+            } else {
+                break;
+            }
+        }
+        String var = lhs.substring(0, i);
+        String rest = lhs.substring(i).trim();
+        String path;
+        if (rest.isEmpty()) {
+            path = "$";
+        } else if (rest.charAt(0) == '$') {
+            path = rest;
+        } else if (rest.charAt(0) == '.' || rest.charAt(0) == '[') {
+            path = "$" + rest;
+        } else {
+            path = "$." + rest;
+        }
+        return new VarAndPath(var, path);
+    }
+
+}

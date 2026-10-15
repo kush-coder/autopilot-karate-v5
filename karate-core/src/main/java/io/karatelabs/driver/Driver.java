@@ -1,0 +1,1563 @@
+/*
+ * The MIT License
+ *
+ * Copyright 2025 Karate Labs Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package io.karatelabs.driver;
+
+import io.karatelabs.js.JavaCallable;
+import io.karatelabs.js.JsFunction;
+import io.karatelabs.js.SimpleObject;
+
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
+
+/**
+ * Browser automation driver interface.
+ * Provides a unified API for browser automation across different backends (CDP, Playwright, WebDriver).
+ *
+ * <p>This interface extends {@link CoreDriver} which defines the ~12 primitive operations.
+ * Most methods in this interface are convenience methods that delegate to those primitives,
+ * primarily to {@link CoreDriver#eval(String)}.</p>
+ *
+ * <p>Phase 8: Extracted from CdpDriver to enable multi-backend support.</p>
+ * <p>Phase 9: Implements ObjectLike for Gherkin/DSL integration (JS property access).</p>
+ * <p>Phase 10: Extends CoreDriver to clearly separate primitives from convenience methods.</p>
+ *
+ * @see CoreDriver
+ */
+public interface Driver extends CoreDriver, SimpleObject {
+
+    // ========== ObjectLike Implementation (for JS property access) ==========
+
+    /**
+     * Get a property value or method by name for JavaScript access.
+     * Properties return values directly; methods return JavaCallables.
+     */
+    @SuppressWarnings("unchecked")
+    @Override
+    default Object jsGet(String name) {
+        return switch (name) {
+            // Properties (direct values)
+            case DriverApi.URL -> getUrl();
+            case DriverApi.TITLE -> getTitle();
+            case DriverApi.COOKIES -> getCookies();
+            case DriverApi.DIMENSIONS -> getDimensions();
+            case DriverApi.DIALOG_TEXT -> getDialogText();
+
+            // Element actions (return Element for chaining)
+            case DriverApi.CLICK -> (JavaCallable) (ctx, args) ->
+                    click(String.valueOf(args[0]));
+            case DriverApi.INPUT -> (JavaCallable) (ctx, args) -> {
+                String loc = String.valueOf(args[0]);
+                Object value = args.length > 1 ? args[1] : "";
+                int delay = args.length > 2 && args[2] instanceof Number n ? n.intValue() : 0;
+                if (value instanceof List<?> list) {
+                    String[] arr = list.stream().map(String::valueOf).toArray(String[]::new);
+                    return input(loc, arr, delay);
+                }
+                if (value != null && value.getClass().isArray()) {
+                    int length = java.lang.reflect.Array.getLength(value);
+                    String[] strs = new String[length];
+                    for (int i = 0; i < length; i++) {
+                        strs[i] = String.valueOf(java.lang.reflect.Array.get(value, i));
+                    }
+                    return input(loc, strs, delay);
+                }
+                String s = value == null ? "" : String.valueOf(value);
+                return delay > 0 ? input(loc, s, delay) : input(loc, s);
+            };
+            case DriverApi.INPUT_FILE -> (JavaCallable) (ctx, args) -> {
+                String loc = String.valueOf(args[0]);
+                // second arg may be a single path, a list/array of paths, or varargs
+                List<String> files = new ArrayList<>();
+                for (int i = 1; i < args.length; i++) {
+                    if (args[i] instanceof List<?> list) {
+                        list.forEach(o -> files.add(String.valueOf(o)));
+                    } else if (args[i] != null && args[i].getClass().isArray()) {
+                        int length = java.lang.reflect.Array.getLength(args[i]);
+                        for (int j = 0; j < length; j++) {
+                            files.add(String.valueOf(java.lang.reflect.Array.get(args[i], j)));
+                        }
+                    } else {
+                        files.add(String.valueOf(args[i]));
+                    }
+                }
+                return inputFile(loc, files.toArray(new String[0]));
+            };
+            case DriverApi.CLEAR -> (JavaCallable) (ctx, args) ->
+                    clear(String.valueOf(args[0]));
+            case DriverApi.FOCUS -> (JavaCallable) (ctx, args) ->
+                    focus(String.valueOf(args[0]));
+            case DriverApi.SCROLL -> (JavaCallable) (ctx, args) ->
+                    scroll(String.valueOf(args[0]));
+            case DriverApi.HIGHLIGHT -> (JavaCallable) (ctx, args) -> {
+                String loc = String.valueOf(args[0]);
+                if (args.length > 1 && args[1] instanceof Number n) {
+                    return highlight(loc, n.intValue());
+                }
+                return highlight(loc);
+            };
+            case DriverApi.HIGHLIGHT_ALL -> (JavaCallable) (ctx, args) -> {
+                String loc = String.valueOf(args[0]);
+                if (args.length > 1 && args[1] instanceof Number n) {
+                    highlightAll(loc, n.intValue());
+                } else {
+                    highlightAll(loc);
+                }
+                return null;
+            };
+            case DriverApi.SELECT -> (JavaCallable) (ctx, args) -> {
+                String locator = String.valueOf(args[0]);
+                Object value = args.length > 1 ? args[1] : null;
+                if (value instanceof Number n) {
+                    return select(locator, n.intValue());
+                }
+                return select(locator, value != null ? String.valueOf(value) : "");
+            };
+            case DriverApi.SUBMIT -> (JavaCallable) (ctx, args) -> submit();
+
+            // Element state (return primitives)
+            case DriverApi.TEXT -> (JavaCallable) (ctx, args) ->
+                    text(String.valueOf(args[0]));
+            case DriverApi.HTML -> (JavaCallable) (ctx, args) ->
+                    html(String.valueOf(args[0]));
+            case DriverApi.VALUE -> (JavaCallable) (ctx, args) -> {
+                if (args.length == 1) {
+                    return value(String.valueOf(args[0]));
+                } else {
+                    return value(String.valueOf(args[0]), String.valueOf(args[1]));
+                }
+            };
+            case DriverApi.ATTRIBUTE -> (JavaCallable) (ctx, args) ->
+                    attribute(String.valueOf(args[0]), String.valueOf(args[1]));
+            case DriverApi.PROPERTY -> (JavaCallable) (ctx, args) ->
+                    property(String.valueOf(args[0]), String.valueOf(args[1]));
+            case DriverApi.EXISTS -> (JavaCallable) (ctx, args) ->
+                    exists(String.valueOf(args[0]));
+            case DriverApi.ENABLED -> (JavaCallable) (ctx, args) ->
+                    enabled(String.valueOf(args[0]));
+            case DriverApi.POSITION -> (JavaCallable) (ctx, args) -> {
+                if (args.length > 1 && args[1] instanceof Boolean) {
+                    return position(String.valueOf(args[0]), (Boolean) args[1]);
+                }
+                return position(String.valueOf(args[0]));
+            };
+
+            // Locators
+            case DriverApi.LOCATE -> (JavaCallable) (ctx, args) ->
+                    locate(String.valueOf(args[0]));
+            case DriverApi.LOCATE_ALL -> (JavaCallable) (ctx, args) ->
+                    locateAll(String.valueOf(args[0]));
+            case DriverApi.OPTIONAL -> (JavaCallable) (ctx, args) ->
+                    optional(String.valueOf(args[0]));
+
+            // Wait methods
+            case DriverApi.WAIT_FOR -> (JavaCallable) (ctx, args) ->
+                    waitFor(String.valueOf(args[0]));
+            case DriverApi.WAIT_FOR_TEXT -> (JavaCallable) (ctx, args) ->
+                    waitForText(String.valueOf(args[0]), String.valueOf(args[1]));
+            case DriverApi.WAIT_FOR_ENABLED -> (JavaCallable) (ctx, args) ->
+                    waitForEnabled(String.valueOf(args[0]));
+            case DriverApi.WAIT_FOR_URL -> (JavaCallable) (ctx, args) ->
+                    waitForUrl(String.valueOf(args[0]));
+            case DriverApi.WAIT_UNTIL -> (JavaCallable) (ctx, args) -> {
+                // 1-arg form: if the arg is a callable (JS lambda, Supplier, ...)
+                // poll it locally in karate-js instead of stringifying and shipping
+                // to V8 — the closure's bindings (locateAll, find, etc.) live here.
+                if (args.length == 1) {
+                    Supplier<Object> supplier = DriverApi.asSupplier(args[0], ctx);
+                    if (supplier != null) {
+                        return waitUntil(supplier);
+                    }
+                    return waitUntil(String.valueOf(args[0]));
+                }
+                // 2-arg form: locator + element-bound JS expression that runs in
+                // the browser (e.g. el => !el.disabled). Stringification is
+                // intentional here; JsFunction.toString() yields valid JS source.
+                return waitUntil(String.valueOf(args[0]), String.valueOf(args[1]));
+            };
+
+            case DriverApi.WAIT_FOR_RESULT_COUNT -> (JavaCallable) (ctx, args) ->
+                    waitForResultCount(String.valueOf(args[0]), ((Number) args[1]).intValue());
+
+            // Frame/Page switching
+            case DriverApi.SWITCH_FRAME -> (JavaCallable) (ctx, args) -> {
+                Object arg = args.length > 0 ? args[0] : null;
+                if (arg == null) {
+                    switchFrame((String) null);
+                } else if (arg instanceof Number n) {
+                    switchFrame(n.intValue());
+                } else {
+                    switchFrame(String.valueOf(arg));
+                }
+                return null;
+            };
+            case DriverApi.SWITCH_PAGE -> (JavaCallable) (ctx, args) -> {
+                Object arg = args[0];
+                if (arg instanceof Number n) {
+                    switchPage(n.intValue());
+                } else {
+                    switchPage(String.valueOf(arg));
+                }
+                return null;
+            };
+            case DriverApi.GET_PAGES -> (JavaCallable) (ctx, args) -> getPages();
+
+            // Script execution
+            case DriverApi.SCRIPT -> (JavaCallable) (ctx, args) -> {
+                if (args.length == 1) {
+                    return script(args[0]);
+                } else {
+                    return script(String.valueOf(args[0]), args[1]);
+                }
+            };
+            case DriverApi.SCRIPT_ALL -> (JavaCallable) (ctx, args) ->
+                    scriptAll(String.valueOf(args[0]), args[1]);
+
+            // Navigation
+            case DriverApi.REFRESH -> (JavaCallable) (ctx, args) -> {
+                refresh();
+                return null;
+            };
+            case DriverApi.RELOAD -> (JavaCallable) (ctx, args) -> {
+                reload();
+                return null;
+            };
+            case DriverApi.BACK -> (JavaCallable) (ctx, args) -> {
+                back();
+                return null;
+            };
+            case DriverApi.FORWARD -> (JavaCallable) (ctx, args) -> {
+                forward();
+                return null;
+            };
+
+            // Window
+            case DriverApi.MAXIMIZE -> (JavaCallable) (ctx, args) -> {
+                maximize();
+                return null;
+            };
+            case DriverApi.MINIMIZE -> (JavaCallable) (ctx, args) -> {
+                minimize();
+                return null;
+            };
+            case DriverApi.FULLSCREEN -> (JavaCallable) (ctx, args) -> {
+                fullscreen();
+                return null;
+            };
+            case DriverApi.ACTIVATE -> (JavaCallable) (ctx, args) -> {
+                activate();
+                return null;
+            };
+
+            // Lifecycle
+            case DriverApi.CLOSE -> (JavaCallable) (ctx, args) -> {
+                close();
+                return null;
+            };
+            case DriverApi.QUIT -> (JavaCallable) (ctx, args) -> {
+                quit();
+                return null;
+            };
+
+            // PDF
+            case DriverApi.PDF -> (JavaCallable) (ctx, args) -> {
+                if (args.length > 0 && args[0] instanceof Map) {
+                    return pdf((Map<String, Object>) args[0]);
+                }
+                return pdf();
+            };
+
+            // Positional finders
+            case DriverApi.RIGHT_OF -> (JavaCallable) (ctx, args) ->
+                    rightOf(String.valueOf(args[0]));
+            case DriverApi.LEFT_OF -> (JavaCallable) (ctx, args) ->
+                    leftOf(String.valueOf(args[0]));
+            case DriverApi.ABOVE -> (JavaCallable) (ctx, args) ->
+                    above(String.valueOf(args[0]));
+            case DriverApi.BELOW -> (JavaCallable) (ctx, args) ->
+                    below(String.valueOf(args[0]));
+            case DriverApi.NEAR -> (JavaCallable) (ctx, args) ->
+                    near(String.valueOf(args[0]));
+
+            // waitForAny — accepts (loc1, loc2, ...) or a single array argument
+            case DriverApi.WAIT_FOR_ANY -> (JavaCallable) (ctx, args) -> {
+                if (args.length == 1 && args[0] instanceof List<?> list) {
+                    String[] arr = list.stream().map(String::valueOf).toArray(String[]::new);
+                    return waitForAny(arr);
+                }
+                if (args.length == 1 && args[0] != null && args[0].getClass().isArray()) {
+                    Object array = args[0];
+                    int length = java.lang.reflect.Array.getLength(array);
+                    String[] strs = new String[length];
+                    for (int i = 0; i < length; i++) strs[i] = String.valueOf(java.lang.reflect.Array.get(array, i));
+                    return waitForAny(strs);
+                }
+                String[] arr = new String[args.length];
+                for (int i = 0; i < args.length; i++) arr[i] = String.valueOf(args[i]);
+                return waitForAny(arr);
+            };
+
+            // timeout — get current (no args) or set (int millis), returns Driver for chaining
+            case DriverApi.TIMEOUT -> (JavaCallable) (ctx, args) -> {
+                if (args.length == 0) {
+                    return timeout();
+                }
+                return timeout(((Number) args[0]).intValue());
+            };
+
+            // Screenshot — Gherkin/JS default is to embed into the report
+            // (v1 behavior). The Java API's 0-arg screenshot() deliberately
+            // returns bytes without embedding; here we call screenshot(true)
+            // so that `* screenshot` from a feature file shows up in the HTML
+            // report.
+            case DriverApi.SCREENSHOT -> (JavaCallable) (ctx, args) -> {
+                if (args.length == 0) {
+                    return screenshot(true);
+                }
+                Object first = args[0];
+                if (first instanceof Boolean b) {
+                    return screenshot(b);
+                }
+                if (first instanceof String s) {
+                    boolean embed = !(args.length > 1 && Boolean.FALSE.equals(args[1]));
+                    return screenshot(s, embed);
+                }
+                return screenshot(true);
+            };
+
+            // Cookies
+            case DriverApi.COOKIE -> (JavaCallable) (ctx, args) -> {
+                Object arg = args[0];
+                if (arg instanceof String s) {
+                    return cookie(s);
+                } else if (arg instanceof Map) {
+                    cookie((Map<String, Object>) arg);
+                    return null;
+                }
+                return null;
+            };
+            case DriverApi.COOKIES_SET -> (JavaCallable) (ctx, args) -> {
+                Object arg = args[0];
+                if (arg instanceof List) {
+                    setCookies((List<Map<String, Object>>) arg);
+                }
+                return null;
+            };
+            case DriverApi.CLEAR_COOKIES -> (JavaCallable) (ctx, args) -> {
+                clearCookies();
+                return null;
+            };
+            case DriverApi.DELETE_COOKIE -> (JavaCallable) (ctx, args) -> {
+                deleteCookie(String.valueOf(args[0]));
+                return null;
+            };
+
+            // Request interception
+            // V1 compat:  driver.intercept({ patterns: [...], mock: 'classpath:mock.feature' })
+            // V2 handler:  driver.intercept({ patterns: [...], handler: function(req){ return { status: 200, body: '...' } } })
+            case DriverApi.INTERCEPT -> (JavaCallable) (ctx, args) -> {
+                Object arg = args[0];
+                if (arg instanceof Map) {
+                    Map<String, Object> configMap = (Map<String, Object>) arg;
+                    List<Object> patterns = (List<Object>) configMap.get("patterns");
+                    if (patterns == null) {
+                        throw new RuntimeException("missing array argument 'patterns': " + configMap);
+                    }
+                    // Extract URL pattern strings from pattern maps or plain strings
+                    List<String> urlPatterns = new java.util.ArrayList<>();
+                    for (Object p : patterns) {
+                        if (p instanceof Map) {
+                            Object urlPattern = ((Map<String, Object>) p).get("urlPattern");
+                            urlPatterns.add(urlPattern != null ? String.valueOf(urlPattern) : "*");
+                        } else {
+                            urlPatterns.add(String.valueOf(p));
+                        }
+                    }
+                    Object handlerObj = configMap.get("handler");
+                    String mock = configMap.get("mock") != null ? String.valueOf(configMap.get("mock")) : null;
+                    if (handlerObj instanceof JavaCallable jsHandler) {
+                        // V2: inline JS handler
+                        intercept(urlPatterns, request -> {
+                            Object result = jsHandler.call(ctx, request);
+                            if (result instanceof InterceptResponse ir) {
+                                return ir;
+                            } else if (result instanceof Map) {
+                                Map<String, Object> resultMap = (Map<String, Object>) result;
+                                int status = resultMap.get("status") instanceof Number n ? n.intValue() : 200;
+                                String body = resultMap.get("body") != null ? String.valueOf(resultMap.get("body")) : "";
+                                Map<String, Object> responseHeaders = new java.util.LinkedHashMap<>();
+                                if (resultMap.get("headers") instanceof Map) {
+                                    responseHeaders.putAll((Map<String, Object>) resultMap.get("headers"));
+                                }
+                                return InterceptResponse.of(status, responseHeaders,
+                                        body.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                            }
+                            return null;
+                        });
+                    } else if (mock != null) {
+                        // V1 compat: mock feature file
+                        io.karatelabs.gherkin.Feature feature = io.karatelabs.gherkin.Feature.read(mock);
+                        io.karatelabs.core.MockHandler mockHandler = new io.karatelabs.core.MockHandler(feature);
+                        intercept(urlPatterns, request -> {
+                            io.karatelabs.http.HttpRequest httpRequest = new io.karatelabs.http.HttpRequest();
+                            httpRequest.setUrl(request.getUrl());
+                            httpRequest.setMethod(request.getMethod());
+                            if (request.getHeaders() != null) {
+                                Map<String, List<String>> headers = new java.util.LinkedHashMap<>();
+                                for (Map.Entry<String, Object> entry : request.getHeaders().entrySet()) {
+                                    headers.put(entry.getKey(), List.of(String.valueOf(entry.getValue())));
+                                }
+                                httpRequest.setHeaders(headers);
+                            }
+                            if (request.getPostData() != null) {
+                                httpRequest.setBody(request.getPostData().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                            }
+                            io.karatelabs.http.HttpResponse httpResponse = mockHandler.apply(httpRequest);
+                            if (httpResponse != null) {
+                                Map<String, Object> responseHeaders = new java.util.LinkedHashMap<>();
+                                if (httpResponse.getHeaders() != null) {
+                                    for (Map.Entry<String, List<String>> entry : httpResponse.getHeaders().entrySet()) {
+                                        List<String> values = entry.getValue();
+                                        if (values != null && !values.isEmpty()) {
+                                            responseHeaders.put(entry.getKey(), values.getLast());
+                                        }
+                                    }
+                                }
+                                return InterceptResponse.of(httpResponse.getStatus(), responseHeaders,
+                                        httpResponse.getBodyBytes() != null ? httpResponse.getBodyBytes() : new byte[0]);
+                            }
+                            return null;
+                        });
+                    } else {
+                        throw new RuntimeException("missing 'mock' or 'handler' in intercept config: " + configMap);
+                    }
+                }
+                return null;
+            };
+
+            // Dialog handling
+            case DriverApi.DIALOG -> (JavaCallable) (ctx, args) -> {
+                boolean accept = args.length > 0 && Boolean.TRUE.equals(args[0]);
+                if (args.length > 1 && args[1] != null) {
+                    dialog(accept, String.valueOf(args[1]));
+                } else {
+                    dialog(accept);
+                }
+                return null;
+            };
+            case DriverApi.ON_DIALOG -> (JavaCallable) (ctx, args) -> {
+                if (args.length == 0 || args[0] == null) {
+                    onDialog(null);
+                } else if (args[0] instanceof JavaCallable jsHandler) {
+                    onDialog(dialog -> jsHandler.call(ctx, dialog));
+                }
+                return this;
+            };
+
+            // Mouse and keys
+            case DriverApi.MOUSE -> (JavaCallable) (ctx, args) -> {
+                if (args.length == 0) {
+                    return mouse();
+                } else if (args.length == 1) {
+                    return mouse(String.valueOf(args[0]));
+                } else {
+                    return mouse((Number) args[0], (Number) args[1]);
+                }
+            };
+            case DriverApi.KEYS -> (JavaCallable) (ctx, args) -> keys();
+
+            // Retry - returns a proxy with custom timeout for chaining
+            case DriverApi.RETRY -> (JavaCallable) (ctx, args) -> {
+                Integer count = args.length > 0 ? ((Number) args[0]).intValue() : null;
+                Integer interval = args.length > 1 ? ((Number) args[1]).intValue() : null;
+                return new RetryableDriver(this, count, interval);
+            };
+
+            default -> null;
+        };
+    }
+
+    /**
+     * Set a property value by name for JavaScript assignment.
+     * Supports: driver.url = '...', driver.dimensions = {...}
+     */
+    @SuppressWarnings("unchecked")
+    @Override
+    default void putMember(String name, Object value) {
+        switch (name) {
+            case DriverApi.URL -> setUrl(String.valueOf(value));
+            case DriverApi.DIMENSIONS -> setDimensions((Map<String, Object>) value);
+            default -> SimpleObject.super.putMember(name, value);
+        }
+    }
+
+    // ========== CoreDriver Primitive Implementations ==========
+    // These default methods implement CoreDriver primitives by delegating to Driver methods
+
+    /**
+     * Execute JavaScript. Delegates to {@link #script(String)}.
+     */
+    @Override
+    default Object eval(String js) {
+        return script(js);
+    }
+
+    /**
+     * Execute JavaScript with support for JsFunction.
+     * Delegates to {@link #script(Object)}.
+     *
+     * @param expression JavaScript expression as String or JsFunction
+     * @return the result of the JavaScript execution
+     */
+    default Object eval(Object expression) {
+        return script(expression);
+    }
+
+    /**
+     * Navigate to URL. Delegates to {@link #setUrl(String)}.
+     */
+    @Override
+    default void navigate(String url) {
+        setUrl(url);
+    }
+
+    /**
+     * Switch frames. Dispatches to {@link #switchFrame(int)} or {@link #switchFrame(String)}.
+     */
+    @Override
+    default void frame(Object target) {
+        if (target == null) {
+            switchFrame((String) null);
+        } else if (target instanceof Number n) {
+            switchFrame(n.intValue());
+        } else {
+            switchFrame(target.toString());
+        }
+    }
+
+    /**
+     * Window management. Dispatches to maximize(), minimize(), fullscreen().
+     */
+    @Override
+    default void window(String operation) {
+        switch (operation) {
+            case "maximize" -> maximize();
+            case "minimize" -> minimize();
+            case "fullscreen" -> fullscreen();
+            case "normal" -> setDimensions(Map.of("windowState", "normal"));
+            default -> throw new DriverException("unknown window operation: " + operation);
+        }
+    }
+
+    /**
+     * Tab switching. Dispatches to {@link #switchPage(int)} or {@link #switchPage(String)}.
+     */
+    @Override
+    default void tab(Object target) {
+        if (target instanceof Number n) {
+            switchPage(n.intValue());
+        } else {
+            switchPage(target.toString());
+        }
+    }
+
+    // ========== Navigation ==========
+
+    /**
+     * Navigate to URL and wait for page load.
+     */
+    void setUrl(String url);
+
+    /**
+     * Get current URL.
+     */
+    String getUrl();
+
+    /**
+     * Get page title.
+     */
+    String getTitle();
+
+    /**
+     * Wait for page to load based on strategy.
+     */
+    void waitForPageLoad(PageLoadStrategy strategy);
+
+    /**
+     * Wait for page to load with custom timeout.
+     */
+    void waitForPageLoad(PageLoadStrategy strategy, Duration timeout);
+
+    /**
+     * Refresh the current page.
+     */
+    void refresh();
+
+    /**
+     * Reload the page ignoring cache.
+     */
+    void reload();
+
+    /**
+     * Navigate back in history.
+     */
+    void back();
+
+    /**
+     * Navigate forward in history.
+     */
+    void forward();
+
+    // ========== JavaScript Evaluation ==========
+
+    /**
+     * Execute JavaScript and return result.
+     */
+    Object script(String expression);
+
+    /**
+     * Execute JavaScript with support for JsFunction.
+     * If the argument is a JsFunction (e.g., arrow function), it will be serialized
+     * to its source code and invoked as an IIFE.
+     *
+     * <p>Examples:</p>
+     * <pre>
+     * script("document.title")                    // string expression
+     * script(() => document.title)                // arrow function (from Karate JS)
+     * script(() => { return document.title })     // arrow function with block body
+     * </pre>
+     *
+     * @param expression JavaScript expression as String or JsFunction
+     * @return the result of the JavaScript execution
+     */
+    default Object script(Object expression) {
+        String js = Locators.toFunction(expression);
+        // a function value is invoked; a value expression (including an IIFE that already
+        // invokes itself) goes to the browser verbatim
+        if (expression instanceof JsFunction || Locators.isFunctionDefinition(js)) {
+            js = "(" + js + ")()";
+        }
+        return script(js);
+    }
+
+    /**
+     * Execute a script on an element.
+     * The element is available as '_' in the expression.
+     * Expression can be a String ("_.value") or JsFunction (_ => _.value).
+     */
+    default Object script(String locator, Object expression) {
+        return script(Locators.scriptSelector(locator, expression));
+    }
+
+    /**
+     * Execute a script on all matching elements.
+     * Each element is available as '_' in the expression.
+     * Expression can be a String or JsFunction.
+     */
+    @SuppressWarnings("unchecked")
+    default List<Object> scriptAll(String locator, Object expression) {
+        return (List<Object>) script(Locators.scriptAllSelector(locator, expression));
+    }
+
+    // ========== Screenshot ==========
+
+    /**
+     * Take screenshot and return PNG bytes.
+     */
+    byte[] screenshot();
+
+    /**
+     * Take screenshot, optionally embed in report.
+     */
+    byte[] screenshot(boolean embed);
+
+    /**
+     * Take a screenshot of a specific element (clipped to its bounding rect).
+     * Default impl falls back to full-page screenshot — backends may override
+     * for native element-clipped capture.
+     */
+    default byte[] screenshot(String locator) {
+        return screenshot(locator, true);
+    }
+
+    /**
+     * Take a screenshot of a specific element, optionally embed in report.
+     * Default impl falls back to full-page screenshot.
+     */
+    default byte[] screenshot(String locator, boolean embed) {
+        return screenshot(embed);
+    }
+
+    /**
+     * Take a screenshot of the whole scrollable page, not just the viewport.
+     * Default impl falls back to the viewport screenshot — backends may override
+     * for native beyond-the-viewport capture.
+     */
+    default byte[] screenshotFullPage(boolean embed) {
+        return screenshot(embed);
+    }
+
+    /**
+     * Best-effort screenshot for the failure path (screenshotOnFailure). MUST be
+     * bounded by a SHORT timeout so a stalled renderer can't turn a swallowed
+     * diagnostic capture into a long hang.
+     *
+     * <p>Why this is separate from {@link #screenshot(boolean)}: the regular API
+     * uses the full operation timeout because a user explicitly asked for the
+     * image. The failure path is the opposite — the scenario has already failed,
+     * the bytes are best-effort, and the capture is wrapped in a catch-and-continue.
+     * Yet it inherited the same long timeout, so a renderer that stalled (seen in
+     * CI as "CDP timeout for: Page.captureScreenshot" under a slow container) made
+     * every failed scenario pay the full timeout for an image it then discards —
+     * widening a brief renderer blip into a long cascade. The default delegates to
+     * {@code screenshot(false)}; CDP overrides with a short CDP timeout.</p>
+     */
+    default byte[] failureScreenshot() {
+        return screenshot(false);
+    }
+
+    // ========== Dialog Handling ==========
+
+    /**
+     * Register a handler for JavaScript dialogs (alert, confirm, prompt, beforeunload).
+     */
+    void onDialog(DialogHandler handler);
+
+    /**
+     * Get the current dialog message.
+     */
+    String getDialogText();
+
+    /**
+     * Accept or dismiss the current dialog.
+     */
+    void dialog(boolean accept);
+
+    /**
+     * Accept or dismiss the current dialog with optional prompt input.
+     */
+    void dialog(boolean accept, String input);
+
+    /**
+     * Get the current dialog if one is open.
+     * This is useful for detecting dialogs that appear after actions.
+     *
+     * @return the current Dialog, or null if no dialog is open
+     */
+    Dialog getDialog();
+
+    // ========== Frame Switching ==========
+
+    /**
+     * Switch to an iframe by index.
+     */
+    void switchFrame(int index);
+
+    /**
+     * Switch to an iframe by locator, or null to return to main frame.
+     */
+    void switchFrame(String locator);
+
+    /**
+     * Get the current frame info, or null if in main frame.
+     */
+    Map<String, Object> getCurrentFrame();
+
+    // ========== Submit (wait for page change after next action) ==========
+
+    /**
+     * Mark the next action as triggering a page navigation.
+     * After the next click/action, the driver will wait for the page to change
+     * (detected by URL or document element hash change).
+     * <p>Works on all backends (CDP, WebDriver, Playwright).</p>
+     * <p>Usage: {@code submit().click('#button')}</p>
+     */
+    default Driver submit() {
+        String hash = getUrl() + script("document.documentElement.id");
+        getOptions().setPreSubmitHash(hash);
+        return this;
+    }
+
+    /**
+     * If submit() was called, wait for the document to change after running the action.
+     */
+    default void waitIfSubmitRequested() {
+        String before = getOptions().getPreSubmitHash();
+        if (before == null) {
+            return;
+        }
+        getOptions().setPreSubmitHash(null);
+        long deadline = System.currentTimeMillis() + getOptions().getTimeout();
+        while (System.currentTimeMillis() < deadline) {
+            String after = getUrl() + script("document.documentElement.id");
+            if (!before.equals(after)) {
+                return;
+            }
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+    }
+
+    // ========== Element Operations (defaults delegate to script + Locators) ==========
+
+    /**
+     * Click an element.
+     */
+    default Element click(String locator) {
+        script(Locators.clickJs(locator));
+        waitIfSubmitRequested();
+        return BaseElement.of(this, locator);
+    }
+
+    /**
+     * Focus an element.
+     */
+    default Element focus(String locator) {
+        script(Locators.focusJs(locator));
+        return BaseElement.of(this, locator);
+    }
+
+    /**
+     * Clear an input element.
+     */
+    default Element clear(String locator) {
+        script(Locators.clearJs(locator));
+        return BaseElement.of(this, locator);
+    }
+
+    /**
+     * Input text into an element (focus, clear, type).
+     * For time/date inputs that don't respond to CDP keystrokes, uses JS value assignment.
+     */
+    default Element input(String locator, String value) {
+        focus(locator);
+        Boolean isDateTimeInput = (Boolean) script(locator,
+            "_ && ['time','date','datetime-local','month','week'].indexOf(_.type) >= 0");
+        if (Boolean.TRUE.equals(isDateTimeInput)) {
+            script(Locators.inputJs(locator, value));
+        } else {
+            clear(locator);
+            keys().type(value);
+        }
+        return BaseElement.of(this, locator);
+    }
+
+    /**
+     * Input a sequence of values (strings and/or special keys) into an element.
+     * Each value is sent in sequence — supports mixing literal text with {@code Key.ENTER},
+     * {@code Key.TAB} etc. so that an array form like
+     * {@code input('#search', ['hello', Key.ENTER])} matches v1.
+     */
+    default Element input(String locator, String[] values) {
+        return input(locator, values, 0);
+    }
+
+    /**
+     * Input characters one-by-one with a delay between each — useful for
+     * simulating slow human typing or bypassing race conditions in handlers
+     * that debounce keypresses.
+     */
+    default Element input(String locator, String chars, int delay) {
+        String[] array = new String[chars.length()];
+        for (int i = 0; i < array.length; i++) {
+            array[i] = Character.toString(chars.charAt(i));
+        }
+        return input(locator, array, delay);
+    }
+
+    /**
+     * Input an array of values with a delay between each.
+     */
+    default Element input(String locator, String[] values, int delay) {
+        focus(locator);
+        clear(locator);
+        Keys k = keys();
+        for (String value : values) {
+            if (delay > 0) {
+                try {
+                    Thread.sleep(delay);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            // WebDriver special-key constants live in U+E000..U+E03D — route
+            // those through press(), and send literal text via type()
+            if (value != null && value.length() == 1
+                    && value.charAt(0) >= 0xE000 && value.charAt(0) <= 0xE03D) {
+                k.press(value);
+            } else {
+                k.type(value);
+            }
+        }
+        return BaseElement.of(this, locator);
+    }
+
+    /**
+     * Set the files of a file {@code <input>} element — the ONLY way to drive a file upload:
+     * browsers forbid setting a file input's {@code value} from script (a page must never be
+     * able to pick a file off the user's disk), so {@code value()} throws and {@code input()}
+     * keystrokes go nowhere. Each backend uses its native mechanism instead (CDP
+     * {@code DOM.setFileInputFiles}, W3C element send-keys).
+     *
+     * <p>File references resolve exactly like {@code read()} — relative to the calling feature,
+     * with {@code classpath:}, a root-anchored leading {@code /}, and {@code file:} for a real
+     * OS path (see {@link DriverApi#resolveFilePaths}). Multiple files need an input with the
+     * {@code multiple} attribute. The element does not need to be visible — file inputs are
+     * routinely hidden behind styled buttons.</p>
+     *
+     * <p>NOTE: the resolved path is handed to the browser process — with a remote browser
+     * (grid, container) the file must exist on the machine the BROWSER runs on; use
+     * {@code file:} to name such a path verbatim.</p>
+     */
+    default Element inputFile(String locator, String... files) {
+        throw new DriverException("inputFile not supported by this driver");
+    }
+
+    /**
+     * Set the value of an input element directly.
+     */
+    default Element value(String locator, String value) {
+        script(Locators.inputJs(locator, value));
+        return BaseElement.of(this, locator);
+    }
+
+    /**
+     * Select an option from a dropdown by text or value.
+     */
+    default Element select(String locator, String text) {
+        Object matched = script(Locators.optionSelector(locator, text));
+        if (!Boolean.TRUE.equals(matched)) {
+            throw new DriverException("select failed, no option matching: '" + text + "' for: " + locator);
+        }
+        return BaseElement.of(this, locator);
+    }
+
+    /**
+     * Select an option from a dropdown by index.
+     */
+    default Element select(String locator, int index) {
+        String js = Locators.wrapInFunctionInvoke(
+                "var e = " + Locators.selector(locator) + ";" +
+                        " e.options[" + index + "].selected = true;" +
+                        " e.dispatchEvent(new Event('input', {bubbles: true}));" +
+                        " e.dispatchEvent(new Event('change', {bubbles: true}))");
+        script(js);
+        return BaseElement.of(this, locator);
+    }
+
+    /**
+     * Scroll an element into view.
+     */
+    default Element scroll(String locator) {
+        script(Locators.scrollJs(locator));
+        return BaseElement.of(this, locator);
+    }
+
+    /**
+     * Highlight an element (for debugging).
+     */
+    default Element highlight(String locator) {
+        return highlight(locator, getOptions().getHighlightDuration());
+    }
+
+    /**
+     * Highlight an element (for debugging) for a specific duration in millis.
+     */
+    default Element highlight(String locator, int millis) {
+        script(Locators.highlight(locator, millis));
+        return BaseElement.of(this, locator);
+    }
+
+    /**
+     * Highlight all elements matching the locator (for debugging).
+     */
+    default void highlightAll(String locator) {
+        highlightAll(locator, getOptions().getHighlightDuration());
+    }
+
+    /**
+     * Highlight all elements matching the locator for a specific duration in millis.
+     */
+    default void highlightAll(String locator, int millis) {
+        script(Locators.highlightAll(locator, millis));
+    }
+
+    // ========== Element State (defaults delegate to script + Locators) ==========
+
+    /**
+     * Get the text content of an element.
+     */
+    default String text(String locator) {
+        return (String) script(Locators.textJs(locator));
+    }
+
+    /**
+     * Get the outer HTML of an element.
+     */
+    default String html(String locator) {
+        return (String) script(Locators.outerHtmlJs(locator));
+    }
+
+    /**
+     * Get the value of an input element.
+     */
+    default String value(String locator) {
+        return (String) script(Locators.valueJs(locator));
+    }
+
+    /**
+     * Get an attribute of an element.
+     */
+    default String attribute(String locator, String name) {
+        return (String) script(Locators.attributeJs(locator, name));
+    }
+
+    /**
+     * Get a property of an element.
+     */
+    default Object property(String locator, String name) {
+        return script(Locators.propertyJs(locator, name));
+    }
+
+    /**
+     * Check if an element is enabled.
+     */
+    default boolean enabled(String locator) {
+        return Boolean.TRUE.equals(script(Locators.enabledJs(locator)));
+    }
+
+    /**
+     * Check if an element exists.
+     */
+    default boolean exists(String locator) {
+        return Boolean.TRUE.equals(script(Locators.existsJs(locator)));
+    }
+
+    /**
+     * Get the position of an element (absolute).
+     */
+    @SuppressWarnings("unchecked")
+    default Map<String, Object> position(String locator) {
+        return (Map<String, Object>) script(Locators.getPositionJs(locator));
+    }
+
+    /**
+     * Get the position of an element.
+     *
+     * @param relative if true, returns viewport-relative position
+     */
+    @SuppressWarnings("unchecked")
+    default Map<String, Object> position(String locator, boolean relative) {
+        if (relative) {
+            String js = Locators.wrapInFunctionInvoke(
+                    "var r = " + Locators.selector(locator) + ".getBoundingClientRect();" +
+                            " return { x: r.x, y: r.y, width: r.width, height: r.height }");
+            return (Map<String, Object>) script(js);
+        }
+        return position(locator);
+    }
+
+    // ========== Locators ==========
+
+    /**
+     * Find an element by locator.
+     * This is a convenience method that creates an Element wrapper.
+     */
+    default Element locate(String locator) {
+        return BaseElement.of(this, locator);
+    }
+
+    /**
+     * Find all elements matching a locator.
+     * Implementation requires driver-specific indexed locator support.
+     */
+    List<Element> locateAll(String locator);
+
+    /**
+     * Find all elements matching a locator and filter via the supplied predicate.
+     * Java-only convenience — useful for reporting/auditing where you need to
+     * narrow {@link #locateAll(String)} results without re-querying the DOM.
+     */
+    default List<Element> locateAll(String locator, Predicate<Element> predicate) {
+        List<Element> all = locateAll(locator);
+        List<Element> filtered = new ArrayList<>(all.size());
+        for (Element e : all) {
+            if (predicate.test(e)) {
+                filtered.add(e);
+            }
+        }
+        return filtered;
+    }
+
+    /**
+     * Run an element-bound JS expression on every match and filter the
+     * resulting values via the predicate. Java-only convenience.
+     */
+    default List<Object> scriptAll(String locator, Object expression, Predicate<Object> predicate) {
+        List<Object> all = scriptAll(locator, expression);
+        List<Object> filtered = new ArrayList<>(all.size());
+        for (Object o : all) {
+            if (predicate.test(o)) {
+                filtered.add(o);
+            }
+        }
+        return filtered;
+    }
+
+    /**
+     * Find an element that may not exist (optional).
+     * This is a convenience method that creates an optional Element wrapper.
+     */
+    default Element optional(String locator) {
+        return BaseElement.optional(this, locator);
+    }
+
+    // ========== Wait Methods ==========
+
+    /**
+     * Wait for an element to exist.
+     */
+    Element waitFor(String locator);
+
+    /**
+     * Wait for an element to exist with custom timeout.
+     */
+    Element waitFor(String locator, Duration timeout);
+
+    /**
+     * Wait for any of the locators to match.
+     */
+    Element waitForAny(String locator1, String locator2);
+
+    /**
+     * Wait for any of the locators to match.
+     */
+    Element waitForAny(String[] locators);
+
+    /**
+     * Wait for any of the locators to match with custom timeout.
+     */
+    Element waitForAny(String[] locators, Duration timeout);
+
+    /**
+     * Wait for an element to contain specific text.
+     */
+    Element waitForText(String locator, String expected);
+
+    /**
+     * Wait for an element to contain specific text with custom timeout.
+     */
+    Element waitForText(String locator, String expected, Duration timeout);
+
+    /**
+     * Wait for an element to be enabled.
+     */
+    Element waitForEnabled(String locator);
+
+    /**
+     * Wait for an element to be enabled with custom timeout.
+     */
+    Element waitForEnabled(String locator, Duration timeout);
+
+    /**
+     * Wait for URL to contain expected string.
+     */
+    String waitForUrl(String expected);
+
+    /**
+     * Wait for URL to contain expected string with custom timeout.
+     */
+    String waitForUrl(String expected, Duration timeout);
+
+    /**
+     * Wait until a JavaScript expression on an element evaluates to truthy.
+     */
+    Element waitUntil(String locator, String expression);
+
+    /**
+     * Wait until a JavaScript expression on an element evaluates to truthy.
+     */
+    Element waitUntil(String locator, String expression, Duration timeout);
+
+    /**
+     * Wait until a JavaScript expression evaluates to truthy.
+     */
+    boolean waitUntil(String expression);
+
+    /**
+     * Wait until a JavaScript expression evaluates to truthy with custom timeout.
+     */
+    boolean waitUntil(String expression, Duration timeout);
+
+    /**
+     * Wait until a supplier returns a truthy value.
+     */
+    Object waitUntil(Supplier<Object> condition);
+
+    /**
+     * Wait until a supplier returns a truthy value with custom timeout.
+     */
+    Object waitUntil(Supplier<Object> condition, Duration timeout);
+
+    /**
+     * Wait for a specific number of elements to match.
+     */
+    List<Element> waitForResultCount(String locator, int count);
+
+    /**
+     * Wait for a specific number of elements to match with custom timeout.
+     */
+    List<Element> waitForResultCount(String locator, int count, Duration timeout);
+
+    /**
+     * Wait until {@link #scriptAll(String, Object)} returns exactly {@code count}
+     * results when run against the supplied JS expression on each matched
+     * element. Java-only convenience overload (v1 parity).
+     */
+    @SuppressWarnings("unchecked")
+    default List<Object> waitForResultCount(String locator, int count, String expression) {
+        return (List<Object>) waitUntil(() -> {
+            List<Object> list = scriptAll(locator, expression);
+            return list.size() == count ? list : null;
+        });
+    }
+
+    // ========== Cookies ==========
+
+    /**
+     * Get a cookie by name.
+     */
+    Map<String, Object> cookie(String name);
+
+    /**
+     * Set a cookie.
+     */
+    void cookie(Map<String, Object> cookie);
+
+    /**
+     * Delete a cookie by name.
+     */
+    void deleteCookie(String name);
+
+    /**
+     * Clear all cookies.
+     */
+    void clearCookies();
+
+    /**
+     * Get all cookies.
+     */
+    List<Map<String, Object>> getCookies();
+
+    /**
+     * Bulk-set cookies — convenience over repeated {@link #cookie(Map)} calls.
+     * Mirrors v1's setCookies, where a JSON array could be loaded from a file
+     * and applied wholesale.
+     */
+    default void setCookies(List<Map<String, Object>> cookies) {
+        if (cookies == null) {
+            return;
+        }
+        for (Map<String, Object> c : cookies) {
+            cookie(c);
+        }
+    }
+
+    // ========== Window Management ==========
+
+    /**
+     * Maximize the browser window.
+     */
+    void maximize();
+
+    /**
+     * Minimize the browser window.
+     */
+    void minimize();
+
+    /**
+     * Make the browser window fullscreen.
+     */
+    void fullscreen();
+
+    /**
+     * Get window dimensions and position.
+     */
+    Map<String, Object> getDimensions();
+
+    /**
+     * Set window dimensions and/or position.
+     */
+    void setDimensions(Map<String, Object> dimensions);
+
+    /**
+     * Activate the browser window (bring to front).
+     */
+    void activate();
+
+    // ========== PDF Generation ==========
+
+    /**
+     * Generate a PDF of the current page.
+     */
+    byte[] pdf(Map<String, Object> options);
+
+    /**
+     * Generate a PDF of the current page with default options.
+     */
+    byte[] pdf();
+
+    // ========== Mouse and Keyboard ==========
+
+    /**
+     * Get a Mouse object at position (0, 0).
+     */
+    Mouse mouse();
+
+    /**
+     * Get a Mouse object positioned at an element's center.
+     */
+    Mouse mouse(String locator);
+
+    /**
+     * Get a Mouse object at specified coordinates.
+     */
+    Mouse mouse(Number x, Number y);
+
+    /**
+     * Get a Keys object for keyboard input.
+     */
+    Keys keys();
+
+    // ========== Pages/Tabs Management ==========
+
+    /**
+     * Get list of all page targets (tabs).
+     */
+    List<String> getPages();
+
+    /**
+     * Switch to a page by title or URL substring.
+     */
+    void switchPage(String titleOrUrl);
+
+    /**
+     * Switch to a page by index.
+     */
+    void switchPage(int index);
+
+    /**
+     * Switch to a page by its backend target ID.
+     *
+     * <p>Useful in conjunction with {@link #drainOpenedTargets()} — the drained
+     * entries carry a {@code targetId} which unambiguously identifies the new tab,
+     * while URL/title can be ambiguous (e.g. blank or duplicated across tabs).</p>
+     *
+     * <p>Default implementation delegates to {@link #switchPage(String)} using the
+     * target ID as a substring match; most drivers should override.</p>
+     */
+    default void switchPageById(String targetId) {
+        switchPage(targetId);
+    }
+
+    /**
+     * Drain and return the list of new page targets (tabs) opened since the last call.
+     *
+     * <p>Event-driven — no CDP round-trip. Each entry is a map with {@code targetId},
+     * {@code url}, and {@code title}. Returns an empty list if nothing new was opened.</p>
+     *
+     * <p>Use case: an automation that clicks a link with {@code target="_blank"} or a
+     * button that calls {@code window.open()} can call this after the click to learn
+     * whether (and where) a new tab appeared, and then call {@link #switchPage(String)}
+     * or {@link #switchPage(int)} to focus it.</p>
+     *
+     * <p>Mirrors the {@link #getDialog()} pattern — the driver pushes events into an
+     * internal queue and the caller drains it, avoiding polling {@code Target.getTargets}
+     * after every action.</p>
+     *
+     * <p>Default implementation returns an empty list for drivers that don't track
+     * target events.</p>
+     */
+    default List<Map<String, Object>> drainOpenedTargets() {
+        return java.util.Collections.emptyList();
+    }
+
+    // ========== Positional Locators ==========
+
+    /**
+     * Create a finder for elements to the right of the reference element.
+     * This is a convenience method that creates a Finder.
+     */
+    default Finder rightOf(String locator) {
+        return new Finder(this, locator, Finder.Position.RIGHT_OF);
+    }
+
+    /**
+     * Create a finder for elements to the left of the reference element.
+     * This is a convenience method that creates a Finder.
+     */
+    default Finder leftOf(String locator) {
+        return new Finder(this, locator, Finder.Position.LEFT_OF);
+    }
+
+    /**
+     * Create a finder for elements above the reference element.
+     * This is a convenience method that creates a Finder.
+     */
+    default Finder above(String locator) {
+        return new Finder(this, locator, Finder.Position.ABOVE);
+    }
+
+    /**
+     * Create a finder for elements below the reference element.
+     * This is a convenience method that creates a Finder.
+     */
+    default Finder below(String locator) {
+        return new Finder(this, locator, Finder.Position.BELOW);
+    }
+
+    /**
+     * Create a finder for elements near the reference element.
+     * This is a convenience method that creates a Finder.
+     */
+    default Finder near(String locator) {
+        return new Finder(this, locator, Finder.Position.NEAR);
+    }
+
+    // ========== Timing & Retry ==========
+
+    /**
+     * Set the operation timeout in milliseconds for this driver instance.
+     * Returns the driver for chaining (v1 parity, e.g. {@code timeout(5000).click(...)}).
+     */
+    default Driver timeout(int millis) {
+        getOptions().setTimeout(millis);
+        return this;
+    }
+
+    /**
+     * Get the current operation timeout in milliseconds.
+     */
+    default int timeout() {
+        return getOptions().getTimeout();
+    }
+
+    /**
+     * Sleep for the given milliseconds. Returns the driver for chaining
+     * (v1 parity, e.g. {@code delay(500).click(...)}).
+     */
+    default Driver delay(int millis) {
+        if (millis > 0) {
+            try {
+                Thread.sleep(millis);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        return this;
+    }
+
+    // ========== Request Interception ==========
+
+    /**
+     * Enable request interception with a handler.
+     */
+    void intercept(List<String> patterns, InterceptHandler handler);
+
+    /**
+     * Enable request interception for all requests.
+     */
+    void intercept(InterceptHandler handler);
+
+    /**
+     * Stop request interception.
+     */
+    void stopIntercept();
+
+    // ========== Lifecycle ==========
+
+    /**
+     * Close driver and browser.
+     */
+    void quit();
+
+    /**
+     * Alias for quit().
+     */
+    void close();
+
+    /**
+     * Check if driver is terminated.
+     */
+    boolean isTerminated();
+
+    /**
+     * Quick health check — returns false if the driver's underlying protocol channel
+     * (CDP websocket, WebDriver session, etc.) is stuck or unresponsive. MUST use a
+     * short timeout so the caller doesn't block on a poisoned driver.
+     *
+     * <p>Used by {@link PooledDriverProvider} to decide whether a driver can be
+     * returned to the pool safely. The default here returns true (backends that can't
+     * cheaply probe the channel are assumed healthy). CDP overrides with a bounded
+     * Runtime.evaluate.</p>
+     */
+    default boolean isResponsive() {
+        return true;
+    }
+
+    /**
+     * Whether the driver is ready to accept script/element calls right now — i.e. the
+     * page's execution context is live (not mid-navigation / mid-tab-switch). Cheap and
+     * non-blocking. Backends without an explicit readiness signal report true.
+     */
+    default boolean isReady() {
+        return true;
+    }
+
+    /**
+     * Block until the driver is ready to accept calls (execution context live), or the
+     * configured timeout elapses. Idempotent and safe to call when already ready (returns
+     * immediately). Intended for clients, pools, and providers that want an explicit
+     * barrier before driving — e.g. {@link PooledDriverProvider} after acquiring/reusing
+     * a driver, so a scenario's first call never races a not-yet-ready context. The
+     * default is a no-op for backends that establish readiness synchronously.
+     */
+    default void waitUntilReady() {
+    }
+
+    // ========== Accessors ==========
+
+    /**
+     * Get driver options.
+     */
+    DriverOptions getOptions();
+
+}

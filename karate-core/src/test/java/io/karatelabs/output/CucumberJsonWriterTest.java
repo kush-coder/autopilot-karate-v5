@@ -1,0 +1,631 @@
+/*
+ * The MIT License
+ *
+ * Copyright 2025 Karate Labs Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package io.karatelabs.output;
+
+import io.karatelabs.common.Json;
+import io.karatelabs.core.Runner;
+import io.karatelabs.core.SuiteResult;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Instant;
+import java.util.List;
+import java.util.Map;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+class CucumberJsonWriterTest {
+
+    @TempDir
+    Path tempDir;
+
+    @BeforeEach
+    void setup() {
+        Console.setColorsEnabled(false);
+    }
+
+    @Test
+    void testCucumberJsonGeneration() throws Exception {
+        Path feature = tempDir.resolve("test.feature");
+        Files.writeString(feature, """
+            Feature: Cucumber JSON Test
+
+            Scenario: Passing scenario
+            * def a = 1
+            * match a == 1
+
+            Scenario: Another passing
+            * def b = 2
+            * match b == 2
+            """);
+
+        Path reportDir = tempDir.resolve("reports");
+
+        long before = System.currentTimeMillis();
+        SuiteResult result = Runner.path(feature.toString())
+                .workingDir(tempDir)
+                .outputDir(reportDir)
+                .outputCucumberJson(true)
+                .outputConsoleSummary(false)
+                .parallel(1);
+        long after = System.currentTimeMillis();
+
+        assertTrue(result.isPassed());
+
+        // Verify per-feature JSON file was created (named after packageQualifiedName)
+        Path jsonPath = reportDir.resolve("cucumber-json/test.json");
+        assertTrue(Files.exists(jsonPath), "Cucumber JSON file should exist");
+
+        String jsonStr = Files.readString(jsonPath);
+
+        // Parse and verify structure
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> features = (List<Map<String, Object>>) (List<?>) Json.of(jsonStr).asList();
+        assertEquals(1, features.size());
+
+        Map<String, Object> featureMap = features.get(0);
+        assertEquals("cucumber-json-test", featureMap.get("id"));
+        assertEquals("Cucumber JSON Test", featureMap.get("name"));
+        assertEquals("Feature", featureMap.get("keyword"));
+        assertTrue(featureMap.get("uri").toString().endsWith("test.feature"));
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> elements = (List<Map<String, Object>>) featureMap.get("elements");
+        assertEquals(2, elements.size());
+
+        // Check first scenario
+        Map<String, Object> scenario1 = elements.get(0);
+        assertEquals("passing-scenario", scenario1.get("id").toString().split(";")[1]);
+        assertEquals("Passing scenario", scenario1.get("name"));
+        assertEquals("Scenario", scenario1.get("keyword"));
+        assertEquals("scenario", scenario1.get("type"));
+
+        // start_timestamp: ISO-8601 UTC with millis, and within the run window —
+        // report tools derive suite timing from it, so it must be present and real
+        for (Map<String, Object> element : elements) {
+            String ts = (String) element.get("start_timestamp");
+            assertNotNull(ts, "scenario element should carry start_timestamp");
+            assertTrue(ts.matches("\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z"), ts);
+            long millis = Instant.parse(ts).toEpochMilli();
+            assertTrue(millis >= before && millis <= after, ts);
+        }
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> steps1 = (List<Map<String, Object>>) scenario1.get("steps");
+        assertEquals(2, steps1.size());
+
+        // Verify step structure
+        Map<String, Object> step1 = steps1.get(0);
+        assertEquals("* ", step1.get("keyword"));
+        // Step name includes Karate keyword and text (e.g., "def a = 1")
+        assertEquals("def a = 1", step1.get("name"));
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> result1 = (Map<String, Object>) step1.get("result");
+        assertEquals("passed", result1.get("status"));
+        assertTrue(result1.containsKey("duration"));
+    }
+
+    @Test
+    void testCucumberJsonWithFailures() throws Exception {
+        Path feature = tempDir.resolve("failing.feature");
+        Files.writeString(feature, """
+            Feature: Failing Test
+
+            Scenario: Passing scenario
+            * def a = 1
+            * match a == 1
+
+            Scenario: Failing scenario
+            * def b = 2
+            * match b == 999
+            """);
+
+        Path reportDir = tempDir.resolve("reports");
+
+        SuiteResult result = Runner.path(feature.toString())
+                .workingDir(tempDir)
+                .outputDir(reportDir)
+                .outputCucumberJson(true)
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        assertTrue(result.isFailed());
+
+        Path jsonPath = reportDir.resolve("cucumber-json/failing.json");
+        assertTrue(Files.exists(jsonPath));
+
+        String jsonStr = Files.readString(jsonPath);
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> features = (List<Map<String, Object>>) (List<?>) Json.of(jsonStr).asList();
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> elements = (List<Map<String, Object>>) features.get(0).get("elements");
+        assertEquals(2, elements.size());
+
+        // Verify failing scenario has error
+        Map<String, Object> failingScenario = elements.get(1);
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> steps = (List<Map<String, Object>>) failingScenario.get("steps");
+
+        // Find the failed step
+        boolean foundFailedStep = false;
+        for (Map<String, Object> step : steps) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> stepResult = (Map<String, Object>) step.get("result");
+            if ("failed".equals(stepResult.get("status"))) {
+                foundFailedStep = true;
+                assertTrue(stepResult.containsKey("error_message"));
+                break;
+            }
+        }
+        assertTrue(foundFailedStep, "Should have a failed step");
+    }
+
+    @Test
+    void testCucumberJsonWithTags() throws Exception {
+        Path feature = tempDir.resolve("tagged.feature");
+        Files.writeString(feature, """
+            @feature-tag
+            Feature: Tagged Feature
+
+            @scenario-tag @smoke
+            Scenario: Tagged scenario
+            * def a = 1
+            * match a == 1
+            """);
+
+        Path reportDir = tempDir.resolve("reports");
+
+        Runner.path(feature.toString())
+                .workingDir(tempDir)
+                .outputDir(reportDir)
+                .outputCucumberJson(true)
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        Path jsonPath = reportDir.resolve("cucumber-json/tagged.json");
+        String jsonStr = Files.readString(jsonPath);
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> features = (List<Map<String, Object>>) (List<?>) Json.of(jsonStr).asList();
+
+        // Check feature tags
+        Map<String, Object> featureMap = features.get(0);
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> featureTags = (List<Map<String, Object>>) featureMap.get("tags");
+        assertNotNull(featureTags);
+        assertEquals(1, featureTags.size());
+        assertEquals("@feature-tag", featureTags.get(0).get("name"));
+
+        // Check scenario tags
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> elements = (List<Map<String, Object>>) featureMap.get("elements");
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> scenarioTags = (List<Map<String, Object>>) elements.get(0).get("tags");
+        assertNotNull(scenarioTags);
+        assertEquals(2, scenarioTags.size());
+    }
+
+    @Test
+    void testCucumberJsonNotGeneratedByDefault() throws Exception {
+        Path feature = tempDir.resolve("nocucumber.feature");
+        Files.writeString(feature, """
+            Feature: No Cucumber JSON
+            Scenario: Test
+            * def a = 1
+            """);
+
+        Path reportDir = tempDir.resolve("reports");
+
+        Runner.path(feature.toString())
+                .workingDir(tempDir)
+                .outputDir(reportDir)
+                .outputCucumberJson(false)  // explicitly disabled
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        // Cucumber JSON should NOT exist (check for the packageQualifiedName-based file)
+        // Note: Karate JSON writes {featureName}.json, Cucumber JSON writes {packageQualifiedName}.json
+        // On case-insensitive filesystems, we need distinct names to avoid collision
+        assertFalse(Files.exists(reportDir.resolve("cucumber-json/nocucumber.json")),
+                "Cucumber JSON file should not exist when outputCucumberJson is false");
+    }
+
+    @Test
+    void testCucumberJsonStripsAnsiEscapeCodes() throws Exception {
+        // step logs can contain raw ANSI codes (from HttpLogger) which break downstream tools
+        // build ANSI at runtime via String.fromCharCode so the feature source has no ESC bytes
+        Path feature = tempDir.resolve("ansi.feature");
+        Files.writeString(feature, """
+            Feature: ANSI Test
+
+            Scenario: With ANSI
+            * def esc = String.fromCharCode(27)
+            * karate.log(esc + '[31mRED-LOG' + esc + '[0m ok')
+            """);
+
+        Path reportDir = tempDir.resolve("reports");
+
+        Runner.path(feature.toString())
+                .workingDir(tempDir)
+                .outputDir(reportDir)
+                .outputCucumberJson(true)
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        Path jsonPath = reportDir.resolve("cucumber-json/ansi.json");
+        String jsonStr = Files.readString(jsonPath);
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> features = (List<Map<String, Object>>) (List<?>) Json.of(jsonStr).asList();
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> elements = (List<Map<String, Object>>) features.get(0).get("elements");
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> steps = (List<Map<String, Object>>) elements.get(0).get("steps");
+
+        // find the embedded text/plain log and decode it
+        boolean checkedLog = false;
+        for (Map<String, Object> step : steps) {
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> embeddings = (List<Map<String, Object>>) step.get("embeddings");
+            if (embeddings == null) continue;
+            for (Map<String, Object> embed : embeddings) {
+                if ("text/plain".equals(embed.get("mime_type"))) {
+                    String decoded = new String(java.util.Base64.getDecoder().decode(embed.get("data").toString()));
+                    String esc = String.valueOf((char) 27);
+                    assertTrue(decoded.contains("RED-LOG"), "log content should be retained");
+                    assertFalse(decoded.contains(esc), "log should not contain ANSI escape codes");
+                    checkedLog = true;
+                }
+            }
+        }
+        assertTrue(checkedLog, "expected a text/plain log embedding");
+    }
+
+    @Test
+    void testCucumberJsonWithDocString() throws Exception {
+        Path feature = tempDir.resolve("docstring.feature");
+        Files.writeString(feature, """
+            Feature: DocString Test
+
+            Scenario: With doc string
+            * def payload =
+            \"\"\"
+            {
+              "name": "John",
+              "age": 30
+            }
+            \"\"\"
+            * match payload.name == 'John'
+            """);
+
+        Path reportDir = tempDir.resolve("reports");
+
+        Runner.path(feature.toString())
+                .workingDir(tempDir)
+                .outputDir(reportDir)
+                .outputCucumberJson(true)
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        Path jsonPath = reportDir.resolve("cucumber-json/docstring.json");
+        String jsonStr = Files.readString(jsonPath);
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> features = (List<Map<String, Object>>) (List<?>) Json.of(jsonStr).asList();
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> elements = (List<Map<String, Object>>) features.get(0).get("elements");
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> steps = (List<Map<String, Object>>) elements.get(0).get("steps");
+
+        // Find the step with doc_string
+        boolean foundDocString = false;
+        for (Map<String, Object> step : steps) {
+            if (step.containsKey("doc_string")) {
+                foundDocString = true;
+                @SuppressWarnings("unchecked")
+                Map<String, Object> docString = (Map<String, Object>) step.get("doc_string");
+                assertTrue(docString.get("value").toString().contains("John"));
+                break;
+            }
+        }
+        assertTrue(foundDocString, "Should have a step with doc_string");
+    }
+
+    @Test
+    void testCucumberJsonWithSyntheticStep() throws Exception {
+        // synthetic step results (null Step) — produced by @fail tag, lifecycle hooks,
+        // and scenario init failures — used to NPE in stepToMap and silently drop the
+        // entire feature's JSON file.
+        Path feature = tempDir.resolve("synthetic.feature");
+        Files.writeString(feature, """
+            Feature: Synthetic Step
+
+            @fail
+            Scenario: failing scenario expected to fail
+            * def a = 1
+            * match a == 999
+            """);
+
+        Path reportDir = tempDir.resolve("reports");
+
+        SuiteResult result = Runner.path(feature.toString())
+                .workingDir(tempDir)
+                .outputDir(reportDir)
+                .outputCucumberJson(true)
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        // @fail flips: original FAIL becomes PASS at scenario level
+        assertTrue(result.isPassed());
+
+        Path jsonPath = reportDir.resolve("cucumber-json/synthetic.json");
+        assertTrue(Files.exists(jsonPath), "Cucumber JSON must still be written when synthetic steps are present");
+
+        String jsonStr = Files.readString(jsonPath);
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> features = (List<Map<String, Object>>) (List<?>) Json.of(jsonStr).asList();
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> elements = (List<Map<String, Object>>) features.get(0).get("elements");
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> steps = (List<Map<String, Object>>) elements.get(0).get("steps");
+
+        // Last step is the synthetic fakeSuccess marker
+        Map<String, Object> synthetic = steps.get(steps.size() - 1);
+        assertEquals("* ", synthetic.get("keyword"));
+        assertEquals(0, synthetic.get("line"));
+        assertTrue(synthetic.get("name").toString().toLowerCase().contains("fail"),
+                "synthetic step name should describe the @fail expectation");
+        @SuppressWarnings("unchecked")
+        Map<String, Object> syntheticResult = (Map<String, Object>) synthetic.get("result");
+        assertEquals("passed", syntheticResult.get("status"));
+    }
+
+    @Test
+    void testCucumberJsonWithDataTable() throws Exception {
+        Path feature = tempDir.resolve("table.feature");
+        Files.writeString(feature, """
+            Feature: Table Test
+
+            Scenario: With table
+            * def users =
+              | name  | age |
+              | John  | 30  |
+              | Jane  | 25  |
+            * match users[0].name == 'John'
+            """);
+
+        Path reportDir = tempDir.resolve("reports");
+
+        Runner.path(feature.toString())
+                .workingDir(tempDir)
+                .outputDir(reportDir)
+                .outputCucumberJson(true)
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        Path jsonPath = reportDir.resolve("cucumber-json/table.json");
+        String jsonStr = Files.readString(jsonPath);
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> features = (List<Map<String, Object>>) (List<?>) Json.of(jsonStr).asList();
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> elements = (List<Map<String, Object>>) features.get(0).get("elements");
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> steps = (List<Map<String, Object>>) elements.get(0).get("steps");
+
+        // Find the step with rows (table)
+        boolean foundTable = false;
+        for (Map<String, Object> step : steps) {
+            if (step.containsKey("rows")) {
+                foundTable = true;
+                @SuppressWarnings("unchecked")
+                List<Map<String, Object>> rows = (List<Map<String, Object>>) step.get("rows");
+                assertTrue(rows.size() >= 2, "Should have at least 2 rows (header + data)");
+                // verify cells are plain strings (standard Cucumber format)
+                @SuppressWarnings("unchecked")
+                List<Object> cells = (List<Object>) rows.get(0).get("cells");
+                assertNotNull(cells);
+                assertTrue(cells.get(0) instanceof String, "cells should be plain strings, not objects");
+                break;
+            }
+        }
+        assertTrue(foundTable, "Should have a step with table rows");
+    }
+
+    @Test
+    void testCalledSubFeatureStepsAreFlattenedWithAngleMarkers() throws Exception {
+        // sub.feature is called by main.feature via `call read(...)` — its steps must
+        // show up in main.feature's Cucumber JSON (Cucumber has no native nested-call
+        // concept, so v1 flattens with ">"-prefixed keywords).
+        Path subFeature = tempDir.resolve("sub.feature");
+        Files.writeString(subFeature, """
+            Feature: Sub
+
+            Scenario: sub work
+            * def y = param1
+            * match y == 'hello'
+            """);
+
+        Path mainFeature = tempDir.resolve("main.feature");
+        Files.writeString(mainFeature, """
+            Feature: Main
+
+            Scenario: calls sub
+            * def x = 1
+            * def myCall = call read('sub.feature') { param1: 'hello' }
+            * match x == 1
+            """);
+
+        Path reportDir = tempDir.resolve("reports");
+        SuiteResult result = Runner.path(mainFeature.toString())
+                .workingDir(tempDir)
+                .outputDir(reportDir)
+                .outputCucumberJson(true)
+                .outputConsoleSummary(false)
+                .parallel(1);
+        assertTrue(result.isPassed());
+
+        String jsonStr = Files.readString(reportDir.resolve("cucumber-json/main.json"));
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> features = (List<Map<String, Object>>) (List<?>) Json.of(jsonStr).asList();
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> elements = (List<Map<String, Object>>) features.get(0).get("elements");
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> steps = (List<Map<String, Object>>) elements.get(0).get("steps");
+
+        // Expected sequence: top step, top call step, synthetic header, 2 sub steps, top match
+        assertEquals(6, steps.size(), "main scenario should have 6 entries after flattening");
+
+        assertEquals("* ", steps.get(0).get("keyword"));
+        assertEquals("def x = 1", steps.get(0).get("name"));
+
+        assertEquals("* ", steps.get(1).get("keyword"));
+        assertTrue(((String) steps.get(1).get("name")).startsWith("def myCall = call read"));
+
+        // Synthetic call header
+        assertEquals("> ", steps.get(2).get("keyword"));
+        assertTrue(((String) steps.get(2).get("name")).endsWith("sub.feature"),
+                "header name should be the called feature path, got: " + steps.get(2).get("name"));
+
+        // Sub-feature steps inlined with "> " keyword prefix
+        assertEquals("> * ", steps.get(3).get("keyword"));
+        assertEquals("def y = param1", steps.get(3).get("name"));
+
+        assertEquals("> * ", steps.get(4).get("keyword"));
+        assertEquals("match y == 'hello'", steps.get(4).get("name"));
+
+        // Top-level continues after the call
+        assertEquals("* ", steps.get(5).get("keyword"));
+        assertEquals("match x == 1", steps.get(5).get("name"));
+    }
+
+    @Test
+    void testNestedCalledSubFeatureStepsUseDoubleAngleMarkers() throws Exception {
+        Path deepFeature = tempDir.resolve("deep.feature");
+        Files.writeString(deepFeature, """
+            Feature: Deep
+
+            Scenario: deep work
+            * def z = 42
+            """);
+
+        Path subFeature = tempDir.resolve("sub.feature");
+        Files.writeString(subFeature, """
+            Feature: Sub
+
+            Scenario: sub work
+            * def y = 1
+            * def d = call read('deep.feature')
+            """);
+
+        Path mainFeature = tempDir.resolve("main.feature");
+        Files.writeString(mainFeature, """
+            Feature: Main
+
+            Scenario: nested calls
+            * def m = call read('sub.feature')
+            """);
+
+        Path reportDir = tempDir.resolve("reports");
+        SuiteResult result = Runner.path(mainFeature.toString())
+                .workingDir(tempDir)
+                .outputDir(reportDir)
+                .outputCucumberJson(true)
+                .outputConsoleSummary(false)
+                .parallel(1);
+        assertTrue(result.isPassed());
+
+        String jsonStr = Files.readString(reportDir.resolve("cucumber-json/main.json"));
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> features = (List<Map<String, Object>>) (List<?>) Json.of(jsonStr).asList();
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> elements = (List<Map<String, Object>>) features.get(0).get("elements");
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> steps = (List<Map<String, Object>>) elements.get(0).get("steps");
+
+        // Verify that we see both a "> " (depth 1) and a ">> " (depth 2) marker somewhere
+        boolean sawDepth1Header = false;
+        boolean sawDepth1Step = false;
+        boolean sawDepth2Header = false;
+        boolean sawDepth2Step = false;
+        for (Map<String, Object> step : steps) {
+            String kw = (String) step.get("keyword");
+            if ("> ".equals(kw)) sawDepth1Header = true;
+            if ("> * ".equals(kw)) sawDepth1Step = true;
+            if (">> ".equals(kw)) sawDepth2Header = true;
+            if (">> * ".equals(kw)) sawDepth2Step = true;
+        }
+        assertTrue(sawDepth1Header, "expected '> ' header for depth-1 call");
+        assertTrue(sawDepth1Step, "expected '> * ' step for depth-1 sub-feature");
+        assertTrue(sawDepth2Header, "expected '>> ' header for depth-2 call");
+        assertTrue(sawDepth2Step, "expected '>> * ' step for depth-2 sub-feature");
+    }
+
+    @Test
+    void aSyntheticStepIsNamedByItsTextNotItsRawLog() throws Exception {
+        // A synthetic step keeps display text and log separate. Naming it from the log dumps
+        // whatever the config phase printed into the step name; the text is what belongs there.
+        Path configJs = tempDir.resolve("karate-config.js");
+        Files.writeString(configJs, """
+            function fn() {
+                karate.log('some config-time chatter');
+                throw 'config is broken';
+            }
+            """);
+
+        Path feature = tempDir.resolve("test.feature");
+        Files.writeString(feature, """
+            Feature: Synthetic step naming
+            Scenario: never runs
+            * def a = 1
+            """);
+
+        Path reportDir = tempDir.resolve("reports");
+        Runner.builder()
+                .path(feature.toString())
+                .workingDir(tempDir)
+                .configDir(configJs.toString())
+                .outputDir(reportDir)
+                .outputCucumberJson(true)
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        String jsonStr = Files.readString(reportDir.resolve("cucumber-json/test.json"));
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> features = (List<Map<String, Object>>) (List<?>) Json.of(jsonStr).asList();
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> elements = (List<Map<String, Object>>) features.get(0).get("elements");
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> steps = (List<Map<String, Object>>) elements.get(0).get("steps");
+
+        String name = (String) steps.get(0).get("name");
+        assertTrue(name.startsWith("Scenario execution failed:"), "step name should be the synthetic text, got: " + name);
+        assertTrue(name.contains("config is broken"), name);
+        assertFalse(name.contains("some config-time chatter"), "the log must not be used as the step name: " + name);
+    }
+
+}

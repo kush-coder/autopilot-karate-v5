@@ -1,0 +1,1095 @@
+/*
+ * The MIT License
+ *
+ * Copyright 2025 Karate Labs Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package io.karatelabs.core;
+
+import io.karatelabs.common.Json;
+import io.karatelabs.common.Resource;
+import io.karatelabs.gherkin.Feature;
+import io.karatelabs.gherkin.FeatureSection;
+import io.karatelabs.gherkin.Scenario;
+import io.karatelabs.gherkin.ScenarioOutline;
+import io.karatelabs.gherkin.ExamplesTable;
+import io.karatelabs.gherkin.Table;
+import io.karatelabs.gherkin.Tag;
+import io.karatelabs.js.JavaCallable;
+import io.karatelabs.output.LogContext;
+import io.karatelabs.output.ResultListener;
+import org.slf4j.Logger;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Consumer;
+
+public class FeatureRuntime implements Callable<FeatureResult> {
+
+    private static final Logger logger = LogContext.RUNTIME_LOGGER;
+
+    private final Suite suite;
+    private final Feature feature;
+    private final FeatureRuntime caller;
+    private final ScenarioRuntime callerScenario;  // The calling scenario's runtime (for variable inheritance)
+    private final boolean sharedScope;  // true = pass variables by reference, false = pass copies
+    private final Map<String, Object> callArg;
+    private final String callTagSelector;  // Tag selector for call-by-tag (e.g., "@name=second")
+    private final Set<Integer> callLineFilters;  // Line filter for call-by-line (e.g., file.feature:10)
+
+    // Caches (feature-level). These fields are the fallback used when this
+    // FeatureRuntime has no Suite (test/standalone usage). When a Suite is
+    // attached, the accessors below delegate to Suite-owned stores keyed by
+    // feature URI — this gives karate-gatling a way to share callOnce/setupOnce
+    // results across virtual users that all run the same feature.
+    private final Map<String, Object> CALLONCE_CACHE_LOCAL = new ConcurrentHashMap<>();
+    private final Map<String, Object> SETUPONCE_CACHE_LOCAL = new ConcurrentHashMap<>();
+    private final ReentrantLock callOnceLock = new ReentrantLock();
+
+    // State
+    // Written from scenario threads in parallel mode (executeScenarioParallel) and read
+    // single-threaded after the futures join, to drive the afterFeature hook - hence volatile.
+    private volatile ScenarioRuntime lastExecuted;
+    private FeatureResult result;
+    private final Map<Integer, Integer> outlineCompletedCounts = new HashMap<>();  // section index -> completed count
+    // Outline sections we've already fired OUTLINE_ENTER for. Iteration is
+    // single-threaded (both sequential and parallel paths walk selectedScenarios()
+    // in the calling thread before submitting to the executor) so a plain HashSet
+    // is safe here.
+    private final java.util.Set<Integer> outlineEnteredSections = new java.util.HashSet<>();
+    private int loopIndex = -1;  // -1 means not a loop call; 0+ is the iteration index
+
+    public FeatureRuntime(Feature feature) {
+        this(null, feature, null, null, false, null);
+    }
+
+    public FeatureRuntime(Suite suite, Feature feature) {
+        this(suite, feature, null, null, false, null);
+    }
+
+    public FeatureRuntime(Suite suite, Feature feature, FeatureRuntime caller, Map<String, Object> callArg) {
+        this(suite, feature, caller, null, false, callArg);
+    }
+
+    public FeatureRuntime(Suite suite, Feature feature, FeatureRuntime caller, ScenarioRuntime callerScenario, boolean sharedScope, Map<String, Object> callArg) {
+        this(suite, feature, caller, callerScenario, sharedScope, callArg, null);
+    }
+
+    public FeatureRuntime(Suite suite, Feature feature, FeatureRuntime caller, ScenarioRuntime callerScenario, boolean sharedScope, Map<String, Object> callArg, String callTagSelector) {
+        this(suite, feature, caller, callerScenario, sharedScope, callArg, callTagSelector, null);
+    }
+
+    public FeatureRuntime(Suite suite, Feature feature, FeatureRuntime caller, ScenarioRuntime callerScenario, boolean sharedScope, Map<String, Object> callArg, String callTagSelector, Set<Integer> callLineFilters) {
+        this.suite = suite;
+        this.feature = feature;
+        this.caller = caller;
+        this.callerScenario = callerScenario;
+        this.sharedScope = sharedScope;
+        this.callArg = callArg;
+        this.callTagSelector = callTagSelector;
+        this.callLineFilters = callLineFilters;
+        this.result = new FeatureResult(feature);
+        this.result.setCallDepth(getCallDepth());
+    }
+
+    public int getCallDepth() {
+        int depth = 0;
+        FeatureRuntime fr = caller;
+        while (fr != null) {
+            depth++;
+            fr = fr.caller;
+        }
+        return depth;
+    }
+
+    /**
+     * A top-level feature is one executed directly (as a root feature), not via
+     * call/callonce. This is the canonical "not a called feature" predicate — many
+     * behaviours (result-listener notifications, locking, line filters, after-feature
+     * hooks, abort handling) are gated to top-level features only. Note that suite-level
+     * concerns additionally require {@code suite != null}; standalone usage has no suite
+     * but is still top-level.
+     */
+    public boolean isTopLevel() {
+        return caller == null;
+    }
+
+    /**
+     * The inverse of {@link #isTopLevel()} — true when this feature was reached via
+     * call/callonce from another feature.
+     */
+    public boolean isCalled() {
+        return caller != null;
+    }
+
+    private void notifyListeners(Consumer<ResultListener> action) {
+        // emitting these for nested called features corrupts consumers such as the JUnit
+        // bridge, which would otherwise treat a called feature's events as the caller's
+        if (suite == null || !isTopLevel()) {
+            return;
+        }
+        for (ResultListener listener : suite.getResultListeners()) {
+            action.accept(listener);
+        }
+    }
+
+    public static FeatureRuntime of(Feature feature) {
+        return new FeatureRuntime(feature);
+    }
+
+    public static FeatureRuntime of(Suite suite, Feature feature) {
+        return new FeatureRuntime(suite, feature);
+    }
+
+    // set before FEATURE_EXIT is dispatched — Suite.fireEvent delivers it to every listener even when one
+    // throws, so once set the stream has this feature's result and the Suite never emits a second
+    private boolean exitFired;
+
+    boolean exitFired() {
+        return exitFired;
+    }
+
+    @Override
+    public FeatureResult call() {
+        result.setStartTime(System.currentTimeMillis());
+
+        // Notify listeners of feature start (only for top-level features, not nested calls)
+        notifyListeners(listener -> listener.onFeatureStart(feature));
+
+        try {
+            // Fire FEATURE_ENTER event
+            if (suite != null) {
+                suite.fireEvent(FeatureRunEvent.enter(this));
+            }
+
+            try {
+                // Use scenario-level parallelism for top-level features in parallel mode
+                // Must check BOTH executor AND semaphore to ensure proper synchronization
+                if (suite != null && suite.parallel && isTopLevel()
+                        && suite.getScenarioExecutor() != null && suite.getScenarioSemaphore() != null) {
+                    logger.debug("Running scenarios in parallel mode for feature: {}", feature.getName());
+                    runScenariosParallel();
+                } else {
+                    // Sequential execution for called features or non-parallel mode
+                    if (suite != null && suite.parallel && isTopLevel()) {
+                        logger.warn("Falling back to sequential execution for feature '{}' - executor: {}, semaphore: {}",
+                                feature.getName(), suite.getScenarioExecutor() != null, suite.getScenarioSemaphore() != null);
+                    }
+                    for (Scenario scenario : selectedScenarios()) {
+                        if (suite != null && suite.isAborted()) {
+                            break;
+                        }
+                        maybeFireOutlineEnter(scenario);
+                        executeScenario(scenario);
+                    }
+                }
+            } catch (Exception e) {
+                // Handle errors during scenario iteration (e.g., dynamic expression evaluation failure)
+                // Create a synthetic failed scenario result so the feature fails gracefully
+                logger.error("Error during scenario iteration: {}", e.getMessage());
+                ScenarioResult errorResult = createErrorScenarioResult(e);
+                result.addScenarioResult(errorResult);
+            }
+
+            // Invoke configured afterFeature hook if present (only for top-level features)
+            if (lastExecuted != null && isTopLevel()) {
+                invokeAfterFeatureHook(lastExecuted);
+            }
+
+            // Set end time BEFORE firing FEATURE_EXIT so the event contains correct duration
+            result.setEndTime(System.currentTimeMillis());
+
+            // Fire FEATURE_EXIT event
+            if (suite != null) {
+                exitFired = true;
+                suite.fireEvent(FeatureRunEvent.exit(this, result));
+            }
+        } finally {
+
+            // Notify listeners of feature end (only for top-level features, not nested calls)
+            notifyListeners(listener -> listener.onFeatureEnd(result));
+
+            // Every consumer has now had the whole result, so the nested call trees can go.
+            // Without this the suite keeps one per call for its entire run and memory scales
+            // with total scenarios times calls per scenario. Guarded on isTopLevel() for the
+            // same reason notifyListeners is: releasing inside a called feature would destroy
+            // the very tree the caller is about to attach.
+            if (suite != null && isTopLevel() && !suite.retainCallResults) {
+                result.releaseCallResults();
+            }
+
+            // The captured log text and embeds go the same way, and for a larger saving: they are
+            // the bytes, where call results are the nesting. Same precondition — every consumer
+            // above has had the whole result.
+            //
+            // NOT in perf mode, for two independent reasons. Releasing there frees nothing: the
+            // Gatling lane builds a throwaway Suite per execution which is garbage moments later.
+            // And it would break something: karate-gatling's logReplay renders StepResult.log
+            // AFTER Runner.runFeature returns (LogReplayer.render, called from
+            // KarateExecutor.execute), so clearing it here would empty the replay buffer and
+            // silently remove the only view a load tester has of a failed scenario.
+            if (suite != null && isTopLevel() && !suite.retainStepLogs && !suite.isPerfMode()) {
+                result.releaseStepLogs();
+            }
+        }
+
+        return result;
+    }
+
+    /**
+     * Run scenarios in parallel using the Suite's shared executor.
+     * Each scenario is dispatched to the executor, limited by the scenario semaphore.
+     * The iterator produces scenarios lazily (supporting dynamic @setup scenarios).
+     */
+    private void runScenariosParallel() {
+        ExecutorService executor = suite.getScenarioExecutor();
+        Semaphore semaphore = suite.getScenarioSemaphore();
+        List<Future<ScenarioResult>> futures = new ArrayList<>();
+
+        // Dispatch scenarios to executor as they are produced by the iterator
+        // Dynamic scenarios (from @setup) are evaluated lazily during iteration
+        for (Scenario scenario : selectedScenarios()) {
+            if (suite.isAborted()) {
+                break;
+            }
+            // Fire OUTLINE_ENTER (if first example of its outline) in this
+            // calling thread before submitting — ensures the OUTLINE_ENTER
+            // event lands on the wire before any of its SCENARIO_ENTER events.
+            maybeFireOutlineEnter(scenario);
+            Future<ScenarioResult> future = executor.submit(() -> {
+                String scenarioName = scenario.getName();
+                // Acquire semaphore to limit concurrent scenarios
+                logger.debug("Waiting for semaphore permit: {} (available: {})", scenarioName, semaphore.availablePermits());
+                semaphore.acquire();
+                logger.debug("Acquired semaphore permit: {} (available: {})", scenarioName, semaphore.availablePermits());
+                // Acquire a lane for timeline reporting (consistent lane names instead of random thread IDs)
+                suite.acquireLane();
+                try {
+                    return executeScenarioParallel(scenario);
+                } finally {
+                    suite.releaseLane();
+                    semaphore.release();
+                    logger.debug("Released semaphore permit: {} (available: {})", scenarioName, semaphore.availablePermits());
+                }
+            });
+            futures.add(future);
+        }
+
+        // Wait for all scenarios and collect results
+        for (Future<ScenarioResult> future : futures) {
+            try {
+                ScenarioResult scenarioResult = future.get();
+                result.addScenarioResult(scenarioResult);
+            } catch (Exception e) {
+                logger.error("Error collecting scenario result: {}", e.getMessage());
+                // Create a synthetic error result
+                ScenarioResult errorResult = createErrorScenarioResult(e);
+                result.addScenarioResult(errorResult);
+            }
+        }
+    }
+
+    /**
+     * Execute a scenario in parallel mode.
+     * Handles locking, execution, and result collection.
+     * Returns the ScenarioResult for aggregation by the caller.
+     */
+    private ScenarioResult executeScenarioParallel(Scenario scenario) {
+        // Notify listeners of scenario start (parallel mode runs only for top-level features)
+        notifyListeners(listener -> listener.onScenarioStart(scenario));
+
+        // Acquire locks for @lock tags
+        ScenarioLockManager.LockHandle lockHandle = suite.getLockManager().acquire(scenario);
+
+        ScenarioResult scenarioResult;
+        try {
+            ScenarioRuntime sr = new ScenarioRuntime(this, scenario);
+            scenarioResult = sr.call();
+            // Track a completed runtime so the afterFeature hook still fires in parallel mode.
+            // Order is non-deterministic across threads (last writer wins), which is fine: the
+            // hook only needs a live scenario context to resolve its variables against.
+            // afterScenarioOutline is intentionally not fired here - it is not applicable in parallel mode.
+            lastExecuted = sr;
+
+        } catch (Exception e) {
+            logger.error("Error executing scenario '{}': {}", scenario.getName(), e.getMessage());
+            scenarioResult = createErrorScenarioResult(scenario, e);
+        } finally {
+            // Release locks
+            if (lockHandle != null) {
+                suite.getLockManager().release(lockHandle);
+            }
+        }
+
+        // Notify listeners of scenario completion (parallel mode runs only for top-level features)
+        ScenarioResult completed = scenarioResult;
+        notifyListeners(listener -> listener.onScenarioEnd(completed));
+        releaseCallResultsIfUnwatched(completed);
+
+        return scenarioResult;
+    }
+
+    /**
+     * Execute a single scenario with exception handling (sequential mode).
+     * If the scenario throws an exception, it's captured as a failed scenario result
+     * rather than propagating up and crashing the feature.
+     */
+    private void executeScenario(Scenario scenario) {
+        // Notify listeners of scenario start (only for top-level features)
+        notifyListeners(listener -> listener.onScenarioStart(scenario));
+
+        // Acquire locks for @lock tags (only for top-level features)
+        ScenarioLockManager.LockHandle lockHandle = null;
+        if (suite != null && isTopLevel()) {
+            lockHandle = suite.getLockManager().acquire(scenario);
+        }
+
+        ScenarioResult scenarioResult;
+        try {
+            ScenarioRuntime sr = new ScenarioRuntime(this, scenario);
+            scenarioResult = sr.call();
+            lastExecuted = sr;
+
+            // Check if this is the last scenario in an outline (only for top-level features)
+            if (isTopLevel() && isLastScenarioInOutline(scenario)) {
+                invokeAfterScenarioOutlineHook(sr);
+            }
+        } catch (Exception e) {
+            // Handle unexpected errors during scenario execution
+            logger.error("Error executing scenario '{}': {}", scenario.getName(), e.getMessage());
+            scenarioResult = createErrorScenarioResult(scenario, e);
+        } finally {
+            // Release locks (only for top-level features)
+            if (isTopLevel() && lockHandle != null) {
+                suite.getLockManager().release(lockHandle);
+            }
+        }
+
+        result.addScenarioResult(scenarioResult);
+
+        // Notify listeners of scenario completion (only for top-level features)
+        ScenarioResult completed = scenarioResult;
+        notifyListeners(listener -> listener.onScenarioEnd(completed));
+        releaseCallResultsIfUnwatched(completed);
+    }
+
+    /**
+     * Drop a completed scenario's nested call trees when nothing will read them.
+     *
+     * <p>Deliberately not guarded on {@link #isTopLevel()}, unlike the listener callbacks:
+     * when there is no consumer, a called feature's own nesting is just as unread as the
+     * caller's, and a suite whose features each hold thousands of scenarios only stays
+     * bounded if the inner levels go too.
+     */
+    private void releaseCallResultsIfUnwatched(ScenarioResult completed) {
+        if (completed != null && suite != null && suite.canReleaseCallResultsAtScenarioEnd()) {
+            completed.releaseCallResults();
+        }
+    }
+
+    /**
+     * Create a failed ScenarioResult from an exception when no scenario is available.
+     * Used for errors during scenario iteration (e.g., dynamic expression evaluation).
+     */
+    private ScenarioResult createErrorScenarioResult(Exception error) {
+        // Create a minimal scenario for error reporting
+        Scenario errorScenario = feature.getSections().isEmpty()
+                ? Scenario.createError(feature, "Feature execution failed", feature.getLine())
+                : feature.getSections().get(0).isOutline()
+                ? feature.getSections().get(0).getScenarioOutline().toScenario(null, 0, feature.getLine(), null)
+                : feature.getSections().get(0).getScenario();
+
+        return createErrorScenarioResult(errorScenario, error);
+    }
+
+    /**
+     * Create a failed ScenarioResult from an exception for a specific scenario.
+     */
+    private ScenarioResult createErrorScenarioResult(Scenario scenario, Exception error) {
+        long now = System.currentTimeMillis();
+        ScenarioResult scenarioResult = new ScenarioResult(scenario);
+        if (suite != null) {
+            scenarioResult.setExecutionIndex(suite.nextExecutionIndex());   // an entry with no ENTER still carries one
+        }
+        scenarioResult.setStartTime(now);
+        scenarioResult.setEndTime(now);
+        scenarioResult.setThreadName(Thread.currentThread().getName());
+
+        String errorMessage = "Scenario execution failed: " + error.getMessage();
+        scenarioResult.addStepResult(StepResult.fakeFailure(errorMessage, now, error));
+
+        return scenarioResult;
+    }
+
+    /**
+     * Invokes the configured afterFeature hook if present.
+     * Uses the last executed scenario's runtime context.
+     * Hook failures are surfaced in the report via a fake failure step on the last scenario.
+     */
+    private void invokeAfterFeatureHook(ScenarioRuntime sr) {
+        KarateConfig config = sr.getConfig();
+        Object afterFeature = config.getAfterFeature();
+        if (afterFeature instanceof JavaCallable callable) {
+            try {
+                callable.call(null);
+            } catch (Exception e) {
+                logger.warn("afterFeature hook failed: {}", e.getMessage());
+                appendHookFailure(sr.getResult(), "afterFeature", e);
+            }
+        }
+    }
+
+    /**
+     * Fires OUTLINE_ENTER once per outline section, the first time we encounter
+     * one of its generated examples during iteration. No-op for plain scenarios
+     * and for already-fired outlines. Called single-threaded from the iteration
+     * loops in {@link #run()} / {@link #runScenariosParallel()} before any
+     * scenario work is dispatched.
+     */
+    private void maybeFireOutlineEnter(Scenario scenario) {
+        if (suite == null || !scenario.isOutlineExample()) {
+            return;
+        }
+        FeatureSection section = scenario.getSection();
+        if (section == null) return;
+        ScenarioOutline outline = section.getScenarioOutline();
+        if (outline == null) return;
+        if (outlineEnteredSections.add(section.getIndex())) {
+            suite.fireEvent(OutlineRunEvent.enter(this, outline));
+        }
+    }
+
+    /**
+     * Checks if the given scenario is the last one in its scenario outline.
+     * Tracks completed counts per outline section.
+     */
+    private boolean isLastScenarioInOutline(Scenario scenario) {
+        if (!scenario.isOutlineExample()) {
+            return false;
+        }
+        FeatureSection section = scenario.getSection();
+        int sectionIndex = section.getIndex();
+        ScenarioOutline outline = section.getScenarioOutline();
+
+        // Increment completed count for this outline
+        int completed = outlineCompletedCounts.merge(sectionIndex, 1, Integer::sum);
+
+        // Check if all scenarios in this outline are completed
+        return completed == outline.getNumScenarios();
+    }
+
+    /**
+     * Invokes the configured afterScenarioOutline hook if present.
+     * Hook failures are surfaced in the report via a fake failure step on the outline's last scenario.
+     */
+    private void invokeAfterScenarioOutlineHook(ScenarioRuntime sr) {
+        KarateConfig config = sr.getConfig();
+        Object afterScenarioOutline = config.getAfterScenarioOutline();
+        if (afterScenarioOutline instanceof JavaCallable callable) {
+            try {
+                callable.call(null);
+            } catch (Exception e) {
+                logger.warn("afterScenarioOutline hook failed: {}", e.getMessage());
+                appendHookFailure(sr.getResult(), "afterScenarioOutline", e);
+            }
+        }
+    }
+
+    /**
+     * Attach a fake failure step to a scenario result so a hook exception surfaces in reports.
+     */
+    private void appendHookFailure(ScenarioResult scenarioResult, String hookName, Throwable error) {
+        long now = System.currentTimeMillis();
+        scenarioResult.addStepResult(StepResult.fakeFailure(
+                hookName + " hook failed: " + error.getMessage(), now, error));
+        scenarioResult.setEndTime(now);
+    }
+
+    /**
+     * Returns an iterable of scenarios to execute, including expanded outlines.
+     * Applies tag filtering if configured.
+     */
+    private Iterable<Scenario> selectedScenarios() {
+        return () -> new ScenarioIterator();
+    }
+
+    /**
+     * Iterator that expands scenario outlines into individual scenarios.
+     */
+    private class ScenarioIterator implements Iterator<Scenario> {
+
+        private final List<FeatureSection> sections;
+        private int sectionIndex = 0;
+        private int exampleTableIndex = 0;
+        private int exampleRowIndex = 0;
+        private Scenario nextScenario = null;
+
+        // For dynamic scenarios
+        private List<?> dynamicData = null;
+        private Scenario dynamicTemplateScenario = null;
+
+        ScenarioIterator() {
+            this.sections = feature.getSections();
+            advance();
+        }
+
+        @Override
+        public boolean hasNext() {
+            return nextScenario != null;
+        }
+
+        @Override
+        public Scenario next() {
+            Scenario current = nextScenario;
+            advance();
+            return current;
+        }
+
+        private void advance() {
+            nextScenario = null;
+
+            // Continue processing dynamic data if available
+            if (dynamicData != null && dynamicTemplateScenario != null) {
+                if (processDynamicData()) {
+                    return;
+                }
+            }
+
+            while (sectionIndex < sections.size()) {
+                FeatureSection section = sections.get(sectionIndex);
+
+                if (section.isOutline()) {
+                    ScenarioOutline outline = section.getScenarioOutline();
+                    List<ExamplesTable> tables = outline.getExamplesTables();
+
+                    while (exampleTableIndex < tables.size()) {
+                        ExamplesTable table = tables.get(exampleTableIndex);
+
+                        // Check if this is a dynamic Examples table
+                        if (table.getTable().isDynamic()) {
+                            // Create template scenario for dynamic expansion
+                            Scenario templateScenario = outline.toScenario(
+                                    table.getTable().getDynamicExpression(),
+                                    -1,
+                                    table.getLine(),
+                                    table.getTags()
+                            );
+
+                            // Evaluate the dynamic expression
+                            List<?> data = evaluateDynamicExpression(templateScenario);
+                            if (data != null && !data.isEmpty()) {
+                                dynamicData = data;
+                                dynamicTemplateScenario = templateScenario;
+                                exampleRowIndex = 0;
+
+                                if (processDynamicData()) {
+                                    exampleTableIndex++;
+                                    return;
+                                }
+                            }
+
+                            // Move to next examples table
+                            exampleTableIndex++;
+                            exampleRowIndex = 0;
+                            dynamicData = null;
+                            dynamicTemplateScenario = null;
+                            continue;
+                        }
+
+                        int rowCount = table.getTable().getRows().size() - 1; // exclude header row
+
+                        if (exampleRowIndex < rowCount) {
+                            // Use getExampleData which handles type hints (columns ending with !)
+                            Map<String, Object> exampleData = table.getTable().getExampleData(exampleRowIndex);
+                            // Raw cell text is used for <placeholder> substitution: for !-suffixed
+                            // (EVALUATED) columns the cell is a JS expression source, so splicing it
+                            // verbatim keeps strings quoted and inline JSON valid in a match RHS.
+                            Map<String, String> rawData = table.getTable().getRawExampleData(exampleRowIndex);
+                            int exampleIndex = exampleRowIndex;
+                            exampleRowIndex++;
+
+                            // Create scenario from outline
+                            Scenario scenario = outline.toScenario(
+                                    null,
+                                    exampleIndex,
+                                    table.getLine(),
+                                    table.getTags()
+                            );
+                            scenario.setExampleData(exampleData);
+
+                            // Substitute placeholders in steps and name
+                            for (String key : exampleData.keySet()) {
+                                String resolved = rawData.get(key);
+                                if (resolved == null) {
+                                    resolved = "";
+                                }
+                                scenario.replace("<" + key + ">", resolved);
+                                scenario.replace("${" + key + "}", resolved);
+                            }
+
+                            // Check if scenario should be selected
+                            if (shouldSelect(scenario)) {
+                                nextScenario = scenario;
+                                return;
+                            }
+                            continue;
+                        }
+
+                        // Move to next examples table
+                        exampleTableIndex++;
+                        exampleRowIndex = 0;
+                    }
+
+                    // Move to next section
+                    sectionIndex++;
+                    exampleTableIndex = 0;
+                    exampleRowIndex = 0;
+
+                } else {
+                    Scenario scenario = section.getScenario();
+                    sectionIndex++;
+
+                    // Skip @setup scenarios - they're only run via karate.setup(),
+                    // unless this feature was called with an explicit selector that
+                    // targets them, e.g. `call read('@setup')` or call-by-line. The
+                    // selector is validated below in shouldSelect().
+                    boolean explicitlyTargeted = callTagSelector != null
+                            || (callLineFilters != null && !callLineFilters.isEmpty());
+                    if (scenario.isSetup() && !explicitlyTargeted) {
+                        continue;
+                    }
+
+                    if (shouldSelect(scenario)) {
+                        nextScenario = scenario;
+                        return;
+                    }
+                }
+            }
+        }
+
+        @SuppressWarnings("unchecked")
+        private boolean processDynamicData() {
+            while (exampleRowIndex < dynamicData.size()) {
+                Object item = dynamicData.get(exampleRowIndex);
+                int rowIndex = exampleRowIndex;
+                exampleRowIndex++;
+
+                if (item instanceof Map) {
+                    Map<String, Object> exampleData = (Map<String, Object>) item;
+
+                    // Create a copy of the template scenario for this row
+                    Scenario scenario = dynamicTemplateScenario.copy(rowIndex);
+                    scenario.setExampleData(exampleData);
+
+                    // Substitute placeholders in steps and name. Object/array column
+                    // values are spliced as JSON (not Java's Map.toString() `{k=v}`,
+                    // which is not valid JSON/JS) so the result parses in a step body
+                    // and inner string values stay quoted; scalars keep their plain
+                    // string form. stringifyStrict does not escape angle brackets, so
+                    // embedded <token>s survive for a later `replace` step.
+                    for (String key : exampleData.keySet()) {
+                        String resolved = Json.stringifyStrict(exampleData.get(key));
+                        scenario.replace("<" + key + ">", resolved);
+                        scenario.replace("${" + key + "}", resolved);
+                    }
+
+                    if (shouldSelect(scenario)) {
+                        nextScenario = scenario;
+                        return true;
+                    }
+                }
+                // Skip non-map items
+            }
+
+            // Done with this dynamic data
+            dynamicData = null;
+            dynamicTemplateScenario = null;
+            return false;
+        }
+
+        @SuppressWarnings("unchecked")
+        private List<?> evaluateDynamicExpression(Scenario templateScenario) {
+            try {
+                // Create a temporary ScenarioRuntime to evaluate the expression
+                ScenarioRuntime sr = new ScenarioRuntime(FeatureRuntime.this, templateScenario);
+                sr.setSkipBackground(true);
+
+                // Evaluate the dynamic expression in this runtime's engine. This runtime never
+                // goes through call(), so its client is released here or not at all — one leak
+                // per dynamic-outline feature, every run.
+                String expression = templateScenario.getDynamicExpression();
+                Object result;
+                try {
+                    result = sr.eval(expression);
+                } finally {
+                    sr.releaseHttpClient();
+                }
+
+                if (result instanceof List) {
+                    return (List<?>) result;
+                } else if (result instanceof JavaCallable) {
+                    // Generator function - call repeatedly until null/non-map
+                    return evaluateGeneratorFunction(result);
+                } else {
+                    // Expression didn't return a list or function - error
+                    throw new RuntimeException("Dynamic expression must return a list or function: " + expression + ", got: " + (result != null ? result.getClass().getName() : "null"));
+                }
+            } catch (Exception e) {
+                throw new RuntimeException("Failed to evaluate dynamic expression: " + templateScenario.getDynamicExpression()
+                        + " - " + e.getMessage(), e);
+            }
+        }
+
+        /**
+         * Evaluates a generator function by calling it repeatedly with incrementing index
+         * until it returns null or a non-Map value.
+         */
+        @SuppressWarnings("unchecked")
+        private List<Map<String, Object>> evaluateGeneratorFunction(Object function) {
+            List<Map<String, Object>> results = new ArrayList<>();
+            JavaCallable callable = (JavaCallable) function;
+            int index = 0;
+
+            while (true) {
+                Object rowValue;
+                try {
+                    // JsCallable.call() works with null context (uses declared context internally)
+                    rowValue = callable.call(null, index);
+                } catch (Exception e) {
+                    logger.warn("Generator function threw exception at index {}: {}", index, e.getMessage());
+                    break;
+                }
+
+                if (rowValue == null) {
+                    // null signals end of iteration
+                    break;
+                }
+
+                if (rowValue instanceof Map) {
+                    results.add((Map<String, Object>) rowValue);
+                } else {
+                    // Non-map value signals end of iteration
+                    logger.debug("Generator function returned non-map at index {}, stopping: {}", index, rowValue);
+                    break;
+                }
+
+                index++;
+            }
+
+            return results;
+        }
+
+        private boolean shouldSelect(Scenario scenario) {
+            // Check line filter first (if specified).
+            // Two sources, in priority order:
+            //   1. Per-call line filter from call('file.feature:N') — always
+            //      applies (this IS the call; the caller asked for this scenario).
+            //   2. Suite-level :LINE filter — only at the top level. A called
+            //      feature must run its own scenarios regardless of the suite-level
+            //      filter (mirrors v1 behavior; same bypass as `scenarioName` below).
+            Set<Integer> lines = null;
+            boolean isCallScoped = false;
+            if (callLineFilters != null && !callLineFilters.isEmpty()) {
+                lines = callLineFilters;
+                isCallScoped = true;
+            } else if (suite != null && !suite.lineFilters.isEmpty() && isTopLevel()) {
+                String featureUri = feature.getResource().getUri().toString();
+                lines = suite.lineFilters.get(featureUri);
+            }
+            if (lines != null && !lines.isEmpty()) {
+                if (!matchesLineFilter(scenario, lines)) {
+                    return false;
+                }
+                // Suite-scoped only: intersect with scenarioName when both are set.
+                // Per-call scope: the caller explicitly asked for these lines —
+                // the top-level scenarioName filter does not apply inside a call.
+                if (!isCallScoped && suite != null && suite.scenarioName != null
+                        && !matchesScenarioName(scenario)) {
+                    return false;
+                }
+                return true;
+            }
+
+            // Apply call-level tag filter if specified (takes precedence)
+            // This allows calling specific @ignore scenarios by tag
+            if (callTagSelector != null) {
+                return matchesCallTag(scenario, callTagSelector);
+            }
+
+            // For called features, don't apply user-facing filters
+            // (@ignore, @env, scenarioName). These only exclude scenarios from
+            // top-level runner selection. Without this, a called
+            // feature's anonymous Scenario: would be filtered out whenever a
+            // top-level scenarioName filter is active, causing variable-propagation
+            // from Background `call read(...)` to silently break.
+            if (isCalled()) {
+                return true;
+            }
+
+            // Scenario name filter (IDE plugins use this as a stable, line-independent key).
+            // Same bypass semantics as line filter — if the user asked for a specific
+            // scenario by name, @ignore / @env should not stop it. Only applies at
+            // the top level (the `isCalled()` branch above handles called features).
+            if (suite != null && suite.scenarioName != null) {
+                return matchesScenarioName(scenario);
+            }
+
+            // Skip tag filtering if configured (run all scenarios regardless of @env, @ignore)
+            if (suite != null && suite.isSkipTagFiltering()) {
+                return true;
+            }
+
+            // Fast path: Suite's pre-filter (Suite.allSectionsExcluded) may have
+            // already evaluated and cached the result on this scenario. Only populated
+            // for persistent (non-outline) scenarios — outline rows are generated
+            // fresh per iteration and fall through to full evaluation below.
+            Boolean cached = scenario.getSelected();
+            if (cached != null) {
+                return cached;
+            }
+            // Use TagSelector for suite-level filtering
+            // This handles @ignore, @setup, @env, and complex expressions like anyOf(), allOf()
+            List<Tag> tags = scenario.getTagsEffective();
+            TagSelector selector = new TagSelector(tags);
+            String karateEnv = suite != null ? suite.env : null;
+            return selector.evaluate(suite != null ? suite.tagSelector : null, karateEnv);
+        }
+
+        /**
+         * Check if a scenario matches the line filter.
+         * For regular scenarios: line must match the scenario's line or be within its range.
+         * For outline examples: line must match the example row's line, the outline's line,
+         * or any line within the scenario's step range.
+         */
+        private boolean matchesLineFilter(Scenario scenario, Set<Integer> lines) {
+            int scenarioLine = scenario.getLine();
+
+            // Direct match on scenario line (for regular scenarios this is the Scenario: line,
+            // for outline examples this is the Examples: table line)
+            if (lines.contains(scenarioLine)) {
+                return true;
+            }
+
+            // For outline examples, also check the Scenario Outline declaration line
+            // and the specific example row line
+            if (scenario.isOutlineExample() && scenario.getSection() != null
+                    && scenario.getSection().isOutline()) {
+                ScenarioOutline outline = scenario.getSection().getScenarioOutline();
+                if (lines.contains(outline.getLine())) {
+                    return true;
+                }
+                // Check if line matches this specific example row's line number
+                for (ExamplesTable exTable : outline.getExamplesTables()) {
+                    if (exTable.getLine() == scenarioLine) {
+                        Table t = exTable.getTable();
+                        int dataRowIndex = scenario.getExampleIndex() + 1; // +1 to skip header row
+                        if (dataRowIndex < t.getRows().size()) {
+                            int rowLine = t.getLineNumberForRow(dataRowIndex);
+                            if (lines.contains(rowLine)) {
+                                return true;
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+
+            // Check if any line is within the scenario's step range
+            // This handles clicking on a step within a scenario
+            if (scenario.getSteps() != null && !scenario.getSteps().isEmpty()) {
+                int firstStepLine = scenario.getSteps().get(0).getLine();
+                int lastStepLine = scenario.getSteps().get(scenario.getSteps().size() - 1).getLine();
+                int rangeStart = Math.min(scenarioLine, firstStepLine);
+
+                for (int line : lines) {
+                    if (line >= rangeStart && line <= lastStepLine) {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        /**
+         * Exact (whitespace-trimmed) match against the suite-level scenario name filter.
+         * Null or empty scenario names never match. Duplicate names run all matches —
+         * consistent with how a tag filter selects every scenario carrying the tag.
+         * For Scenario Outlines every generated row shares the outline's name, so a
+         * name match runs all rows; row-level targeting still uses the {@code :LINE} suffix.
+         */
+        private boolean matchesScenarioName(Scenario scenario) {
+            String name = scenario.getName();
+            if (name == null) {
+                return false;
+            }
+            return name.trim().equals(suite.scenarioName);
+        }
+
+        /**
+         * Simple tag matching for call-by-tag syntax (e.g., call read('file.feature@tagname')).
+         * Supports: @tagname, @key=value, ~@tagname (negation). `@name=foo` is just the
+         * @key=value form with `name` as a convention — there is no built-in `name` tag.
+         * Does NOT filter by @ignore - allows calling @ignore scenarios explicitly.
+         */
+        private boolean matchesCallTag(Scenario scenario, String tagSelector) {
+            List<Tag> tags = scenario.getTagsEffective();
+            if (tags.isEmpty()) {
+                return !tagSelector.startsWith("@");
+            }
+
+            // Check if it's a negation
+            if (tagSelector.startsWith("~")) {
+                String required = tagSelector.substring(1);
+                for (Tag tag : tags) {
+                    if (matchesTag(tag, required)) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+
+            // Parse the selector (remove leading @)
+            String selector = tagSelector.startsWith("@") ? tagSelector.substring(1) : tagSelector;
+
+            // Check if any tag matches
+            for (Tag tag : tags) {
+                if (matchesTag(tag, selector)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        /**
+         * Check if a tag matches a selector.
+         * Selector can be: "tagname" or "key=value" (generic — `name` is not special).
+         */
+        private boolean matchesTag(Tag tag, String selector) {
+            int eqPos = selector.indexOf('=');
+            if (eqPos == -1) {
+                // Simple tag match: @tagname
+                return tag.getName().equals(selector);
+            } else {
+                // Value tag match: @name=value
+                String selectorName = selector.substring(0, eqPos);
+                String selectorValue = selector.substring(eqPos + 1);
+                return tag.getName().equals(selectorName) && tag.getValues().contains(selectorValue);
+            }
+        }
+    }
+
+    // ========== Resource Resolution ==========
+
+    public Resource resolve(String path) {
+        // V1 compatibility: handle 'this:' prefix for relative paths
+        if (path.startsWith("this:")) {
+            path = path.substring(5);  // Remove 'this:' prefix
+        }
+        return feature.getResource().resolve(path);
+    }
+
+    // ========== Accessors ==========
+
+    public Suite getSuite() {
+        return suite;
+    }
+
+    public Feature getFeature() {
+        return feature;
+    }
+
+    public FeatureRuntime getCaller() {
+        return caller;
+    }
+
+    public ScenarioRuntime getCallerScenario() {
+        return callerScenario;
+    }
+
+    public boolean isSharedScope() {
+        return sharedScope;
+    }
+
+    public Map<String, Object> getCallArg() {
+        return callArg;
+    }
+
+    public int getLoopIndex() {
+        return loopIndex;
+    }
+
+    public void setLoopIndex(int loopIndex) {
+        this.loopIndex = loopIndex;
+        // the result is built in the constructor, before the caller knows this is a loop call;
+        // the report writers and the gatling replay read the index from the result, not from here
+        result.setLoopIndex(loopIndex);
+    }
+
+    public ScenarioRuntime getLastExecuted() {
+        return lastExecuted;
+    }
+
+    public FeatureResult getResult() {
+        return result;
+    }
+
+    // callonce/setuponce is scoped to the FEATURE INSTANCE, not the feature FILE. The
+    // Suite-level, URI-keyed store is used only for top-level features — that is where a
+    // feature's parallel scenarios share this one FeatureRuntime, and where karate-gatling
+    // shares results across virtual-user runs of the same feature (Runner passes a shared
+    // store; each run is top-level). A CALLED feature (caller != null) gets a fresh
+    // FeatureRuntime per `call`/`callonce read()` invocation and must use the instance-local
+    // cache — otherwise a `callonce` inside a feature invoked repeatedly (e.g. once per
+    // Scenario Outline row) would be frozen to the first invocation's caller scope. This
+    // mirrors v1, which used the per-FeatureRuntime cache except in gatling perfMode.
+    public ReentrantLock getCallOnceLock() {
+        return (suite != null && isTopLevel()) ? suite.getCallOnceLock(featureKey()) : callOnceLock;
+    }
+
+    public Map<String, Object> getCallOnceCache() {
+        return (suite != null && isTopLevel()) ? suite.getCallOnceCache(featureKey()) : CALLONCE_CACHE_LOCAL;
+    }
+
+    public Map<String, Object> getSetupOnceCache() {
+        return (suite != null && isTopLevel()) ? suite.getSetupOnceCache(featureKey()) : SETUPONCE_CACHE_LOCAL;
+    }
+
+    private String featureKey() {
+        Resource resource = feature.getResource();
+        java.net.URI uri = resource.getUri();
+        // getUri() is null for in-memory / synthetically-loaded features (and some
+        // classpath resources); fall back to the always-populated prefixed path so
+        // callonce/setuponce cache scoping still works instead of NPE-ing.
+        return uri != null ? uri.toString() : resource.getPrefixedPath();
+    }
+
+}

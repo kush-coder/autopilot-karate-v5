@@ -1,0 +1,403 @@
+/*
+ * The MIT License
+ *
+ * Copyright 2025 Karate Labs Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package io.karatelabs.js;
+
+import io.karatelabs.parser.Node;
+import io.karatelabs.parser.ParserException;
+
+import java.net.URLDecoder;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.function.Consumer;
+
+/**
+ * Engine-state holder. Sits above the script-level {@link CoreContext} as the
+ * terminal link in every name-resolution chain — when a {@link CoreContext}
+ * reaches the end of its parent walk without finding a binding, it falls
+ * through to {@link #hasKey} / {@link #get} here to resolve built-ins
+ * (Math, JSON, …) lazily and to read the unified bindings store.
+ * <p>
+ * Shares the engine's single {@link Bindings} instance with every CoreContext
+ * that runs through this engine — top-level {@code var}, implicit globals,
+ * lazy-cached built-ins, and {@link Engine#putRootBinding}-injected resources
+ * all live there. The {@code hidden} flag on individual entries keeps the
+ * latter two out of {@link Engine#getBindings()} inspection.
+ */
+class ContextRoot implements Context {
+
+    static final JsBuiltinMethod PARSE_INT = new JsBuiltinMethod("parseInt", 2, (ctx, args) -> {
+        if (args.length == 0) return Double.NaN;
+        int radix = args.length > 1 && args[1] != Terms.UNDEFINED
+                ? Terms.objectToNumber(args[1]).intValue() : 0;
+        return Terms.parseInt(argToString(args[0]), radix);
+    });
+
+    static final JsBuiltinMethod PARSE_FLOAT = new JsBuiltinMethod("parseFloat", 1, (ctx, args) ->
+            args.length == 0 ? Double.NaN : Terms.parseFloat(argToString(args[0]), false));
+
+    // A Number arg is ToString'd per spec before parsing, so it has to take the
+    // spec form -- Java's would feed "1.0E21" to a parser that only knows 'e'.
+    private static String argToString(Object arg) {
+        return arg instanceof Number n ? Terms.numberToString(n) : arg + "";
+    }
+
+    private final Engine engine;
+
+    /**
+     * Single shared bindings store — same instance as {@link Engine#bindings}.
+     * Held here so engine internals can write through {@code root.bindings}
+     * symmetrically with how script-level CoreContexts use {@code bindings}.
+     */
+    final BindingsStore bindings;
+
+    /**
+     * Top-level {@code this} — globalThis stand-in. Reflects built-in globals
+     * + user-visible bindings as own properties (so
+     * {@code Object.getOwnPropertyDescriptor(this, "Math")} etc. work). Child
+     * contexts inherit this until a function call rebinds {@code thisObject}.
+     */
+    final Object thisObject;
+
+    // `performance` is lazily allocated, so its origin has to be stamped here
+    // instead — timings must be relative to engine creation, not first read
+    private final long nanoOrigin = System.nanoTime();
+    private final double timeOrigin = System.currentTimeMillis();
+
+    Consumer<String> onConsoleLog;
+
+    ContextListener listener;
+    ExternalBridge bridge;
+    RunInterceptor<?> interceptor;
+    DebugPointFactory<?> pointFactory;
+
+    short evalId;
+
+    ContextRoot(Engine engine) {
+        this.engine = engine;
+        this.bindings = engine.bindings;
+        this.thisObject = new JsGlobalThis(this);
+    }
+
+    void setOnConsoleLog(Consumer<String> onConsoleLog) {
+        this.onConsoleLog = onConsoleLog;
+    }
+
+    /**
+     * Terminal step of {@link CoreContext#resolve} — script-level CoreContext
+     * falls through here after exhausting its outer walk. Returns the
+     * existing Slot, or lazily initializes a built-in (Math, JSON, etc.)
+     * and returns its newly-cached Slot. Returns {@code null} if the name
+     * is neither user-bound nor a recognized built-in.
+     */
+    BindingSlot resolveOrInit(String key) {
+        BindingSlot s = bindings.getSlot(key);
+        if (s != null) {
+            return s;
+        }
+        Object global = initGlobal(key);
+        if (global != null) {
+            // Cache as hidden so Engine.getBindings() inspection doesn't
+            // surface lazy-loaded built-ins.
+            bindings.putHidden(key, global);
+            return bindings.getSlot(key);
+        }
+        return null;
+    }
+
+    /**
+     * Lookup-chain entry for callers that want a value (not a Slot) — wraps
+     * {@link #resolveOrInit} with JsLazy-unwrap and undefined fallback.
+     */
+    Object get(String key) {
+        BindingSlot s = resolveOrInit(key);
+        if (s == null) {
+            return Terms.UNDEFINED;
+        }
+        Object v = s.value;
+        return v instanceof JsLazy lz ? lz.get() : v;
+    }
+
+    /**
+     * True if {@code key} resolves at the global level — either it's already
+     * in the unified store, or it's a recognized built-in name that
+     * {@link #initGlobal} can lazily produce. Side-effect-free: does NOT
+     * trigger lazy init.
+     */
+    boolean hasKey(String key) {
+        if (bindings.hasMember(key)) {
+            return true;
+        }
+        return canInitGlobal(key);
+    }
+
+    private static boolean canInitGlobal(String key) {
+        return switch (key) {
+            case "console", "parseInt", "parseFloat", "encodeURIComponent", "decodeURIComponent",
+                 "encodeURI", "decodeURI", "undefined", "Array", "Date", "Error", "Function",
+                 "Infinity", "Java", "JSON", "Map", "Math", "NaN", "Number", "BigInt", "Boolean",
+                 "Object", "Promise", "RegExp", "Set", "String", "TypeError", "ReferenceError", "RangeError",
+                 "SyntaxError", "URIError", "EvalError", "AggregateError", "WeakMap", "WeakSet",
+                 "TextEncoder", "TextDecoder", "Uint8Array", "globalThis",
+                 "setTimeout", "clearTimeout", "structuredClone", "performance",
+                 "isNaN", "isFinite", "eval", "Symbol", "Reflect" -> true;
+            default -> false;
+        };
+    }
+
+    //=== Context interface =============================================================================================
+
+    @Override
+    public Engine getEngine() {
+        return engine;
+    }
+
+    @Override
+    public Context getParent() {
+        return null;
+    }
+
+    @Override
+    public ContextScope getScope() {
+        return ContextScope.ROOT;
+    }
+
+    @Override
+    public int getDepth() {
+        return -1;
+    }
+
+    @Override
+    public Node getNode() {
+        return null;
+    }
+
+    @Override
+    public String getPath() {
+        return "ROOT";
+    }
+
+    @Override
+    public int getIteration() {
+        return -1;
+    }
+
+    @Override
+    public Object getThisObject() {
+        return thisObject;
+    }
+
+    @Override
+    public CallInfo getCallInfo() {
+        return null;
+    }
+
+    @Override
+    public Object[] getCallArgs() {
+        return null;
+    }
+
+    @Override
+    public Object getReturnValue() {
+        return null;
+    }
+
+    @Override
+    public Object getErrorThrown() {
+        return null;
+    }
+
+    @Override
+    public ExitType getExitType() {
+        return null;
+    }
+
+    @Override
+    public String toString() {
+        return "ROOT";
+    }
+
+    //=== Built-in globals ==============================================================================================
+
+    // This Engine's built-in constructor instances (Object, Array, …,
+    // AggregateError). Per-Engine — NOT JVM singletons — so user mutations,
+    // tombstones, and freezes on one engine's constructors can be neither
+    // observed nor destroyed by another engine running concurrently. Lazily
+    // created per name; identity is stable within the Engine so
+    // `Array.prototype.constructor === Array` holds. The prototype objects
+    // they expose (`Array.prototype` etc.) remain JVM-wide singletons.
+    private Map<String, JsFunction> builtinConstructors;
+
+    JsFunction builtinConstructor(String name) {
+        if (builtinConstructors == null) {
+            builtinConstructors = new HashMap<>();
+        }
+        JsFunction c = builtinConstructors.get(name);
+        if (c == null) {
+            c = switch (name) {
+                case "Array" -> new JsArrayConstructor();
+                case "BigInt" -> new JsBigIntConstructor();
+                case "Boolean" -> new JsBooleanConstructor();
+                case "Date" -> new JsDateConstructor();
+                case "Function" -> new JsFunctionConstructor();
+                case "Map" -> new JsMapConstructor();
+                case "Number" -> new JsNumberConstructor();
+                case "Object" -> new JsObjectConstructor();
+                case "Promise" -> new JsPromiseConstructor();
+                case "RegExp" -> new JsRegexConstructor();
+                case "Set" -> new JsSetConstructor();
+                case "String" -> new JsStringConstructor();
+                case "WeakMap" -> new JsWeakMapConstructor();
+                case "WeakSet" -> new JsWeakSetConstructor();
+                case "Error" -> new JsErrorConstructor(JsErrorPrototype.ERROR, 1);
+                case "TypeError" -> new JsErrorConstructor(JsErrorPrototype.TYPE_ERROR, 1);
+                case "RangeError" -> new JsErrorConstructor(JsErrorPrototype.RANGE_ERROR, 1);
+                case "SyntaxError" -> new JsErrorConstructor(JsErrorPrototype.SYNTAX_ERROR, 1);
+                case "ReferenceError" -> new JsErrorConstructor(JsErrorPrototype.REFERENCE_ERROR, 1);
+                case "URIError" -> new JsErrorConstructor(JsErrorPrototype.URI_ERROR, 1);
+                case "EvalError" -> new JsErrorConstructor(JsErrorPrototype.EVAL_ERROR, 1);
+                case "AggregateError" -> new JsErrorConstructor(JsErrorPrototype.AGGREGATE_ERROR, 2);
+                default -> null;
+            };
+            if (c != null) {
+                builtinConstructors.put(name, c);
+            }
+        }
+        return c;
+    }
+
+    private Object initGlobal(String key) {
+        return switch (key) {
+            case "console" -> new JsConsole(this);
+            // Shared with Number.parseInt / Number.parseFloat so spec identity
+            // (Number.parseInt === parseInt) holds. Wrapped via JsBuiltinMethod
+            // so .name / .length are observable per spec and isConstructor returns false.
+            case "parseInt" -> PARSE_INT;
+            case "parseFloat" -> PARSE_FLOAT;
+            case "isNaN" -> (JsInvokable) args -> {
+                if (args.length == 0 || args[0] == null || args[0] == Terms.UNDEFINED) return true;
+                Number n = Terms.objectToNumber(args[0]);
+                return n == null || Double.isNaN(n.doubleValue());
+            };
+            case "isFinite" -> (JsInvokable) args -> {
+                if (args.length == 0 || args[0] == null || args[0] == Terms.UNDEFINED) return false;
+                Number n = Terms.objectToNumber(args[0]);
+                if (n == null) return false;
+                double d = n.doubleValue();
+                return !Double.isNaN(d) && !Double.isInfinite(d);
+            };
+            case "encodeURIComponent" -> (JsInvokable) args -> {
+                String encoded = URLEncoder.encode(Terms.toStringCoerce(args[0], null), StandardCharsets.UTF_8);
+                return encoded.replace("+", "%20")
+                        .replace("%21", "!").replace("%27", "'").replace("%28", "(")
+                        .replace("%29", ")").replace("%7E", "~").replace("%2A", "*");
+            };
+            case "decodeURIComponent" -> (JsInvokable) args ->
+                    URLDecoder.decode(Terms.toStringCoerce(args[0], null), StandardCharsets.UTF_8);
+            case "encodeURI" -> (JsInvokable) args -> {
+                String encoded = URLEncoder.encode(Terms.toStringCoerce(args[0], null), StandardCharsets.UTF_8);
+                return encoded.replace("+", "%20")
+                        .replace("%21", "!").replace("%23", "#").replace("%24", "$")
+                        .replace("%26", "&").replace("%27", "'").replace("%28", "(")
+                        .replace("%29", ")").replace("%2A", "*").replace("%2B", "+")
+                        .replace("%2C", ",").replace("%2F", "/").replace("%3A", ":")
+                        .replace("%3B", ";").replace("%3D", "=").replace("%3F", "?")
+                        .replace("%40", "@").replace("%7E", "~");
+            };
+            case "decodeURI" -> (JsInvokable) args ->
+                    URLDecoder.decode(Terms.toStringCoerce(args[0], null), StandardCharsets.UTF_8);
+            case "undefined" -> Terms.UNDEFINED;
+            case "eval" -> (JsInvokable) args -> {
+                if (args.length == 0) return Terms.UNDEFINED;
+                Object src = args[0];
+                // per ES spec: non-string arguments are returned unchanged
+                if (!(src instanceof String s)) {
+                    return src;
+                }
+                // indirect-eval semantics: evaluate in the global (root) scope
+                try {
+                    return engine.evalRaw(s);
+                } catch (ParserException pe) {
+                    // per spec, eval-code that fails to parse throws a JS
+                    // SyntaxError the caller can catch — a bare ParserException
+                    // would escape as a Java exception no JS catch can see
+                    throw JsErrorException.syntaxError(pe.getMessage());
+                }
+            };
+            case "Array", "Date", "Function", "Error", "Map", "Number", "BigInt", "Boolean",
+                 "Object", "Promise", "RegExp", "Set", "String", "TypeError", "ReferenceError", "RangeError",
+                 "SyntaxError", "URIError", "EvalError", "AggregateError",
+                 "WeakMap", "WeakSet" -> builtinConstructor(key);
+            // the top-level `this` object, under its spec name
+            case "globalThis" -> thisObject;
+            case "setTimeout" -> new JsBuiltinMethod("setTimeout", 2, AsyncSupport::setTimeout);
+            case "clearTimeout" -> new JsBuiltinMethod("clearTimeout", 1, AsyncSupport::clearTimeout);
+            case "Infinity" -> Double.POSITIVE_INFINITY;
+            case "Java" -> new JsJava(bridge);
+            case "JSON" -> new JsJson();
+            case "Math" -> new JsMath();
+            case "NaN" -> Double.NaN;
+            case "performance" -> new JsPerformance(nanoOrigin, timeOrigin);
+            case "structuredClone" -> new JsBuiltinMethod("structuredClone", 1, JsStructuredClone::call);
+            case "TextDecoder" -> new JsTextDecoder();
+            case "TextEncoder" -> new JsTextEncoder();
+            case "Uint8Array" -> new JsUint8Array(0);
+            // Minimal Reflect — only `construct` and `apply` are wired so the
+            // test262 isConstructor harness works. Full Reflect stays gated
+            // via the `feature: Reflect` skip in expectations.yaml.
+            case "Reflect" -> new JsReflect();
+            // Minimal Symbol: the well-known symbols are {@link JsSymbol} values over
+            // their spec keys ("@@iterator" etc.), so `arr[Symbol.iterator]` resolves
+            // to `arr["@@iterator"]`. Consumed by the engine: @@iterator
+            // (IterUtils.getIterator), @@toPrimitive (Terms.toPrimitive),
+            // @@toStringTag (JsObjectPrototype). The remainder are exposed so user
+            // code that *reads* them (e.g. `obj[Symbol.species]`) gets a stable key
+            // rather than undefined. No symbol registry (Symbol.for / keyFor) and no
+            // Symbol.prototype — tests needing those stay gated by `feature: Symbol`.
+            case "Symbol" -> {
+                JsObject sym = new SymbolStandIn();
+                for (String name : JsSymbol.WELL_KNOWN) {
+                    sym.putMember(name, new JsSymbol(JsSymbol.keyOf(name)));
+                }
+                yield sym;
+            }
+            default -> null;
+        };
+    }
+
+    /**
+     * The {@code Symbol} global itself — callable, so {@code Symbol(desc)} mints
+     * a fresh {@link JsSymbol} with a key of its own.
+     */
+    private static final class SymbolStandIn extends JsObject implements JsCallable {
+        @Override
+        public Object call(Context context, Object[] args) {
+            Object description = args.length == 0 ? Terms.UNDEFINED : args[0];
+            return JsSymbol.mint(description == Terms.UNDEFINED ? ""
+                    : Terms.toStringCoerce(description, context instanceof CoreContext cc ? cc : null));
+        }
+    }
+
+}

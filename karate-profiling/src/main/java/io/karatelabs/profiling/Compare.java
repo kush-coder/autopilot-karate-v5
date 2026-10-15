@@ -1,0 +1,638 @@
+/*
+ * The MIT License
+ *
+ * Copyright 2026 Karate Labs Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package io.karatelabs.profiling;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+
+/**
+ * Turns a set of parity run directories into the table behind docs/PROFILING.md §0's claims.
+ *
+ * <p><b>This exists because the alternative has already failed.</b> Every published parity number
+ * was scraped by hand, and commit "the stats scrape skipped a decimal cell and shifted every
+ * column" is what that cost on a matrix of eight runs. A matrix of twenty, taken on a machine
+ * nobody is watching, will fail the same way and less visibly. The arithmetic below is the
+ * arithmetic §10 documents; the point is that it now happens once, in a place that can be read and
+ * corrected, rather than once per analysis in a shell history nobody keeps.
+ *
+ * <p><b>Throughput comes from the mock, never from Gatling.</b> Gatling divides its request count
+ * by a duration rounded to whole seconds, which at these run lengths quantises the rate in steps of
+ * several percent — enough to render two arms a second apart as the same figure, which is exactly
+ * how the first matrix concluded the arms were identical. {@code MockStats.servedPerSecond} is the
+ * same requests over a nanosecond window.
+ *
+ * <p><b>What it will not do is decide anything.</b> Rows that fail a check are marked and kept, not
+ * dropped, and the spread is always printed next to the mean — a standard deviation larger than the
+ * effect is the finding, not an inconvenience to average away. Nothing here asserts, which is the
+ * same doctrine as the rest of the harness.
+ *
+ * <pre>
+ * etc/run.sh compare target/profiling/gatling-http-*
+ * </pre>
+ */
+public final class Compare {
+
+    private Compare() {
+    }
+
+    /** Requests each arm's client makes per iteration, and the users driving them, from the run. */
+    record Run(Path dir, String arm, int tierMillis, boolean tls, String variant, int bodyBytes,
+               boolean pooled, int users, long iterationsRequested,
+               long served, double servedPerSecond, double sleepMicrosMean, long peakInFlight,
+               long distinctPeerPorts, long ko, double injectorCores, double windowSeconds,
+               double p50, double p99, int cpus) {
+
+        /**
+         * What the two arms of a pair must agree on, beyond the latency tier.
+         *
+         * <p>A TLS matrix and a plaintext one at the same tier used to land in the same bucket and
+         * be averaged together, though the whole point of the TLS tier is that its numbers differ.
+         * Nothing in the output said so; the only thing standing between the operator and a wrong
+         * mean was keeping results in separate directories.
+         *
+         * <p><b>The variant is deliberately not in here.</b> An equivalence control is one control
+         * arm against one <i>ordinary</i> arm — {@code plain-fat} vs {@code karate}, or
+         * {@code plain} vs {@code karate-lean} — so requiring both arms to carry the same variant
+         * rejects precisely the pairing the control exists to make. That cost a bench run to find:
+         * the guard compiled, passed its unit test, and silently emptied both control tables. The
+         * variant belongs to the {@link Pair}, not to the arm — see {@link Pair#shape()}.
+         */
+        String armShape() {
+            return (tls ? "TLS" : "plaintext")
+                    + (bodyBytes > 0 ? ", " + bodyBytes + "-byte body" : "")
+                    // Density belongs here rather than on the pair: an 8-user run and a 32-user one
+                    // are different load points, and the plan schedules both at the same tier. They
+                    // used to PAIR with each other as well as bucket together.
+                    + ", " + users + "u";
+        }
+
+        /**
+         * Pooling is deliberately NOT in {@link #armShape()}.
+         *
+         * <p>{@code matrix.sh --pooled} gives the connection pool to the karate arm only, because
+         * the plain arm already keep-alives — so a pooled matrix is asymmetric by construction,
+         * exactly like an equivalence control. Requiring both arms to agree would refuse the very
+         * pairing the A/B exists to make, which is the bug this class already shipped once.
+         */
+        boolean pooledArm() {
+            return pooled;
+        }
+
+        /**
+         * The first load-bearing field this digest did not supply, or null if it is complete.
+         *
+         * <p><b>A -1 must never reach the arithmetic.</b> Digests predating {@code servedPerSecond}
+         * still carry a {@code "served"} key, so they parse far enough to look like parity runs and
+         * then contribute {@code -1} rates to every mean — which is precisely the silent-wrong-number
+         * failure this class exists to prevent, reproduced inside it. A run missing any of these is
+         * named and skipped rather than blended.
+         */
+        String missingField() {
+            if (servedPerSecond <= 0) {
+                return "servedPerSecond (digest predates the mock's own load-window clock)";
+            }
+            if (users <= 0) {
+                return "threads";
+            }
+            if (iterationsRequested <= 0) {
+                return "iterations (duration-bounded runs cannot be paired this way)";
+            }
+            if (served <= 0) {
+                return "served";
+            }
+            if (windowSeconds <= 0) {
+                return "loadWindowSeconds";
+            }
+            return null;
+        }
+
+        /**
+         * Gatling splits the requested total across users and rounds up, so the run is a multiple
+         * of the user count — the digest says so per run. Requests per iteration falls out of what
+         * the mock actually served over that, rather than being assumed to be two.
+         */
+        double requestsPerIteration() {
+            long actual = (long) (Math.ceil(iterationsRequested / (double) users) * users);
+            return actual <= 0 ? 0 : served / (double) actual;
+        }
+
+        /**
+         * Seconds one user spends on one iteration. A closed loop makes throughput exactly
+         * {@code users / iteration time}, so this inverts the measured rate back into the
+         * per-iteration serial time the comparison is actually about.
+         */
+        double iterationMillis() {
+            double rate = servedPerSecond / requestsPerIteration();   // iterations per second
+            return rate <= 0 ? 0 : users * 1000.0 / rate;
+        }
+    }
+
+    static int main(List<String> argv) {
+        // The js-* family is a different experiment — two builds of one engine on elapsed
+        // time, paired by explicit run tags — so it has its own comparator. A mixed argument
+        // list is refused: interleaving the two lanes in one table has no meaning.
+        List<Path> dirs = argv.stream().map(Path::of).toList();
+        long jsRuns = dirs.stream().filter(JsCompare::isJsRun).count();
+        if (jsRuns > 0) {
+            if (jsRuns < dirs.size()) {
+                System.err.println("[compare] " + jsRuns + " of " + dirs.size() + " runs are"
+                        + " js A/B runs — derive the js and parity tables in separate"
+                        + " invocations");
+                return 2;
+            }
+            return JsCompare.main(dirs);
+        }
+        List<Run> runs = new ArrayList<>();
+        for (String arg : argv) {
+            Path dir = Path.of(arg);
+            Run run = read(dir);
+            if (run == null) {
+                System.err.println("[compare] skipped (no parity data): " + dir.getFileName());
+                continue;
+            }
+            String missing = run.missingField();
+            if (missing != null) {
+                System.err.println("[compare] skipped (missing " + missing + "): " + dir.getFileName());
+                continue;
+            }
+            runs.add(run);
+        }
+        if (runs.size() < 2) {
+            System.err.println("[compare] need at least two parity runs, found " + runs.size());
+            return 2;
+        }
+        // Directory names carry a sortable timestamp, and run order is what pairs them.
+        runs.sort(Comparator.comparing(r -> r.dir().getFileName().toString()
+                .replaceAll(".*-(\\d{4}-\\d{2}-\\d{2}-\\d{6})$", "$1")));
+
+        // Keyed by tier AND shape. Same latency over TLS is not the same experiment as over
+        // plaintext, and an equivalence control is not an ordinary pair — bucketing on the tier
+        // alone averaged them together and printed one confident number for two experiments.
+        Map<String, List<Pair>> byTier = new LinkedHashMap<>();
+        List<String> warnings = new ArrayList<>();
+        java.util.Set<Path> paired = new java.util.HashSet<>();
+        for (int i = 0; i + 1 < runs.size(); i++) {
+            Run first = runs.get(i);
+            Run second = runs.get(i + 1);
+            if (first.arm().equals(second.arm())) {
+                warnings.add("consecutive " + first.arm() + " runs, not paired: "
+                        + first.dir().getFileName() + " then " + second.dir().getFileName());
+                continue;
+            }
+            if (first.tierMillis() != second.tierMillis()) {
+                warnings.add("tier changed mid-pair, not paired: " + first.dir().getFileName()
+                        + " (" + first.tierMillis() + "ms) then " + second.dir().getFileName()
+                        + " (" + second.tierMillis() + "ms)");
+                continue;
+            }
+            if (!first.armShape().equals(second.armShape())) {
+                warnings.add("transport changed mid-pair, not paired: " + first.dir().getFileName()
+                        + " (" + first.armShape() + ") then " + second.dir().getFileName()
+                        + " (" + second.armShape() + ")");
+                continue;
+            }
+            Run plain = first.arm().equals("plain") ? first : second;
+            Run karate = first.arm().equals("plain") ? second : first;
+            Pair pair = new Pair(plain, karate, first.arm().charAt(0) + "→" + second.arm().charAt(0));
+            if (pair.bothArmsAreControls()) {
+                warnings.add("both arms are equivalence controls, not paired: "
+                        + plain.dir().getFileName() + " and " + karate.dir().getFileName()
+                        + " — a control is measured against an ORDINARY arm, so this pair has no"
+                        + " reference and its difference means nothing");
+                continue;
+            }
+            byTier.computeIfAbsent(first.tierMillis() + " ms tier, " + pair.shape(),
+                            k -> new ArrayList<>())
+                    .add(pair);
+            paired.add(first.dir());
+            paired.add(second.dir());
+            i++;   // consumed both
+        }
+        // A run left over at the end pairs with nothing and would otherwise vanish without a word,
+        // against this class's own rule that nothing is dropped silently. An odd run count is
+        // usually an aborted sweep, and knowing which arm is unmatched is how you resume it.
+        for (Run run : runs) {
+            if (!paired.contains(run.dir())) {
+                warnings.add("no partner for " + run.dir().getFileName() + " (" + run.arm()
+                        + ", " + run.tierMillis() + "ms, " + run.armShape()
+                        + (run.variant().isEmpty() ? "" : ", " + run.variant()) + ")");
+            }
+        }
+
+        StringBuilder out = new StringBuilder();
+        for (Map.Entry<String, List<Pair>> tier : byTier.entrySet()) {
+            appendTier(out, tier.getKey(), tier.getValue());
+        }
+        for (String warning : warnings) {
+            out.append("\n> **unpaired** — ").append(warning).append("\n");
+        }
+        System.out.print(out);
+        // Nothing paired is a failure, not a quiet success. Readable runs that all end up
+        // unpaired — a mislabelled matrix, an aborted sweep, two arms that disagree on shape —
+        // used to print warnings and exit 0, which is exactly when automation should notice.
+        if (byTier.isEmpty()) {
+            System.err.println("[compare] no pairs formed from " + runs.size()
+                    + " readable runs — see the unpaired notes above");
+            return 1;
+        }
+        return 0;
+    }
+
+    record Pair(Run plain, Run karate, String order) {
+
+        /**
+         * Transport, plus the equivalence control this pair carries on ONE of its arms.
+         *
+         * <p>This is the bucketing key, and it has to live here rather than on the arm: a control
+         * pair is asymmetric by construction, so the variant describes the comparison, not either
+         * side of it. {@code fat} raises the plain arm to Karate's checks and {@code lean} lowers
+         * the Karate arm to plain's, and each has to be read against the ordinary pair at the same
+         * tier — which means they must be bucketed apart from it, and from each other.
+         */
+        String shape() {
+            String variant = plain.variant().isEmpty() ? karate.variant() : plain.variant();
+            return plain.armShape()
+                    + (variant.isEmpty() ? "" : ", " + variant + " control")
+                    // Asymmetric by design, so it describes the comparison rather than either side
+                    // — and a pooled matrix must not average with an unpooled one at the same tier,
+                    // which is precisely the A/B the plan runs.
+                    + (plain.pooledArm() || karate.pooledArm() ? ", pooled" : "");
+        }
+
+        /** Two controls have no ordinary reference between them, so their difference is unreadable. */
+        boolean bothArmsAreControls() {
+            return !plain.variant().isEmpty() && !karate.variant().isEmpty();
+        }
+
+        double deficitPercent() {
+            return plain.servedPerSecond() <= 0 ? 0
+                    : 100 * (plain.servedPerSecond() - karate.servedPerSecond()) / plain.servedPerSecond();
+        }
+
+        /** The window difference, per iteration. The conservative figure — see {@link #correctedMillis}. */
+        double addedMillis() {
+            return karate.iterationMillis() - plain.iterationMillis();
+        }
+
+        /**
+         * The injected sleep is a real {@code Thread.sleep} whose overshoot varies with load, and
+         * the mock reports what it actually took rather than the knob value. When it slept less on
+         * one arm, that arm was handed iteration time the other did not get. §10 found this running
+         * consistently in Karate's favour, which makes the uncorrected number the conservative one
+         * and this the honest upper end of the range.
+         */
+        double correctedMillis() {
+            double perIteration = karate.requestsPerIteration();
+            return addedMillis() + perIteration * (plain.sleepMicrosMean() - karate.sleepMicrosMean()) / 1000.0;
+        }
+    }
+
+    private static void appendTier(StringBuilder out, String tier, List<Pair> pairs) {
+        double iteration = pairs.isEmpty() ? 0 : pairs.get(0).plain().iterationMillis();
+        out.append("\n#### ").append(tier).append(" — ")
+                .append(pairs.size()).append(pairs.size() == 1 ? " pair" : " pairs")
+                .append(", ~").append(fixed(iteration, 0)).append(" ms iteration\n\n");
+        out.append("| pair | order | plain req/s | karate req/s | karate deficit | added ms/iter | ")
+                .append("sleep-corrected | injector cores (p/k) | run directories |\n")
+                .append("|---:|---|---:|---:|---:|---:|---:|---:|---|\n");
+        List<Double> deficits = new ArrayList<>();
+        List<Double> added = new ArrayList<>();
+        List<Double> corrected = new ArrayList<>();
+        List<String> flags = new ArrayList<>();
+        for (int i = 0; i < pairs.size(); i++) {
+            Pair pair = pairs.get(i);
+            deficits.add(pair.deficitPercent());
+            added.add(pair.addedMillis());
+            corrected.add(pair.correctedMillis());
+            out.append("| ").append(i + 1).append(" | ").append(pair.order()).append(" | ")
+                    .append(fixed(pair.plain().servedPerSecond(), 1)).append(" | ")
+                    .append(fixed(pair.karate().servedPerSecond(), 1)).append(" | ")
+                    .append(fixed(pair.deficitPercent(), 1)).append("% | ")
+                    .append(signed(pair.addedMillis())).append(" | ")
+                    .append(signed(pair.correctedMillis())).append(" | ")
+                    .append(cores(pair.plain())).append(" / ").append(cores(pair.karate())).append(" | `")
+                    .append(pair.plain().dir().getFileName()).append("` / `")
+                    .append(pair.karate().dir().getFileName()).append("` |\n");
+            checks(pair, i + 1, flags);
+        }
+        out.append("| **mean** | | **").append(fixed(mean(collect(pairs, true)), 1)).append("** | **")
+                .append(fixed(mean(collect(pairs, false)), 1)).append("** | **")
+                .append(fixed(mean(deficits), 1)).append("%** | **").append(signed(mean(added)))
+                .append("** (sd ").append(fixed(sd(added), 2)).append(") | **")
+                .append(signed(mean(corrected))).append("** (sd ").append(fixed(sd(corrected), 2))
+                .append(") | | |\n");
+
+        out.append("\n**Resolution.** sd ").append(fixed(sd(added), 2))
+                .append(" ms against a mean of ").append(signed(mean(added))).append(" ms");
+        if (sd(added) >= Math.abs(mean(added))) {
+            out.append(" — **the spread is larger than the effect, so this tier is not resolved by ")
+                    .append(pairs.size()).append(" pairs.** Alternating the arm order keeps the mean ")
+                    .append("unbiased against noise that hits both arms, so more pairs do converge — ")
+                    .append("but as sd/sqrt(n), which is why a quieter machine beats a longer sweep: ")
+                    .append("resolving this mean to within half itself from here needs roughly ")
+                    .append(neededPairs(added)).append(" pairs.\n");
+        } else {
+            out.append(" — the effect is above the spread at this pair count.\n");
+        }
+        for (String flag : flags) {
+            out.append("\n> **check** — ").append(flag).append("\n");
+        }
+    }
+
+    /**
+     * The three acceptance checks §10 sets out, applied per pair rather than remembered. They are
+     * reported, never enforced: a flagged row stays in the table and in the mean, because deciding
+     * what a flag means is the reader's job and silently dropping a row is how a matrix comes to
+     * look cleaner than the runs behind it.
+     */
+    private static void checks(Pair pair, int index, List<String> flags) {
+        for (Run run : List.of(pair.plain(), pair.karate())) {
+            String who = "pair " + index + " " + run.arm();
+            if (run.ko() > 0) {
+                flags.add(who + ": **" + run.ko() + " ko** — failed requests leave the sample and take "
+                        + "the slow ones with them, so this row is not a slower point, it is a point "
+                        + "with holes.");
+            }
+            if (run.peakInFlight() != run.users()) {
+                flags.add(who + ": peak in-flight " + run.peakInFlight() + " against " + run.users()
+                        + " users — the mock was not holding what the injector offered.");
+            }
+            // The run's OWN core count, from its digest — not this machine's. Digests get copied
+            // off the machine that took them, and a 16-core cell analysed on a 10-core laptop
+            // would be judged against the wrong threshold in whichever direction hurts.
+            if (run.cpus() > 0 && run.injectorCores() > 0.8 * run.cpus()) {
+                flags.add(who + ": injector at " + fixed(run.injectorCores(), 1) + " of "
+                        + run.cpus() + " cores — near saturation, so this arm may be reporting the "
+                        + "machine rather than the client.");
+            }
+        }
+        if (pair.plain().served() != pair.karate().served()) {
+            flags.add("pair " + index + ": arms served different request counts ("
+                    + pair.plain().served() + " vs " + pair.karate().served() + ").");
+        }
+    }
+
+    private static String cores(Run run) {
+        return run.injectorCores() < 0 ? "?" : fixed(run.injectorCores(), 1);
+    }
+
+    private static List<Double> collect(List<Pair> pairs, boolean plain) {
+        List<Double> values = new ArrayList<>();
+        for (Pair pair : pairs) {
+            values.add(plain ? pair.plain().servedPerSecond() : pair.karate().servedPerSecond());
+        }
+        return values;
+    }
+
+    static double mean(List<Double> values) {
+        double sum = 0;
+        for (double value : values) {
+            sum += value;
+        }
+        return values.isEmpty() ? 0 : sum / values.size();
+    }
+
+    /**
+     * Pairs needed for the standard error of the mean to fall to half the mean — i.e. for the
+     * effect to be resolved to within 50% of itself.
+     *
+     * <p>Stated as arithmetic rather than as "it will never converge", which is what this tool
+     * said first and is false: the arm order alternates, so noise hitting both arms leaves the
+     * mean unbiased and averaging does work. It works as {@code sd/sqrt(n)} though, which is the
+     * real argument for a quiet machine — halving the noise is worth quadrupling the runs.
+     */
+    static long neededPairs(List<Double> values) {
+        double mean = Math.abs(mean(values));
+        double sd = sd(values);
+        if (mean <= 0 || sd <= 0) {
+            return -1;
+        }
+        return (long) Math.ceil(Math.pow(2 * sd / mean, 2));
+    }
+
+    /** Sample standard deviation — n-1, because these are pairs drawn from a process, not a census. */
+    static double sd(List<Double> values) {
+        if (values.size() < 2) {
+            return 0;
+        }
+        double mean = mean(values);
+        double sum = 0;
+        for (double value : values) {
+            sum += (value - mean) * (value - mean);
+        }
+        return Math.sqrt(sum / (values.size() - 1));
+    }
+
+    static String fixed(double value, int decimals) {
+        return String.format(Locale.ROOT, "%." + decimals + "f", value);
+    }
+
+    static String signed(double value) {
+        return String.format(Locale.ROOT, "%+.2f", value);
+    }
+
+    /**
+     * Everything comes out of {@code digest.md}, which is the artifact the disk-hygiene rule keeps:
+     * recordings and reports are deleted after every result, so a comparison that needed them could
+     * only ever be run once, immediately, by whoever took the runs.
+     */
+    private static Run read(Path dir) {
+        String digest = readString(dir.resolve("digest.md"));
+        if (digest == null) {
+            return null;
+        }
+        String mockStats = section(digest, "\"served\":");
+        if (mockStats == null) {
+            return null;
+        }
+        String name = dir.getFileName().toString();
+        String arm = name.contains("-karate-") ? "karate" : name.contains("-plain-") ? "plain" : null;
+        if (arm == null) {
+            return null;
+        }
+        String mockConfig = section(digest, "\"latencyMillis\":");
+        Run run = new Run(dir, arm,
+                (int) LoadProfile.mockNumber(mockConfig, "latencyMillis"),
+                mockConfig != null && mockConfig.contains("\"tls\":true"),
+                variant(name),
+                // Absent for every run before the body-size tier existed, and for every run that
+                // does not use it — which is the 34-byte default, so 0 reads as "the payload every
+                // published figure was measured against".
+                (int) Math.max(0, row(digest, "body bytes")),
+                digest.contains("| pooled | true |"),
+                (int) row(digest, "threads"),
+                (long) rowIterations(digest),
+                (long) LoadProfile.mockNumber(mockStats, "served"),
+                LoadProfile.mockNumber(mockStats, "servedPerSecond"),
+                LoadProfile.mockNumber(mockStats, "sleepMicrosMean"),
+                (long) LoadProfile.mockNumber(mockStats, "peakInFlight"),
+                (long) LoadProfile.mockNumber(mockStats, "distinctPeerPorts"),
+                ko(digest),
+                injectorCores(digest),
+                LoadProfile.mockNumber(mockStats, "loadWindowSeconds"),
+                percentile(digest, 0), percentile(digest, 3),
+                cpus(digest));
+        return run;
+    }
+
+    /**
+     * The equivalence-control suffix in a workload name, or "" for an ordinary run.
+     *
+     * <p>Taken from the directory name because nothing in the digest records it. That is the weaker
+     * half of this guard and worth saying plainly: a control run whose workload is renamed without
+     * one of these suffixes reads as ordinary again. The suffixes are the harness's own, so the
+     * coupling is at least inside one repository.
+     */
+    private static String variant(String name) {
+        for (String suffix : new String[]{"fat", "lean"}) {
+            if (name.contains("-" + suffix + "-")) {
+                return suffix;
+            }
+        }
+        return "";
+    }
+
+    /** Cores on the machine that took the run, out of "| os / cpus | Mac OS X aarch64 / 10 |". */
+    private static int cpus(String digest) {
+        int at = digest.indexOf("| os / cpus | ");
+        if (at < 0) {
+            return -1;
+        }
+        int to = digest.indexOf(" |", at + 14);
+        String cell = digest.substring(at + 14, to < 0 ? digest.length() : to);
+        int slash = cell.lastIndexOf('/');
+        try {
+            return slash < 0 ? -1 : Integer.parseInt(cell.substring(slash + 1).trim());
+        } catch (RuntimeException e) {
+            return -1;
+        }
+    }
+
+    /** The JSON object on the line carrying a given key — the digest fences several of them. */
+    private static String section(String digest, String key) {
+        int at = digest.indexOf(key);
+        if (at < 0) {
+            return null;
+        }
+        int open = digest.lastIndexOf('{', at);
+        int close = digest.indexOf('}', at);
+        return open < 0 || close < 0 ? null : digest.substring(open, close + 1);
+    }
+
+    private static double row(String digest, String label) {
+        int at = digest.indexOf("| " + label + " | ");
+        if (at < 0) {
+            return -1;
+        }
+        int from = at + label.length() + 5;
+        int to = digest.indexOf(" |", from);
+        try {
+            return Double.parseDouble(digest.substring(from, to).trim());
+        } catch (RuntimeException e) {
+            return -1;
+        }
+    }
+
+    private static double rowIterations(String digest) {
+        int at = digest.indexOf("| bound | iterations=");
+        if (at < 0) {
+            return -1;
+        }
+        int from = at + "| bound | iterations=".length();
+        int to = digest.indexOf(" |", from);
+        try {
+            return Double.parseDouble(digest.substring(from, to).trim());
+        } catch (RuntimeException e) {
+            return -1;
+        }
+    }
+
+    private static long ko(String digest) {
+        int at = digest.indexOf("| ok / ko | ");
+        if (at < 0) {
+            return -1;
+        }
+        int bold = digest.indexOf("**", at);
+        int end = digest.indexOf("**", bold + 2);
+        try {
+            return Long.parseLong(digest.substring(bold + 2, end).trim());
+        } catch (RuntimeException e) {
+            return -1;
+        }
+    }
+
+    /**
+     * The injector's row of the CPU headroom panel; -1 for a run taken before that panel existed.
+     *
+     * <p>Matched on a <b>prefix</b>, deliberately. This used to require the exact string
+     * {@code "| workload (the injector) |"}, and the day the panel started naming each row's own
+     * core count — {@code "workload (the injector, 16 cpus)"} — every table began printing
+     * {@code ?} for injector cores. That was the visible half. The invisible half is worse: the
+     * saturation check below gates on this value, so it silently stopped firing, and a run that
+     * pegged its injector would have been reported as a clean measurement.
+     */
+    private static double injectorCores(String digest) {
+        int at = digest.indexOf("| workload (the injector");
+        if (at < 0) {
+            return -1;
+        }
+        int bold = digest.indexOf("**", at);
+        int end = digest.indexOf("**", bold + 2);
+        try {
+            return Double.parseDouble(digest.substring(bold + 2, end).trim());
+        } catch (RuntimeException e) {
+            return -1;
+        }
+    }
+
+    private static double percentile(String digest, int index) {
+        int at = digest.indexOf("| p50 / p75 / p95 / p99 | ");
+        if (at < 0) {
+            return -1;
+        }
+        int from = at + "| p50 / p75 / p95 / p99 | ".length();
+        String[] parts = digest.substring(from, digest.indexOf(" |", from)).trim().split(" / ");
+        try {
+            return index < parts.length ? Double.parseDouble(parts[index].replace(" ms", "").trim()) : -1;
+        } catch (RuntimeException e) {
+            return -1;
+        }
+    }
+
+    private static String readString(Path path) {
+        try {
+            return Files.exists(path) ? Files.readString(path) : null;
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+}

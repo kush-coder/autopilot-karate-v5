@@ -1,0 +1,188 @@
+/*
+ * The MIT License
+ *
+ * Copyright 2025 Karate Labs Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package io.karatelabs;
+
+import io.karatelabs.cli.CleanCommand;
+import io.karatelabs.cli.CliCommandProvider;
+import io.karatelabs.cli.MockCommand;
+import io.karatelabs.cli.RunCommand;
+import io.karatelabs.output.Console;
+import io.karatelabs.core.Globals;
+import picocli.CommandLine;
+import picocli.CommandLine.Command;
+import picocli.CommandLine.Option;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.ServiceLoader;
+import java.util.Set;
+import java.util.concurrent.Callable;
+
+/**
+ * Main entry point for the Karate CLI.
+ * <p>
+ * Supports two usage modes:
+ * <ul>
+ *   <li>Subcommand mode: {@code karate run src/test/features}</li>
+ *   <li>Legacy mode: {@code karate src/test/features} (delegates to run)</li>
+ * </ul>
+ * <p>
+ * When invoked without arguments, looks for {@code karate.json} in the current directory.
+ */
+@Command(
+        name = "karate",
+        mixinStandardHelpOptions = true,
+        versionProvider = Main.VersionProvider.class,
+        description = "Karate API testing framework",
+        subcommands = {
+                RunCommand.class,
+                MockCommand.class,
+                CleanCommand.class
+        }
+)
+public class Main implements Callable<Integer> {
+
+    static class VersionProvider implements CommandLine.IVersionProvider {
+        @Override
+        public String[] getVersion() {
+            return new String[]{"Karate " + Globals.KARATE_VERSION};
+        }
+    }
+
+    @Option(
+            names = {"--no-color"},
+            description = "Disable colored output"
+    )
+    boolean noColor;
+
+    public static void main(String[] args) {
+        // --no-color is a top-level option, but defaultToRun() may prepend "run" and the
+        // subcommands (run/mock/clean) don't declare it — so apply it here and strip it
+        // before picocli parses, otherwise picocli rejects it as an unknown subcommand
+        // option ("Unknown option: '--no-color'").
+        if (hasNoColor(args)) {
+            Console.setColorsEnabled(false);
+            args = stripNoColor(args);
+        }
+
+        // Build the command tree (built-in subcommands + any ext-contributed ones).
+        CommandLine commandLine = buildCommandLine();
+
+        // Default to "run" subcommand when no subcommand is specified.
+        // This allows v1-style commands like: karate -g tests tests/
+        // to work the same as: karate run -g tests tests/
+        args = defaultToRun(args, commandLine.getSubcommands().keySet());
+
+        int exitCode = commandLine
+                .setCaseInsensitiveEnumValuesAllowed(true)
+                .execute(args);
+        System.exit(exitCode);
+    }
+
+    /**
+     * Build the {@code karate} {@link CommandLine} with its built-in subcommands plus any
+     * contributed by ext JARs on the classpath via {@link CliCommandProvider} (ServiceLoader).
+     * This is how {@code karate serve} (karate-max) plugs in without a core edit per command.
+     */
+    static CommandLine buildCommandLine() {
+        CommandLine commandLine = new CommandLine(new Main());
+        for (CliCommandProvider provider : ServiceLoader.load(CliCommandProvider.class, Main.class.getClassLoader())) {
+            for (Object command : provider.commands()) {
+                commandLine.addSubcommand(command);
+            }
+        }
+        return commandLine;
+    }
+
+    /** True if {@code --no-color} appears anywhere in the args. */
+    static boolean hasNoColor(String[] args) {
+        for (String arg : args) {
+            if ("--no-color".equals(arg)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Remove every {@code --no-color} token; the colour setting is applied separately. */
+    static String[] stripNoColor(String[] args) {
+        return Arrays.stream(args).filter(a -> !"--no-color".equals(a)).toArray(String[]::new);
+    }
+
+    /**
+     * If args don't start with a registered subcommand (or --help/-h/--version/-V),
+     * prepend "run" so PicoCLI routes through RunCommand with full flag parsing.
+     * {@code subcommands} is the live set of names (built-in + ext-contributed).
+     * <p>
+     * Top-level-only options such as {@code --no-color} must already be stripped by the
+     * caller — picocli would otherwise reject them against the RunCommand parser.
+     */
+    static String[] defaultToRun(String[] args, Set<String> subcommands) {
+        if (args.length == 0) {
+            return args;
+        }
+        String first = args[0];
+        // Don't interfere with help/version flags or known subcommands
+        if (first.equals("-h") || first.equals("--help")
+                || first.equals("-V") || first.equals("--version")
+                || subcommands.contains(first)) {
+            return args;
+        }
+        // Prepend "run" so all flags are parsed by RunCommand
+        String[] newArgs = new String[args.length + 1];
+        newArgs[0] = "run";
+        System.arraycopy(args, 0, newArgs, 1, args.length);
+        return newArgs;
+    }
+
+    @Override
+    public Integer call() {
+        // Handle color settings
+        if (noColor) {
+            Console.setColorsEnabled(false);
+        }
+
+        // No args at all - look for karate-pom.json in current directory
+        if (Files.exists(Path.of(RunCommand.DEFAULT_POM_FILE))) {
+            RunCommand runCommand = new RunCommand();
+            return runCommand.call();
+        }
+
+        // No subcommand, no args, no karate-pom.json - show help
+        CommandLine.usage(this, System.out);
+        return 0;
+    }
+
+    /**
+     * Parse command-line arguments without executing.
+     * Useful for integrating with other tools.
+     */
+    public static Main parse(String... args) {
+        Main main = new Main();
+        new CommandLine(main).parseArgs(args);
+        return main;
+    }
+
+}

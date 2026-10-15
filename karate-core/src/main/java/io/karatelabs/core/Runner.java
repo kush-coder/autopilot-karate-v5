@@ -1,0 +1,1247 @@
+/*
+ * The MIT License
+ *
+ * Copyright 2025 Karate Labs Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package io.karatelabs.core;
+
+import io.karatelabs.common.FileUtils;
+import io.karatelabs.common.Resource;
+import io.karatelabs.gherkin.Feature;
+import io.karatelabs.output.LogLevel;
+import io.karatelabs.output.ResultListener;
+
+import java.io.File;
+import java.lang.reflect.Method;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import org.slf4j.Logger;
+
+/**
+ * Main entry point for running Karate tests programmatically.
+ * <p>
+ * Example usage:
+ * <pre>
+ * SuiteResult result = Runner.path("src/test/resources")
+ *     .tags("@smoke")
+ *     .karateEnv("dev")
+ *     .parallel(5);
+ * </pre>
+ */
+public final class Runner {
+
+    private Runner() {
+    }
+
+    /**
+     * Start building a test run with one or more paths.
+     * Paths can be directories or individual .feature files.
+     */
+    public static Builder path(String... paths) {
+        return new Builder().path(paths);
+    }
+
+    /**
+     * Start building a test run with a list of paths.
+     */
+    public static Builder path(List<String> paths) {
+        return new Builder().path(paths);
+    }
+
+    /**
+     * Start building a test run with Feature objects.
+     */
+    public static Builder features(Feature... features) {
+        return new Builder().features(features);
+    }
+
+    /**
+     * Get a new builder instance.
+     */
+    public static Builder builder() {
+        return new Builder();
+    }
+
+    /**
+     * Execute a single feature with pre-defined variables.
+     * This is called by karate-gatling for running features with Gatling session variables.
+     *
+     * @param path the feature path (can be classpath: prefixed)
+     * @param arg  variables to inject into the feature (available as top-level variables)
+     * @return the feature result
+     */
+    public static FeatureResult runFeature(String path, Map<String, Object> arg) {
+        return runFeature(path, arg, null);
+    }
+
+    /**
+     * Run a single feature file with arguments and optional PerfHook.
+     * <p>
+     * This method is primarily used by Gatling integration for running features
+     * with performance metric collection.
+     *
+     * @param path     the feature path (can be classpath: prefixed)
+     * @param arg      variables to inject into the feature (available as top-level variables)
+     * @param perfHook optional PerfHook for performance metric collection (Gatling)
+     * @return the feature result
+     */
+    public static FeatureResult runFeature(String path, Map<String, Object> arg, PerfHook perfHook) {
+        return runFeature(path, arg, perfHook, null);
+    }
+
+    /**
+     * Run a single feature file with arguments, optional PerfHook and tag filter.
+     * <p>
+     * This method is primarily used by Gatling integration. The {@code tags} argument
+     * follows the same semantics as {@link Builder#tags(String...)} — each entry is a
+     * tag expression; multiple entries are AND-ed together; commas within an entry are OR.
+     *
+     * @param path     the feature path (can be classpath: prefixed)
+     * @param arg      variables to inject into the feature (available as top-level variables)
+     * @param perfHook optional PerfHook for performance metric collection (Gatling)
+     * @param tags     optional tag filter expressions (null or empty means no filter)
+     * @return the feature result
+     */
+    public static FeatureResult runFeature(String path, Map<String, Object> arg, PerfHook perfHook, List<String> tags) {
+        return runFeature(path, arg, perfHook, tags, null);
+    }
+
+    /**
+     * Run a single feature with arguments, optional PerfHook, tag filter, and a
+     * pre-configured {@link Builder} template (env, configDir, systemProperties).
+     * <p>
+     * Used by karate-gatling to expose {@code protocol.runner.karateEnv(...)} etc.
+     * The template's {@code env}, {@code configDir}, and {@code systemProperties}
+     * are applied; everything else (paths, listeners, output flags) is overridden
+     * for the single-feature, no-report execution model.
+     */
+    public static FeatureResult runFeature(String path, Map<String, Object> arg, PerfHook perfHook,
+                                           List<String> tags, Builder template) {
+        // Create the suite using Builder, seeding with template settings if provided
+        Builder builder = Runner.builder()
+                .outputHtmlReport(false)
+                .outputConsoleSummary(false)
+                // The FeatureResult is RETURNED to the caller and this Suite is discarded, so the
+                // release at feature end would free nothing here and only take data the caller is
+                // about to read — this entry point has no SuiteResult retaining features for a
+                // whole run, which is the entire reason the release exists. The perf lane reaches
+                // the same conclusion by its own route (Suite.isPerfMode), but this path is public
+                // and legal without a hook, and there was no way to opt out on it.
+                .retainStepLogs(true);
+        // this lane has never evaluated karate-boot.js — a Gatling simulation boots nothing
+        builder.setSkipBootFile(true);
+        if (template != null) {
+            if (template.getEnv() != null) {
+                builder.karateEnv(template.getEnv());
+            }
+            if (template.getConfigDir() != null) {
+                builder.configDir(template.getConfigDir());
+            }
+            // carry the template's anchor so the feature — and every reference inside it —
+            // resolves against the project, not the process CWD
+            if (template.getWorkingDir() != null) {
+                builder.workingDir(template.getWorkingDir());
+            }
+            // Without this the Gatling lane cannot supply an HttpClientFactory at all: this
+            // overload is the entry point KarateExecutor uses, and every other Runner path
+            // carries the factory, so the seam looked reachable and was not. That silently
+            // blocked the one use case HttpClientFactory's own javadoc advertises — a shared
+            // connection pool for performance testing.
+            if (template.getHttpClientFactory() != null) {
+                builder.httpClientFactory(template.getHttpClientFactory());
+            }
+            Map<String, String> sysProps = template.getSystemProperties();
+            if (sysProps != null) {
+                for (Map.Entry<String, String> e : sysProps.entrySet()) {
+                    builder.systemProperty(e.getKey(), e.getValue());
+                }
+            }
+            builder.systemEnv(template.getSystemEnv());
+            // Propagate injected cache stores so callSingle/callOnce results survive
+            // across this Suite (one virtual user) and back into the protocol-owned
+            // cache for the next virtual user to see.
+            if (template.getCallSingleCache() != null) {
+                builder.callSingleCache(template.getCallSingleCache(), template.getCallSingleLock());
+            }
+            if (template.getCallOnceCacheStore() != null) {
+                builder.callOnceCacheStore(template.getCallOnceCacheStore(), template.getCallOnceLockStore());
+            }
+            if (template.getSetupOnceCacheStore() != null) {
+                builder.setupOnceCacheStore(template.getSetupOnceCacheStore());
+            }
+            // left unset, per-step log capture is off in this lane — nothing here reads it.
+            // karate-gatling sets it when log replay is on, since replay is exactly the reader.
+            if (template.getCaptureStepLogs() != null) {
+                builder.captureStepLogs(template.getCaptureStepLogs());
+            }
+            // same reader: replay descends into called features, so their results must outlive
+            // the scenario-end release that is otherwise right for this lane
+            builder.retainCallResults(template.isRetainCallResults());
+        }
+        if (tags != null && !tags.isEmpty()) {
+            builder.tags(tags.toArray(new String[0]));
+        }
+        // This single-feature path bypasses Builder.parallel(), so apply the karate.env /
+        // karate.config.dir sysprop+envvar overrides here too — otherwise a Gatling simulation
+        // run with -Dkarate.env=... would not pick it up (it would resolve to the config default).
+        KarateOptionsHandler.applyEnvAndConfigDir(builder);
+        Suite suite = builder.buildSuite();
+
+        // read the feature AFTER the Suite exists, so it is anchored on THE root the same way
+        // every other lane's features are (this is the one place that used to root at the CWD)
+        Feature feature = Feature.read(Resource.path(path, suite.getRoot(), suite.getClasspathRoot()));
+
+        // Set PerfHook if provided (for Gatling integration)
+        if (perfHook != null) {
+            suite.setPerfHook(perfHook);
+        }
+
+        // Run the feature with the arg map
+        FeatureRuntime fr = new FeatureRuntime(suite, feature, null, null, false, arg, null);
+        FeatureResult result = fr.call();
+
+        // Capture result variables from last executed scenario (for Gatling variable chaining)
+        ScenarioRuntime lastExecuted = fr.getLastExecuted();
+        if (lastExecuted != null) {
+            result.setResultVariables(lastExecuted.getAllVariables());
+        }
+
+        // Notify PerfHook of feature completion
+        if (perfHook != null) {
+            perfHook.afterFeature(result);
+        }
+
+        return result;
+    }
+
+    // ========== Builder ==========
+
+    public static class Builder {
+
+        private static final Logger logger = io.karatelabs.output.LogContext.RUNTIME_LOGGER;
+
+        private final List<String> paths = new ArrayList<>();
+        private final List<Feature> features = new ArrayList<>();
+        private final List<RunListener> listeners = new ArrayList<>();
+        private final List<RunListenerFactory> listenerFactories = new ArrayList<>();
+        private final List<ResultListener> resultListeners = new ArrayList<>();
+        // absolute normalized feature path -> the bytes to run in its place (see overlay)
+        private final Map<Path, byte[]> overlays = new HashMap<>();
+
+        private String env;
+        private List<String> tags;
+        private String scenarioName;
+        private String configDir;
+        private Path outputDir; // Default set in getOutputDir() using FileUtils.getBuildDir()
+        // null until explicitly set — "was a working dir chosen?" is what decides whether a
+        // boot.classpath declaration may re-anchor it (Suite ctor). Default applied there.
+        private Path workingDir;
+        private boolean skipBootFile;
+        private boolean dryRun;
+        private boolean outputHtmlReport = true;
+        private boolean outputJsonLines;
+        private boolean outputJunitXml;
+        private boolean outputCucumberJson;
+        private boolean backupOutputDir = true;
+        private boolean outputConsoleSummary = true;
+        private boolean retainCallResults = false;
+        private boolean retainStepLogs = false;
+        // null = decide from the run: on everywhere except perf mode (see Suite.isCaptureStepLogs)
+        private Boolean captureStepLogs;
+        private Map<String, String> systemProperties;
+        private Map<String, String> systemEnv;
+        private final Map<String, Object> globals = new java.util.LinkedHashMap<>();
+        private LogLevel logLevel = LogLevel.DEBUG;
+        private String consoleLevel; // SLF4J/Logback level; null = inherit (logback.xml default)
+        private io.karatelabs.driver.DriverProvider driverProvider;
+        private io.karatelabs.http.HttpClientFactory httpClientFactory;
+        private boolean skipTagFiltering;
+        private int poolSize = -1; // -1 means auto-detect from parallel count
+        private java.util.function.Consumer<Suite> suiteConsumer;
+        private io.karatelabs.js.RunInterceptor<?> debugInterceptor;
+        private io.karatelabs.js.DebugPointFactory<?> debugPointFactory;
+
+        // Line filters: maps feature resource key to set of line numbers to run
+        // Resource key is the normalized path (e.g., "src/test/features/test.feature")
+        private final Map<String, Set<Integer>> lineFilters = new HashMap<>();
+
+        // Track resolved features separately to associate them with their original paths
+        private List<Feature> resolvedFeatures;
+
+        // Optional injected cache stores. When non-null, Suite uses these instead of
+        // allocating fresh per-Suite stores. Used by karate-gatling to share callSingle
+        // and callOnce results across the virtual users of a single simulation, so an
+        // expensive setup runs once per simulation rather than once per virtual user.
+        private Map<String, Object> callSingleCache;
+        private java.util.concurrent.locks.ReentrantLock callSingleLock;
+        private Map<String, Map<String, Object>> callOnceCacheStore;
+        private Map<String, java.util.concurrent.locks.ReentrantLock> callOnceLockStore;
+        private Map<String, Map<String, Object>> setupOnceCacheStore;
+
+        Builder() {
+        }
+
+        /**
+         * Add paths to search for .feature files.
+         * Can be directories or individual files.
+         */
+        public Builder path(String... values) {
+            paths.addAll(Arrays.asList(values));
+            return this;
+        }
+
+        /**
+         * Add paths to search for .feature files.
+         */
+        public Builder path(List<String> values) {
+            if (values != null) {
+                paths.addAll(values);
+            }
+            return this;
+        }
+
+        /**
+         * Add Feature objects directly.
+         */
+        public Builder features(Feature... values) {
+            features.addAll(Arrays.asList(values));
+            return this;
+        }
+
+        /**
+         * Add Feature objects directly.
+         */
+        public Builder features(Collection<Feature> values) {
+            if (values != null) {
+                features.addAll(values);
+            }
+            return this;
+        }
+
+        /**
+         * Run the feature at {@code path} from {@code bytes} in this run only, as if the file held them
+         * (relative refs, config, reports and ids resolve from {@code path}); nothing is read from or
+         * written to that file, which need not exist.
+         */
+        public Builder overlay(Path path, byte[] bytes) {
+            overlays.put(path.toAbsolutePath().normalize(), bytes.clone());
+            return this;
+        }
+
+        /**
+         * Set the karate environment (karate.env).
+         */
+        public Builder karateEnv(String env) {
+            this.env = env;
+            return this;
+        }
+
+        /**
+         * Set tag filter expressions.
+         * Multiple arguments are AND-ed together (each must match).
+         * Commas within a single argument mean OR (any must match).
+         * <p>
+         * Examples:
+         * <ul>
+         *   <li>{@code tags("@smoke")} — run scenarios tagged @smoke</li>
+         *   <li>{@code tags("~@slow")} — exclude scenarios tagged @slow</li>
+         *   <li>{@code tags("@smoke,@fast")} — run scenarios tagged @smoke OR @fast</li>
+         *   <li>{@code tags("~@slow", "~@ignore")} — exclude @slow AND @ignore</li>
+         *   <li>{@code tags("@smoke", "~@slow")} — must have @smoke AND must not have @slow</li>
+         * </ul>
+         */
+        public Builder tags(String... tagExpressions) {
+            if (tagExpressions != null && tagExpressions.length > 0) {
+                if (this.tags == null) {
+                    this.tags = new ArrayList<>();
+                }
+                for (String tag : tagExpressions) {
+                    if (tag != null && !tag.isEmpty()) {
+                        this.tags.add(tag);
+                    }
+                }
+            }
+            return this;
+        }
+
+        /**
+         * Filter by scenario name (exact match, whitespace-trimmed on both sides).
+         * When set, only scenarios whose name equals this value will run, and
+         * tag filters (@ignore, @env) are bypassed for matches — the same
+         * semantics as the {@code file.feature:LINE} line filter.
+         */
+        public Builder scenarioName(String name) {
+            this.scenarioName = name;
+            return this;
+        }
+
+        /**
+         * Set the directory containing karate-config.js.
+         */
+        public Builder configDir(String dir) {
+            this.configDir = dir;
+            return this;
+        }
+
+        /**
+         * Set a system property that will be available via karate.properties in scripts.
+         * Multiple properties can be set by calling this method multiple times.
+         */
+        public Builder systemProperty(String key, String value) {
+            if (systemProperties == null) {
+                systemProperties = new HashMap<>();
+            }
+            systemProperties.put(key, value);
+            return this;
+        }
+
+        /**
+         * Environment variables layered over the process environment for this Suite only:
+         * {@code karate.sysenv} and {@code boot.sysenv} read them first. Snapshotted when the
+         * Suite is built, so Suites running side by side never see each other's values.
+         */
+        public Builder systemEnv(Map<String, String> env) {
+            if (env != null && !env.isEmpty()) {
+                if (systemEnv == null) {
+                    systemEnv = new HashMap<>();
+                }
+                env.forEach((k, v) -> {
+                    if (k != null && v != null) {
+                        systemEnv.put(k, v);
+                    }
+                });
+            }
+            return this;
+        }
+
+        /**
+         * Set the minimum log level for report capture.
+         * Logs below this level will be filtered from reports.
+         */
+        public Builder logLevel(LogLevel level) {
+            if (level != null) {
+                this.logLevel = level;
+            }
+            return this;
+        }
+
+        /**
+         * Set the minimum log level by name (case-insensitive).
+         * Valid values: trace, debug, info, warn, error
+         */
+        public Builder logLevel(String level) {
+            if (level != null) {
+                this.logLevel = LogLevel.valueOf(level.toUpperCase());
+            }
+            return this;
+        }
+
+        /**
+         * Set the SLF4J/console log level for the "karate" logger.
+         * Distinct from {@link #logLevel(String)} which is the report-buffer threshold.
+         * Valid values: trace, debug, info, warn, error.
+         * If null/unset the level is inherited from logback.xml (typically INFO).
+         */
+        public Builder consoleLevel(String level) {
+            this.consoleLevel = level;
+            return this;
+        }
+
+        /**
+         * Set the output directory for reports.
+         */
+        public Builder outputDir(String dir) {
+            if (dir != null) {
+                this.outputDir = Path.of(dir);
+            }
+            return this;
+        }
+
+        /**
+         * Set the output directory for reports.
+         */
+        public Builder outputDir(Path dir) {
+            if (dir != null) {
+                this.outputDir = dir;
+            }
+            return this;
+        }
+
+        /**
+         * Set the working directory for relative path resolution.
+         * This affects how feature file paths are displayed in reports.
+         */
+        public Builder workingDir(String dir) {
+            if (dir != null) {
+                this.workingDir = Path.of(dir).toAbsolutePath().normalize();
+            }
+            return this;
+        }
+
+        /**
+         * Set the working directory for relative path resolution.
+         * This affects how feature file paths are displayed in reports.
+         */
+        public Builder workingDir(Path dir) {
+            if (dir != null) {
+                this.workingDir = dir.toAbsolutePath().normalize();
+            }
+            return this;
+        }
+
+        /**
+         * Enable/disable HTML report generation.
+         */
+        public Builder outputHtmlReport(boolean enabled) {
+            this.outputHtmlReport = enabled;
+            return this;
+        }
+
+        /**
+         * Enable/disable JSON Lines streaming output.
+         * Streams lifecycle events to karate-json/karate-events.jsonl as they fire,
+         * with one record per line and a per-line flush so external tools (e.g. IDE
+         * test runners) can tail the file in real time.
+         */
+        public Builder outputJsonLines(boolean enabled) {
+            this.outputJsonLines = enabled;
+            return this;
+        }
+
+        /**
+         * Enable/disable JUnit XML report generation.
+         */
+        public Builder outputJunitXml(boolean enabled) {
+            this.outputJunitXml = enabled;
+            return this;
+        }
+
+        /**
+         * Enable/disable Cucumber JSON report generation.
+         */
+        public Builder outputCucumberJson(boolean enabled) {
+            this.outputCucumberJson = enabled;
+            return this;
+        }
+
+        /**
+         * Enable/disable backup of existing output directory.
+         * When enabled, the existing output directory is renamed with a timestamp
+         * suffix (e.g., karate-reports_2025-01-15_143022) before new reports are written.
+         */
+        public Builder backupOutputDir(boolean enabled) {
+            this.backupOutputDir = enabled;
+            return this;
+        }
+
+        /**
+         * Enable/disable console summary output after test execution.
+         * When disabled, no summary is printed to console, but results
+         * are still available in the returned SuiteResult.
+         */
+        /**
+         * Keep the nested {@code karate.call()} result trees reachable after the run.
+         *
+         * <p>Off by default. Every call attaches the callee's whole result tree to the
+         * calling step, and the suite holds every feature until it ends, so retaining them
+         * makes memory scale with total scenarios times calls per scenario — enough to
+         * exhaust the heap on a long suite. They are released once each feature has
+         * completed and every listener has consumed it.
+         *
+         * <p>Reports are unaffected either way: the HTML report extracts its page model,
+         * nested step detail included, while the result is still whole. Turn this on only
+         * to walk into a called feature's steps from a {@link SuiteResult} programmatically
+         * after the run.
+         */
+        public Builder retainCallResults(boolean enabled) {
+            this.retainCallResults = enabled;
+            return this;
+        }
+
+        /**
+         * Keep each step's captured log text and embeds reachable after the run.
+         *
+         * <p>Off by default. The log holds the rendered HTTP request and response for every
+         * step and an embed holds raw bytes — a screenshot, a document — and the suite holds
+         * every feature until it ends, so retaining them makes memory scale with total steps
+         * times payload size. They are released once each feature has completed and every
+         * listener has consumed it.
+         *
+         * <p>Reports are unaffected either way: HTML, Cucumber JSON, JUnit XML and the JSONL
+         * stream all serialize the feature while it is still whole. Turn this on only to read
+         * {@code StepResult.getLog()} or {@code getEmbeds()} from a {@link SuiteResult}
+         * programmatically after the run.
+         *
+         * <p>Ignored under karate-gatling, where nothing is retained past one execution anyway
+         * and {@code logReplay} reads the log after the feature returns.
+         */
+        public Builder retainStepLogs(boolean enabled) {
+            this.retainStepLogs = enabled;
+            return this;
+        }
+
+        public Builder outputConsoleSummary(boolean enabled) {
+            this.outputConsoleSummary = enabled;
+            return this;
+        }
+
+        /**
+         * Collect each step's Karate output — HTTP request / response blocks, {@code print} —
+         * into {@code StepResult.log}, which is what the HTML report, the JSONL / JUnit /
+         * Cucumber writers and karate-gatling's log replay all read.
+         *
+         * <p>Unset by default, which means <em>on</em> for a normal run and <em>off</em> under
+         * Gatling: that lane writes no HTML report, so the text would be built — the response
+         * body re-parsed and pretty-printed for every request — only to be retained and
+         * discarded. Set it explicitly to override in either direction.
+         *
+         * <p>This is capture, not logging: {@code print} and {@code karate.log()} reach SLF4J
+         * either way, at whatever level the Logback config allows.
+         */
+        public Builder captureStepLogs(boolean enabled) {
+            this.captureStepLogs = enabled;
+            return this;
+        }
+
+        /**
+         * Enable dry-run mode (parse but don't execute).
+         */
+        public Builder dryRun(boolean enabled) {
+            this.dryRun = enabled;
+            return this;
+        }
+
+        /**
+         * Bind a JS global (an ext-global-shaped object, typically a
+         * {@link io.karatelabs.js.SimpleObject}) into every scenario of this run — the
+         * <b>run-free / programmatic</b> equivalent of an {@link Ext} calling
+         * {@link Suite#registerGlobal(String, Object)} in {@code onBoot}. Lets an embedder
+         * stand up a one-off {@code Runner.features(...)} run that binds a global without
+         * authoring an ext or a {@code karate-boot.js} — e.g. a synthesizer whose single
+         * synthetic step replays recorded events through
+         * {@link io.karatelabs.output.LogContext#step(String, boolean)}. Seeded before
+         * {@code karate-config.js}; a reserved-name collision fails the suite loud at construction.
+         */
+        public Builder global(String name, Object instance) {
+            globals.put(name, instance);
+            return this;
+        }
+
+        /**
+         * Add a run event listener.
+         */
+        public Builder listener(RunListener listener) {
+            if (listener != null) {
+                listeners.add(listener);
+            }
+            return this;
+        }
+
+        /**
+         * Receive the constructed {@link Suite} just before the run starts — the handle a caller
+         * needs for cooperative mid-run control: {@link Suite#abort()} lets the executing scenario
+         * finish and skips everything after it (the same flag abortSuiteOnFailure sets).
+         */
+        public Builder onSuite(java.util.function.Consumer<Suite> consumer) {
+            this.suiteConsumer = consumer;
+            return this;
+        }
+
+        /**
+         * Add multiple run event listeners.
+         */
+        public Builder listeners(Collection<RunListener> values) {
+            if (values != null) {
+                listeners.addAll(values);
+            }
+            return this;
+        }
+
+        /**
+         * Add a run listener factory for per-thread listeners.
+         * The factory's create() method is called once per execution thread.
+         */
+        public Builder listenerFactory(RunListenerFactory factory) {
+            if (factory != null) {
+                listenerFactories.add(factory);
+            }
+            return this;
+        }
+
+        /**
+         * Add a run listener factory by class name (supports no-arg constructor).
+         * Used for CLI --listener-factory option.
+         * @param className fully qualified class name
+         */
+        public Builder listenerFactory(String className) {
+            if (className != null && !className.isEmpty()) {
+                try {
+                    Class<?> clazz = Class.forName(className);
+                    Object instance = clazz.getDeclaredConstructor().newInstance();
+                    if (instance instanceof RunListenerFactory factory) {
+                        listenerFactories.add(factory);
+                    } else if (instance instanceof RunListener listener) {
+                        // If it's a RunListener, wrap it in a factory that returns the same instance
+                        listeners.add(listener);
+                    } else {
+                        throw new IllegalArgumentException(
+                                "Class " + className + " must implement RunListenerFactory or RunListener");
+                    }
+                } catch (ClassNotFoundException e) {
+                    throw new IllegalArgumentException("Class not found: " + className, e);
+                } catch (Exception e) {
+                    throw new IllegalArgumentException("Failed to instantiate " + className, e);
+                }
+            }
+            return this;
+        }
+
+        /**
+         * Add a result listener for streaming test results.
+         */
+        public Builder resultListener(ResultListener listener) {
+            if (listener != null) {
+                resultListeners.add(listener);
+            }
+            return this;
+        }
+
+        /**
+         * Add multiple result listeners.
+         */
+        public Builder resultListeners(Collection<ResultListener> values) {
+            if (values != null) {
+                resultListeners.addAll(values);
+            }
+            return this;
+        }
+
+        /**
+         * Set a driver provider for managing browser driver lifecycle.
+         * <p>
+         * When set, the provider is used to acquire/release drivers for scenarios
+         * instead of creating a new driver per scenario.
+         * <p>
+         * Example:
+         * <pre>
+         * Runner.path("features/")
+         *     .driverProvider(new PooledDriverProvider())
+         *     .parallel(4);  // Pool size auto-detected
+         * </pre>
+         */
+        public Builder driverProvider(io.karatelabs.driver.DriverProvider provider) {
+            this.driverProvider = provider;
+            return this;
+        }
+
+        /**
+         * Enable browser driver pooling for parallel UI tests.
+         * Creates a PooledDriverProvider that reuses browser instances across scenarios.
+         * <p>
+         * Pool size is auto-detected from the parallel thread count.
+         * <p>
+         * Example:
+         * <pre>
+         * Runner.path("features/")
+         *     .pool()       // Enable pooling
+         *     .parallel(4); // Pool size = 4
+         * </pre>
+         */
+        public Builder pool() {
+            this.poolSize = -1; // Auto-detect from parallel count
+            return this;
+        }
+
+        /**
+         * Enable browser driver pooling with explicit pool size.
+         * Creates a PooledDriverProvider that reuses browser instances across scenarios.
+         * <p>
+         * Example:
+         * <pre>
+         * Runner.path("features/")
+         *     .pool(2)      // Pool of 2 browsers
+         *     .parallel(4); // 4 threads share 2 browsers
+         * </pre>
+         *
+         * @param size number of browser instances to pool
+         */
+        public Builder pool(int size) {
+            this.poolSize = size;
+            return this;
+        }
+
+        /**
+         * Set the HTTP client factory for custom/mock HTTP clients.
+         * When set, this factory is used instead of the default HTTP client.
+         */
+        public Builder httpClientFactory(io.karatelabs.http.HttpClientFactory factory) {
+            this.httpClientFactory = factory;
+            return this;
+        }
+
+        /**
+         * Skip tag filtering (@env, @ignore) so all scenarios run regardless of tags.
+         * Use this for unit tests that need to run scenarios with any tags.
+         */
+        public Builder skipTagFiltering(boolean skip) {
+            this.skipTagFiltering = skip;
+            return this;
+        }
+
+        /**
+         * Set debug support with interceptor and factory.
+         * Used for IDE debugging integration.
+         */
+        public <T> Builder debugSupport(io.karatelabs.js.RunInterceptor<T> interceptor, io.karatelabs.js.DebugPointFactory<T> factory) {
+            this.debugInterceptor = interceptor;
+            this.debugPointFactory = factory;
+            return this;
+        }
+
+        /**
+         * Inject a pre-allocated callSingle cache (and its companion lock). When set,
+         * Suites built from this builder reuse the cache instead of creating their own
+         * — so the cache outlives any single Suite. Used by karate-gatling to share
+         * callSingle results across the virtual users of one simulation.
+         * <p>
+         * Pass a matching {@code lock} so all Suites sharing the cache also share its
+         * write lock; otherwise concurrent virtual users can race.
+         */
+        public Builder callSingleCache(Map<String, Object> cache, java.util.concurrent.locks.ReentrantLock lock) {
+            this.callSingleCache = cache;
+            this.callSingleLock = lock;
+            return this;
+        }
+
+        /**
+         * Inject pre-allocated callOnce/setupOnce stores (keyed by feature URI). Same
+         * lifetime semantics as {@link #callSingleCache} — used by karate-gatling so a
+         * feature's callOnce/setupOnce runs once per simulation, not once per virtual user.
+         */
+        public Builder callOnceCacheStore(Map<String, Map<String, Object>> cacheStore,
+                                          Map<String, java.util.concurrent.locks.ReentrantLock> lockStore) {
+            this.callOnceCacheStore = cacheStore;
+            this.callOnceLockStore = lockStore;
+            return this;
+        }
+
+        public Builder setupOnceCacheStore(Map<String, Map<String, Object>> cacheStore) {
+            this.setupOnceCacheStore = cacheStore;
+            return this;
+        }
+
+        /**
+         * <b>Provisional API — may change or be removed without notice.</b>
+         * Exposed to support advanced runtime scenario discovery (e.g. sequential
+         * retry against an expensive grid session) until in-suite orchestration
+         * hooks land.
+         *
+         * <p>Note: callers that filter the returned {@link Feature}s themselves
+         * (e.g. by walking sections and evaluating a {@code TagSelector}) bypass
+         * {@code FeatureRuntime.shouldSelect} and will miss {@code @ignore},
+         * {@code @setup}, suite-level line/name filters, and {@code @envnot}.
+         * Mirror that logic if you need parity with what would actually run.
+         */
+        public List<Feature> getResolvedFeatures() {
+            return resolveFeaturesAt(workingDir != null ? workingDir : FileUtils.WORKING_DIR.toPath(), null);
+        }
+
+        /**
+         * Resolve this Builder's paths + pre-built features at the given anchors. Called from the
+         * {@link Suite} constructor <b>after</b> {@code karate-boot.js} has evaluated, so features are
+         * rooted at THE root and carry the boot-declared {@code classpath:} fallback dir into every
+         * reference made from inside them — a leading-{@code /} read inside a feature then means the
+         * same directory an ext's config means. Memoized — the first call wins.
+         *
+         * @param root          THE root features anchor on (see {@code Suite.getRoot()})
+         * @param classpathRoot the {@code classpath:}-miss fallback dir (null = root)
+         */
+        List<Feature> resolveFeaturesAt(Path root, Path classpathRoot) {
+            if (resolvedFeatures == null) {
+                resolvedFeatures = new ArrayList<>();
+                for (Feature feature : features) {
+                    resolvedFeatures.add(reRoot(feature, root, classpathRoot));
+                }
+                for (String path : paths) {
+                    resolveFeatures(path, resolvedFeatures, root, classpathRoot);
+                }
+            }
+            return Collections.unmodifiableList(resolvedFeatures);
+        }
+
+        /**
+         * Re-anchor a pre-built, filesystem-backed {@link Feature}'s {@link Resource} root, so a
+         * leading-{@code /} reference (read / callSingle / karate.start — including during config-eval,
+         * which anchors on the running feature's resource root) resolves to the project root, exactly like
+         * the path-loading flow that already builds features via {@code Resource.from(file, root)}.
+         * This closes the gap where {@code Runner.features(feature)} ran a feature whose resource was
+         * rooted at the process CWD (e.g. built via {@code Feature.read(Resource.path(...))}), ignoring an
+         * explicit {@code .workingDir(...)}. Classpath / in-memory features (no filesystem path) and
+         * features already correctly anchored are returned unchanged; best-effort — never fails
+         * resolution over a re-root.
+         */
+        private Feature reRoot(Feature feature, Path root, Path classpathRoot) {
+            Resource resource = feature.getResource();
+            Path cpRoot = classpathRoot != null ? classpathRoot : root;
+            if (resource == null || !resource.isFile() || root == null
+                    || (!overlays.containsKey(resource.getPath())
+                    && root.equals(resource.getRoot()) && cpRoot.equals(resource.getClasspathRoot()))) {
+                return feature;
+            }
+            try {
+                // an overlaid resource is re-anchored with its own bytes, never reparsed from disk
+                byte[] bytes = overlays.get(resource.getPath());
+                if (bytes == null && resource instanceof io.karatelabs.common.PathResource pr && pr.isOverlay()) {
+                    bytes = pr.getBytes();
+                }
+                return Feature.read(bytes != null
+                        ? Resource.overlay(resource.getPath(), bytes, root, cpRoot)
+                        : Resource.from(resource.getPath(), root, cpRoot));
+            } catch (Exception e) {
+                return feature;
+            }
+        }
+
+        // ========== Package-private accessors for Suite constructor ==========
+
+        String getEnv() { return env; }
+        List<String> getTags() { return tags; }
+        String getConfigDir() { return configDir; }
+        Path getOutputDir() { return outputDir; }
+        /** The EXPLICITLY-set working dir, or null — the Suite applies the default. */
+        Path getWorkingDir() { return workingDir; }
+        boolean isSkipBootFile() { return skipBootFile; }
+        boolean isDryRun() { return dryRun; }
+        boolean isOutputHtmlReport() { return outputHtmlReport; }
+        boolean isOutputJsonLines() { return outputJsonLines; }
+        boolean isOutputJunitXml() { return outputJunitXml; }
+        boolean isOutputCucumberJson() { return outputCucumberJson; }
+        boolean isBackupOutputDir() { return backupOutputDir; }
+        boolean isOutputConsoleSummary() { return outputConsoleSummary; }
+
+        boolean isRetainCallResults() { return retainCallResults; }
+
+        boolean isRetainStepLogs() { return retainStepLogs; }
+        /** null when unset — the Suite decides from perf mode. */
+        Boolean getCaptureStepLogs() { return captureStepLogs; }
+        Map<String, String> getSystemProperties() { return systemProperties; }
+        Map<String, String> getSystemEnv() { return systemEnv; }
+        Map<String, Object> getProgrammaticGlobals() { return globals; }
+        List<RunListener> getListeners() { return listeners; }
+        List<RunListenerFactory> getListenerFactories() { return listenerFactories; }
+        List<ResultListener> getResultListeners() { return resultListeners; }
+        io.karatelabs.driver.DriverProvider getDriverProvider() { return driverProvider; }
+        io.karatelabs.http.HttpClientFactory getHttpClientFactory() { return httpClientFactory; }
+        boolean isSkipTagFiltering() { return skipTagFiltering; }
+        Map<String, Set<Integer>> getLineFilters() { return lineFilters; }
+        String getScenarioName() { return scenarioName; }
+        io.karatelabs.js.RunInterceptor<?> getDebugInterceptor() { return debugInterceptor; }
+        io.karatelabs.js.DebugPointFactory<?> getDebugPointFactory() { return debugPointFactory; }
+        List<String> getPaths() { return paths; }
+        Map<String, Object> getCallSingleCache() { return callSingleCache; }
+        java.util.concurrent.locks.ReentrantLock getCallSingleLock() { return callSingleLock; }
+        Map<String, Map<String, Object>> getCallOnceCacheStore() { return callOnceCacheStore; }
+        Map<String, java.util.concurrent.locks.ReentrantLock> getCallOnceLockStore() { return callOnceLockStore; }
+        Map<String, Map<String, Object>> getSetupOnceCacheStore() { return setupOnceCacheStore; }
+        List<Feature> getFeatures() { return features; }
+        LogLevel getLogLevel() { return logLevel; }
+
+        // ========== Package-private setters for KarateOptionsHandler (sysprop overrides) ==========
+
+        void setEnv(String env) { this.env = env; }
+        void setTags(List<String> tags) { this.tags = tags; }
+        void setScenarioName(String name) { this.scenarioName = name; }
+        void setConfigDir(String dir) { this.configDir = dir; }
+        /** Gatling's single-feature lane has never booted karate-boot.js — keep it that way. */
+        void setSkipBootFile(boolean skip) { this.skipBootFile = skip; }
+        void setOutputDir(Path dir) { this.outputDir = dir; }
+        void setDryRun(boolean dryRun) { this.dryRun = dryRun; }
+        void setOutputHtmlReport(boolean enabled) { this.outputHtmlReport = enabled; }
+        void setOutputJsonLines(boolean enabled) { this.outputJsonLines = enabled; }
+        void setOutputJunitXml(boolean enabled) { this.outputJunitXml = enabled; }
+        void setOutputCucumberJson(boolean enabled) { this.outputCucumberJson = enabled; }
+        void setLogLevel(LogLevel level) { if (level != null) this.logLevel = level; }
+
+        void clearPaths() {
+            paths.clear();
+            features.clear();
+            lineFilters.clear();
+            resolvedFeatures = null;
+        }
+
+        /**
+         * Execute the tests with the specified thread count.
+         * This is the terminal operation that runs the tests.
+         *
+         * @param threadCount number of threads (1 for sequential)
+         * @return the test results
+         */
+        public SuiteResult parallel(int threadCount) {
+            // Apply system property / env variable overrides BEFORE debug delegation,
+            // so the debug server (if spawned) sees the merged Builder state via buildDebugArgs.
+            // Skipped when debugInterceptor != null (we're already inside the spawned debug server).
+            int effectiveThreads = threadCount;
+            if (debugInterceptor == null) {
+                effectiveThreads = KarateOptionsHandler.apply(this, threadCount);
+            }
+
+            // Apply log levels (may have been changed by sysprop)
+            io.karatelabs.output.LogContext.setLogLevel(logLevel);
+            if (consoleLevel != null) {
+                io.karatelabs.output.LogContext.setRuntimeLogLevel(consoleLevel);
+            }
+
+            // Check for IDE debug integration via system property
+            // When -Dkarate.debug.port is set (e.g. by IntelliJ or VS Code),
+            // delegate to io.karatelabs.debug.Main.run() from karate-ide-v2.jar
+            SuiteResult debugResult = startDebugServerIfRequired(effectiveThreads);
+            if (debugResult != null) {
+                return debugResult;
+            }
+
+            Suite suite = new Suite(this, Math.max(1, effectiveThreads));
+            if (suiteConsumer != null) {
+                suiteConsumer.accept(suite);
+            }
+            SuiteResult result = suite.run();
+
+            // Print summary if enabled
+            if (outputConsoleSummary) {
+                result.printSummary(env, effectiveThreads);
+            }
+
+            return result;
+        }
+
+        // IDE integration contract (debugger): the karate.debug.port system property, the class name
+        // io.karatelabs.debug.Main and its static SuiteResult run(String[]) are used by the Karate IDE
+        // plugins. Do not rename, change signatures, or change threading / event semantics without
+        // coordinating with them.
+        private SuiteResult startDebugServerIfRequired(int threadCount) {
+            // Skip if debugSupport() was already called — we're inside the debug server
+            if (debugInterceptor != null) {
+                return null;
+            }
+            String debugPortStr = System.getProperty("karate.debug.port");
+            if (debugPortStr == null || debugPortStr.trim().isEmpty()) {
+                return null;
+            }
+            int debugPort = 0;
+            try {
+                debugPort = Integer.parseInt(debugPortStr.trim());
+            } catch (Exception e) {
+                // ignore, use 0 (auto-assign)
+            }
+            // Apply system properties if configured
+            if (systemProperties != null) {
+                systemProperties.forEach(System::setProperty);
+            }
+            String[] args = buildDebugArgs(debugPort, threadCount);
+            logger.debug("karate.debug.port detected, delegating to debug server: {}", Arrays.toString(args));
+            try {
+                Class<?> mainClass = Class.forName("io.karatelabs.debug.Main");
+                Method runMethod = mainClass.getMethod("run", String[].class);
+                return (SuiteResult) runMethod.invoke(null, (Object) args);
+            } catch (ClassNotFoundException e) {
+                logger.warn("karate.debug.port is set but karate-ide JAR is not on the classpath");
+                return null;
+            } catch (Exception e) {
+                throw new RuntimeException("failed to start debug server", e);
+            }
+        }
+
+        // CLI-style args for the debugger (see above). Adding a flag is safe; renaming or removing an
+        // existing one, or changing its meaning, needs coordinating with the Karate IDE plugins.
+        private String[] buildDebugArgs(int debugPort, int threadCount) {
+            List<String> args = new ArrayList<>();
+            args.add("-d");
+            args.add(String.valueOf(debugPort));
+            if (env != null) {
+                args.add("-e");
+                args.add(env);
+            }
+            if (tags != null) {
+                for (String tag : tags) {
+                    args.add("-t");
+                    args.add(tag);
+                }
+            }
+            if (threadCount > 1) {
+                args.add("-T");
+                args.add(String.valueOf(threadCount));
+            }
+            args.addAll(paths);
+            return args.toArray(new String[0]);
+        }
+
+        /**
+         * Build the Suite without running it.
+         * Useful for advanced scenarios where you need to configure the Suite
+         * further or run it manually.
+         */
+        public Suite buildSuite() {
+            return buildSuite(1);
+        }
+
+        /**
+         * Build the Suite with specified thread count without running it.
+         */
+        Suite buildSuite(int threadCount) {
+            // Apply log levels (these are global settings)
+            io.karatelabs.output.LogContext.setLogLevel(logLevel);
+            if (consoleLevel != null) {
+                io.karatelabs.output.LogContext.setRuntimeLogLevel(consoleLevel);
+            }
+
+            return new Suite(this, Math.max(1, threadCount));
+        }
+
+        private void resolveFeatures(String path, List<Feature> target, Path root, Path classpathRoot) {
+            // Parse line number from path (e.g., "test.feature:10" or "test.feature:10:15")
+            String actualPath = path;
+            Set<Integer> lines = new HashSet<>();
+
+            // Check for line number suffix (path:line or path:line1:line2:...)
+            // Only parse line numbers for .feature files, not directories
+            // Look for ".feature:" to find where line numbers start (handles Windows drive letters like C:\)
+            if (path.contains(".feature:") && !path.startsWith("classpath:")) {
+                int featureExtIndex = path.indexOf(".feature:");
+                int colonIndex = featureExtIndex + ".feature".length();
+                String potentialPath = path.substring(0, colonIndex);
+                String remainder = path.substring(colonIndex + 1);
+
+                // Check if what follows the colon looks like line numbers
+                if (remainder.matches("\\d+(:\\d+)*")) {
+                    actualPath = potentialPath;
+                    for (String lineStr : remainder.split(":")) {
+                        try {
+                            lines.add(Integer.parseInt(lineStr));
+                        } catch (NumberFormatException e) {
+                            // Not a valid line number, treat as original path
+                            actualPath = path;
+                            lines.clear();
+                            break;
+                        }
+                    }
+                }
+            } else if (path.startsWith("classpath:") && path.contains(".feature:")) {
+                // Handle classpath:path/to/file.feature:10 format
+                int featureExtIndex = path.indexOf(".feature:");
+                int colonIndex = featureExtIndex + ".feature".length();
+                String potentialPath = path.substring(0, colonIndex);
+                String remainder = path.substring(colonIndex + 1);
+
+                // Check if what follows the colon looks like line numbers
+                if (remainder.matches("\\d+(:\\d+)*")) {
+                    actualPath = potentialPath;
+                    for (String lineStr : remainder.split(":")) {
+                        try {
+                            lines.add(Integer.parseInt(lineStr));
+                        } catch (NumberFormatException e) {
+                            actualPath = path;
+                            lines.clear();
+                            break;
+                        }
+                    }
+                }
+            }
+
+            File file = new File(actualPath);
+
+            if (file.isDirectory()) {
+                resolveDirectory(file, target, root, classpathRoot);
+            } else if ((file.exists() || overlays.containsKey(file.toPath().toAbsolutePath().normalize()))
+                    && file.getName().endsWith(".feature")) {
+                Feature feature = readFeature(file.toPath(), root, classpathRoot);
+                target.add(feature);
+                // Store line filter for this feature
+                if (!lines.isEmpty()) {
+                    lineFilters.put(feature.getResource().getUri().toString(), lines);
+                }
+            } else if (actualPath.startsWith("classpath:")) {
+                // Handle classpath resources
+                String classpathPath = actualPath.substring("classpath:".length());
+                if (classpathPath.startsWith("/")) {
+                    classpathPath = classpathPath.substring(1);
+                }
+
+                if (classpathPath.endsWith(".feature")) {
+                    // Single feature file — anchored on the project root, symmetrically with the
+                    // directory-scan branch below (which has always passed root through). Without
+                    // it, one classpath: feature ran rooted at the process CWD and every leading-"/"
+                    // reference inside it leaked out of the project.
+                    Resource resource = Resource.path(actualPath, root, classpathRoot);
+                    Feature feature = Feature.read(resource);
+                    target.add(feature);
+                    // Store line filter for this feature
+                    if (!lines.isEmpty()) {
+                        lineFilters.put(feature.getResource().getUri().toString(), lines);
+                    }
+                } else {
+                    // Directory - scan for .feature files
+                    List<Resource> resources = Resource.scanClasspath(classpathPath, "feature", null, root);
+                    for (Resource resource : resources) {
+                        // a jar-scanned hit is in-memory (no Path) — take it as-is
+                        Feature feature = Feature.read(resource.getPath() == null
+                                ? resource : Resource.from(resource.getPath(), root, classpathRoot));
+                        target.add(feature);
+                    }
+                }
+            }
+        }
+
+        private void resolveDirectory(File dir, List<Feature> target, Path root, Path classpathRoot) {
+            File[] files = dir.listFiles();
+            if (files == null) return;
+
+            for (File file : files) {
+                if (file.isDirectory()) {
+                    resolveDirectory(file, target, root, classpathRoot);
+                } else if (file.getName().endsWith(".feature")) {
+                    Feature feature = readFeature(file.toPath(), root, classpathRoot);
+                    target.add(feature);
+                }
+            }
+        }
+
+        private Feature readFeature(Path file, Path root, Path classpathRoot) {
+            byte[] bytes = overlays.get(file.toAbsolutePath().normalize());
+            return Feature.read(bytes != null
+                    ? Resource.overlay(file, bytes, root, classpathRoot)
+                    : Resource.from(file, root, classpathRoot));
+        }
+
+        @Override
+        public String toString() {
+            return "Runner.Builder{paths=" + paths + ", features=" + features.size() + "}";
+        }
+    }
+
+}

@@ -1,0 +1,627 @@
+/*
+ * The MIT License
+ *
+ * Copyright 2025 Karate Labs Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package io.karatelabs.output;
+
+import io.karatelabs.core.StepResult;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Thread-local log collector for scenario execution.
+ * All user-script logging (print, karate.log, HTTP) goes here.
+ * Also collects embeds (HTML from doc, images, etc.) for reports.
+ * The collected log/embeds are written to karate-json reports.
+ */
+public class LogContext {
+
+    private static final ThreadLocal<LogContext> CURRENT = new ThreadLocal<>();
+
+    // ========== Category Loggers ==========
+    // Use these for category-aware logging that cascades to SLF4J
+
+    /** Logger for core framework (Suite, Runner, StepExecutor, reports, config, process utils) */
+    public static final Logger RUNTIME_LOGGER = LoggerFactory.getLogger("karate.runtime");
+
+    /** Logger for HTTP request/response logs */
+    public static final Logger HTTP_LOGGER = LoggerFactory.getLogger("karate.http");
+
+    /** Logger for mock server logs */
+    public static final Logger MOCK_LOGGER = LoggerFactory.getLogger("karate.mock");
+
+    /** Logger for embedded HTTP server request/response logs */
+    public static final Logger SERVER_LOGGER = LoggerFactory.getLogger("karate.server");
+
+    /** Logger for test logs (karate.log, karate.logger, print statements) */
+    public static final Logger SCENARIO_LOGGER = LoggerFactory.getLogger("karate.scenario");
+
+    /** Logger for console output (test summary) */
+    public static final Logger CONSOLE_LOGGER = LoggerFactory.getLogger("karate.console");
+
+    private static LogLevel threshold = LogLevel.INFO;
+
+    /**
+     * Logger names mutated by {@link #setRuntimeLogLevel} and captured/restored by
+     * {@link #snapshot()}. The "karate" parent alone is not enough: the bundled
+     * {@code logback.xml} pins child categories to explicit levels (notably
+     * {@code karate.http=DEBUG}), and in Logback a child with an explicit level
+     * ignores its ancestor's level. Setting only "karate" therefore left HTTP
+     * request/response lines on the console at every {@code logging.console} setting
+     * (issue #2917). Fanning the level out to every category makes the knob actually
+     * silence — including {@code console: 'off'} / {@code 'none'}.
+     */
+    private static final String[] RUNTIME_LOGGERS = {
+            "karate", "karate.runtime", "karate.http", "karate.mock",
+            "karate.server", "karate.scenario", "karate.console", "io.karatelabs"
+    };
+
+    private final StringBuilder buffer = new StringBuilder();
+    private List<StepResult.Embed> embeds;
+    private List<StepResult> pendingSteps;
+    // Per-thread HTTP logging config, set via `configure logging = { mask, pretty }`.
+    // HttpLogger reads these on each request so changes take effect immediately
+    // without needing to rebuild the HTTP client. Defaults: pretty=true, no mask.
+    private LogMask mask;
+    private boolean pretty = true;
+    // Whether anything is collected into the report buffer at all. Off means the buffer
+    // stays empty and every consumer of it (HTML report, JSONL, log replay) gets nothing —
+    // SLF4J is untouched, so `print` and karate.log() still reach the console. Set per
+    // scenario from the Suite (see Runner.Builder.captureStepLogs): on everywhere except
+    // under Gatling, where there is no HTML report and nothing reads what is collected.
+    private boolean capture = true;
+
+    // ========== Thread-Local Access ==========
+
+    public static LogContext get() {
+        LogContext ctx = CURRENT.get();
+        if (ctx == null) {
+            ctx = new LogContext();
+            CURRENT.set(ctx);
+        }
+        return ctx;
+    }
+
+    /** The current thread's context, or null when there is none — never creates one (unlike {@link #get()}). */
+    public static LogContext peekCurrent() {
+        return CURRENT.get();
+    }
+
+    public static void set(LogContext ctx) {
+        CURRENT.set(ctx);
+    }
+
+    public static void clear() {
+        CURRENT.remove();
+    }
+
+    /**
+     * Create a LogWriter that captures to the thread-local LogContext AND cascades to SLF4J.
+     * Use this for category-aware logging.
+     *
+     * @param logger the SLF4J logger (determines the category)
+     * @return a LogWriter for fluent logging
+     */
+    public static LogWriter with(Logger logger) {
+        return new LogWriter(logger);
+    }
+
+    /**
+     * Set the minimum log level for report capture.
+     * Logs below this level will be filtered out.
+     */
+    public static void setLogLevel(LogLevel level) {
+        threshold = level;
+    }
+
+    /**
+     * Get the current log level threshold.
+     */
+    public static LogLevel getLogLevel() {
+        return threshold;
+    }
+
+    /**
+     * Set the runtime log level for SLF4J/Logback.
+     * Uses reflection to avoid compile-time dependency on Logback.
+     * Sets the level on the "karate" parent AND every child category
+     * (karate.runtime, karate.http, karate.mock, karate.server, karate.scenario,
+     * karate.console) plus io.karatelabs — see {@link #RUNTIME_LOGGERS} for why the
+     * parent alone is not enough.
+     * <p>
+     * Accepts the standard levels (trace, debug, info, warn, error) plus {@code off}
+     * and {@code none} (an alias for {@code off}) to silence the console completely.
+     *
+     * @param level the log level (trace, debug, info, warn, error, off, none)
+     * @return true if the level was set successfully, false if Logback is not available
+     */
+    public static boolean setRuntimeLogLevel(String level) {
+        if (level == null || level.isEmpty()) {
+            return false;
+        }
+        // "none" is a friendlier alias for Logback's "off" — the issue asked for it by name.
+        String normalized = level.equalsIgnoreCase("none") ? "off" : level;
+        try {
+            Object ctx = logbackContext();
+            if (ctx == null) {
+                RUNTIME_LOGGER.debug("Runtime log level not supported: not using Logback");
+                return false;
+            }
+            Class<?> levelClass = Class.forName("ch.qos.logback.classic.Level");
+            Object levelValue = levelClass
+                    .getMethod("toLevel", String.class)
+                    .invoke(null, normalized.toUpperCase());
+            // the levels are about to change, so every live Snapshot needs the "before" now —
+            // this is the only moment it can still be observed. See capturePendingLevels().
+            capturePendingLevels();
+            for (String name : RUNTIME_LOGGERS) {
+                setLevelOn(ctx, levelClass, name, levelValue);
+            }
+            RUNTIME_LOGGER.debug("Set runtime log level to: {}", level);
+            return true;
+        } catch (Exception e) {
+            RUNTIME_LOGGER.debug("Failed to set runtime log level: {}", e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * The Logback {@code LoggerContext} (an {@code ILoggerFactory}), or null when
+     * Logback is not the bound SLF4J backend — in which case runtime level changes
+     * are silently unsupported.
+     */
+    private static Object logbackContext() {
+        Object factory = LoggerFactory.getILoggerFactory();
+        if (!factory.getClass().getName().equals("ch.qos.logback.classic.LoggerContext")) {
+            return null;
+        }
+        return factory;
+    }
+
+    private static void setLevelOn(Object ctx, Class<?> levelClass, String name, Object levelValue) throws Exception {
+        // LoggerContext.getLogger(String) returns ch.qos.logback.classic.Logger
+        Object logger = ctx.getClass().getMethod("getLogger", String.class).invoke(ctx, name);
+        // levelValue may be null — restoring a logger that had no explicit level resets
+        // it to inherit from its parent, which is exactly the pre-snapshot state.
+        logger.getClass().getMethod("setLevel", levelClass).invoke(logger, levelValue);
+    }
+
+    /**
+     * Capture the explicit level (or null = inherited) of every {@link #RUNTIME_LOGGERS}
+     * entry, as a lowercase-string map. Used by {@link Snapshot} so a mid-test
+     * {@code configure logging = { console: ... }} change can be fully restored on exit
+     * across all categories — not just the parent. Returns null if Logback is unavailable.
+     * <p>
+     * Reflective and eight loggers deep, so it runs only when a level is actually about to
+     * change — see {@link #capturePendingLevels()}.
+     */
+    private static Map<String, String> captureRuntimeLevels() {
+        try {
+            Object ctx = logbackContext();
+            if (ctx == null) {
+                return null;
+            }
+            Map<String, String> levels = new LinkedHashMap<>();
+            for (String name : RUNTIME_LOGGERS) {
+                Object logger = ctx.getClass().getMethod("getLogger", String.class).invoke(ctx, name);
+                Object level = logger.getClass().getMethod("getLevel").invoke(logger);
+                levels.put(name, level == null ? null : level.toString().toLowerCase());
+            }
+            return levels;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static void restoreRuntimeLevels(Map<String, String> levels) {
+        try {
+            Object ctx = logbackContext();
+            if (ctx == null) {
+                return;
+            }
+            Class<?> levelClass = Class.forName("ch.qos.logback.classic.Level");
+            java.lang.reflect.Method toLevel = levelClass.getMethod("toLevel", String.class);
+            for (Map.Entry<String, String> e : levels.entrySet()) {
+                Object levelValue = e.getValue() == null ? null
+                        : toLevel.invoke(null, e.getValue().toUpperCase());
+                setLevelOn(ctx, levelClass, e.getKey(), levelValue);
+            }
+        } catch (Exception e) {
+            RUNTIME_LOGGER.debug("Failed to restore runtime log levels: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * The innermost {@link Snapshot} live on this thread, chained outwards via
+     * {@link Snapshot#outer}. Nesting is real: a {@code call} / {@code callonce} runs on the
+     * caller's thread and takes its own snapshot inside the caller's.
+     */
+    private static final ThreadLocal<Snapshot> PENDING = new ThreadLocal<>();
+
+    /**
+     * Give every live Snapshot that has not yet recorded the Logback levels the state as it is
+     * <em>right now</em> — called from {@link #setRuntimeLogLevel} immediately before it changes
+     * them, which is the last moment the "before" exists.
+     * <p>
+     * This is why {@link #snapshot()} does not capture eagerly. Capturing is a reflective walk
+     * over eight logger names, and a scenario that never runs {@code configure logging} — which
+     * is nearly all of them — has nothing to restore, so the walk was pure waste on every
+     * scenario. One walk serves the whole chain: an uncaptured snapshot's creation-time state is
+     * the current state, because nothing but this method changes the levels.
+     */
+    private static void capturePendingLevels() {
+        Snapshot s = PENDING.get();
+        if (s == null || s.captured) {
+            // head captured implies the whole chain below it was captured in the same walk
+            return;
+        }
+        Map<String, String> levels = captureRuntimeLevels();
+        while (s != null && !s.captured) {
+            s.captured = true;
+            s.consoleLevels = levels; // shared, and only ever read
+            s = s.outer;
+        }
+    }
+
+    /**
+     * Snapshot of the report-buffer threshold, the log mask/pretty settings and — only if
+     * something changes them while it is live — the per-category Logback levels. Take one
+     * before a scenario runs and {@link #restore()} after, so any mid-test
+     * {@code configure logging = {...}} change does not leak across scenarios.
+     * <p>
+     * A level change made by <em>another</em> thread is deliberately not reverted by this one:
+     * the levels are process-global, and clobbering them with a value this thread never saw
+     * would be worse than leaving the other thread's setting alone.
+     */
+    public static final class Snapshot {
+
+        private final LogLevel reportLevel;
+        private final LogMask mask;
+        private final boolean pretty;
+        private final Snapshot outer;
+
+        // written by capturePendingLevels, on this thread, before any level actually changes
+        private boolean captured;
+        private Map<String, String> consoleLevels;
+
+        private Snapshot(LogLevel reportLevel, LogMask mask, boolean pretty, Snapshot outer) {
+            this.reportLevel = reportLevel;
+            this.mask = mask;
+            this.pretty = pretty;
+            this.outer = outer;
+        }
+
+        public void restore() {
+            LogContext.setLogLevel(reportLevel);
+            if (consoleLevels != null) {
+                restoreRuntimeLevels(consoleLevels);
+            }
+            if (PENDING.get() == this) {
+                // pop, and don't leave a thread-local entry behind on a pooled or virtual thread
+                if (outer == null) {
+                    PENDING.remove();
+                } else {
+                    PENDING.set(outer);
+                }
+            }
+            LogContext ctx = get();
+            ctx.setMask(mask);
+            ctx.setPretty(pretty);
+        }
+    }
+
+    public static Snapshot snapshot() {
+        LogContext ctx = get();
+        Snapshot s = new Snapshot(getLogLevel(), ctx.mask, ctx.pretty, PENDING.get());
+        PENDING.set(s);
+        return s;
+    }
+
+    public LogMask getMask() {
+        return mask;
+    }
+
+    public void setMask(LogMask mask) {
+        this.mask = mask;
+    }
+
+    public boolean isPretty() {
+        return pretty;
+    }
+
+    public void setPretty(boolean pretty) {
+        this.pretty = pretty;
+    }
+
+    /** Whether the report buffer collects anything on this thread — see {@link #isCapturing}. */
+    public boolean isCapture() {
+        return capture;
+    }
+
+    public void setCapture(boolean capture) {
+        this.capture = capture;
+    }
+
+    /**
+     * Would a message at this level actually land in the report buffer? Producers of expensive
+     * log text — above all {@link HttpLogger}, which re-parses and pretty-prints every response
+     * body — must ask this <em>before</em> building the string, rather than relying on the
+     * {@link #log} calls below to drop it once the cost has already been paid.
+     */
+    public boolean isCapturing(LogLevel level) {
+        return capture && level.isEnabled(threshold);
+    }
+
+    // ========== Logging ==========
+
+    /**
+     * Log a message at the specified level.
+     * Message is filtered if level is below threshold.
+     */
+    public void log(LogLevel level, String message) {
+        if (!capture || !level.isEnabled(threshold)) {
+            return; // Filtered
+        }
+        buffer.append(message).append('\n');
+    }
+
+    /**
+     * Log a message at the specified level with format arguments.
+     */
+    public void log(LogLevel level, String format, Object... args) {
+        if (!capture || !level.isEnabled(threshold)) {
+            return; // Filtered
+        }
+        String message = format(format, args);
+        buffer.append(message).append('\n');
+    }
+
+    /**
+     * Log a message at INFO level.
+     * Used by karate.log() and print statements.
+     */
+    public void log(Object message) {
+        log(LogLevel.INFO, String.valueOf(message));
+    }
+
+    /**
+     * Log a message at INFO level with format arguments.
+     */
+    public void log(String format, Object... args) {
+        log(LogLevel.INFO, format, args);
+    }
+
+    // ========== Embeds ==========
+
+    /**
+     * Add an embed (HTML, image, etc.) to be included in step result.
+     */
+    public void embed(byte[] data, String mimeType, String name) {
+        if (embeds == null) {
+            embeds = new ArrayList<>();
+        }
+        embeds.add(new StepResult.Embed(data, mimeType, name));
+    }
+
+    /**
+     * Add an embed with just data and mime type.
+     */
+    public void embed(byte[] data, String mimeType) {
+        embed(data, mimeType, null);
+    }
+
+    /**
+     * Add a pre-built embed (e.g. a multi-part {@code {name, parts[], meta}} from an
+     * ext like image-comparison) to the current step. Thread-local, so it targets
+     * the step executing on this thread.
+     */
+    public void embed(StepResult.Embed embed) {
+        if (embeds == null) {
+            embeds = new ArrayList<>();
+        }
+        embeds.add(embed);
+    }
+
+    /**
+     * Collect and clear embeds.
+     */
+    public List<StepResult.Embed> collectEmbeds() {
+        List<StepResult.Embed> result = embeds;
+        embeds = null;
+        return result;
+    }
+
+    // ========== Synthetic steps ==========
+
+    /**
+     * Append a synthetic step to the scenario currently executing on this thread — symmetric with
+     * {@link #embed}: an out-of-band producer (e.g. running inside an {@code * eval}) contributes a
+     * real, named step row to the report/JSONL without parsing a {@code .feature}. The buffered steps
+     * are flushed into the scenario's result immediately after the in-flight step completes, so they
+     * appear as sibling step rows right where they were produced.
+     *
+     * <p>The step's {@code status} is reported and, for {@code FAILED}, fails the scenario (it joins
+     * the step list {@link io.karatelabs.core.ScenarioResult#isFailed()} scans) — so a producer can
+     * <b>signal a pass/fail purely by appending a step</b>, no exception required.
+     *
+     * @param text   the step's display text
+     * @param passed {@code true} → a passed (green) step; {@code false} → a failed step that fails the scenario
+     * @param embeds optional embeds attached to THIS step (e.g. a screenshot or a JSON payload); may be {@code null}
+     * @return the created {@link StepResult} (for further customization, e.g. {@code setLog})
+     */
+    public StepResult step(String text, boolean passed, List<StepResult.Embed> embeds) {
+        StepResult sr = StepResult.synthetic(text,
+                passed ? StepResult.Status.PASSED : StepResult.Status.FAILED,
+                System.currentTimeMillis(), null);
+        if (embeds != null) {
+            for (StepResult.Embed e : embeds) {
+                sr.addEmbed(e);
+            }
+        }
+        return step(sr);
+    }
+
+    /** Append a synthetic step with no embeds (see {@link #step(String, boolean, List)}). */
+    public StepResult step(String text, boolean passed) {
+        return step(text, passed, null);
+    }
+
+    /**
+     * Append a fully-built synthetic step — the escape hatch for full control (a failure message via
+     * {@link StepResult#synthetic} with a {@code Throwable}, a custom log, multi-part embeds). See
+     * {@link #step(String, boolean, List)}.
+     */
+    public StepResult step(StepResult sr) {
+        if (pendingSteps == null) {
+            pendingSteps = new ArrayList<>();
+        }
+        pendingSteps.add(sr);
+        return sr;
+    }
+
+    /** Collect and clear the synthetic steps buffered since the last call (flushed per step by the runtime). */
+    public List<StepResult> collectPendingSteps() {
+        List<StepResult> result = pendingSteps;
+        pendingSteps = null;
+        return result;
+    }
+
+    // ========== Collect ==========
+
+    /**
+     * Get accumulated log and clear buffer (for step/scenario end).
+     */
+    public String collect() {
+        String result = buffer.toString();
+        buffer.setLength(0);
+        return result;
+    }
+
+    /**
+     * Append previously-captured log content verbatim, bypassing level filtering.
+     * Used to carry log output across a LogContext reset (e.g. preserving
+     * karate-config.js logs into the fresh per-scenario LogContext).
+     */
+    public void appendCaptured(String content) {
+        if (capture && content != null && !content.isEmpty()) {
+            buffer.append(content);
+        }
+    }
+
+    /**
+     * Get accumulated log without clearing.
+     */
+    public String peek() {
+        return buffer.toString();
+    }
+
+    // ========== Format Helper ==========
+
+    /**
+     * Simple {} placeholder replacement (no SLF4J dependency).
+     */
+    static String format(String format, Object... args) {
+        if (args == null || args.length == 0) {
+            return format;
+        }
+        StringBuilder sb = new StringBuilder();
+        int argIndex = 0;
+        int i = 0;
+        while (i < format.length()) {
+            if (i < format.length() - 1 && format.charAt(i) == '{' && format.charAt(i + 1) == '}') {
+                if (argIndex < args.length) {
+                    sb.append(args[argIndex++]);
+                } else {
+                    sb.append("{}");
+                }
+                i += 2;
+            } else {
+                sb.append(format.charAt(i));
+                i++;
+            }
+        }
+        return sb.toString();
+    }
+
+    // ========== LogWriter Inner Class ==========
+
+    /**
+     * Fluent log writer that captures to LogContext buffer AND cascades to SLF4J.
+     * Thread-safe: each call gets the current thread's LogContext.
+     */
+    public static class LogWriter {
+
+        private final Logger logger;
+
+        LogWriter(Logger logger) {
+            this.logger = logger;
+        }
+
+        public void trace(String message) {
+            log(LogLevel.TRACE, message);
+            logger.trace(message);
+        }
+
+        public void debug(String message) {
+            log(LogLevel.DEBUG, message);
+            logger.debug(message);
+        }
+
+        public void info(String message) {
+            log(LogLevel.INFO, message);
+            logger.info(message);
+        }
+
+        public void warn(String message) {
+            log(LogLevel.WARN, message);
+            logger.warn(message);
+        }
+
+        public void error(String message) {
+            log(LogLevel.ERROR, message);
+            logger.error(message);
+        }
+
+        public boolean isDebugEnabled() {
+            return logger.isDebugEnabled();
+        }
+
+        public boolean isTraceEnabled() {
+            return logger.isTraceEnabled();
+        }
+
+        private void log(LogLevel level, String message) {
+            // The SLF4J call in every method above is deliberately unconditional: this is the
+            // path `print` and karate.log() take, and it must keep reaching the console at
+            // whatever level Logback allows even when the report buffer is off.
+            LogContext ctx = get();
+            if (ctx.capture && level.isEnabled(threshold)) {
+                ctx.buffer.append(message).append('\n');
+            }
+        }
+    }
+}

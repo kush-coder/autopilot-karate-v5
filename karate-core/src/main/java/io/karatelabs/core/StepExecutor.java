@@ -1,0 +1,3739 @@
+/*
+ * The MIT License
+ *
+ * Copyright 2025 Karate Labs Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package io.karatelabs.core;
+
+import io.karatelabs.common.DataUtils;
+import io.karatelabs.common.Json;
+import io.karatelabs.common.Resource;
+import io.karatelabs.common.StringUtils;
+import io.karatelabs.common.Xml;
+import org.w3c.dom.Node;
+import io.karatelabs.gherkin.Feature;
+import io.karatelabs.gherkin.MatchExpression;
+import io.karatelabs.gherkin.Step;
+import io.karatelabs.gherkin.Table;
+import io.karatelabs.http.AuthHandler;
+import io.karatelabs.http.BasicAuthHandler;
+import io.karatelabs.http.BearerAuthHandler;
+import io.karatelabs.http.ClientCredentialsAuthHandler;
+import io.karatelabs.http.HttpRequest;
+import io.karatelabs.http.HttpRequestBuilder;
+import io.karatelabs.http.HttpResponse;
+import io.karatelabs.gherkin.GherkinParser;
+import io.karatelabs.js.EngineException;
+import io.karatelabs.js.JavaCallable;
+import io.karatelabs.output.LogContext;
+import org.slf4j.Logger;
+import io.karatelabs.match.Match;
+import io.karatelabs.match.Result;
+
+import com.jayway.jsonpath.JsonPath;
+import com.jayway.jsonpath.PathNotFoundException;
+
+import java.io.File;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+public class StepExecutor {
+
+    private static final Logger logger = LogContext.RUNTIME_LOGGER;
+
+    private final ScenarioRuntime runtime;
+
+    // Call results accumulated during current step execution (for call/callonce steps)
+    private List<FeatureResult> stepCallResults;
+
+    public StepExecutor(ScenarioRuntime runtime) {
+        this.runtime = runtime;
+    }
+
+    void addCallResult(FeatureResult result) {
+        // Attach to the scenario actually running on this thread, not necessarily this
+        // executor's. When karate.call() is reached through a JS function whose bridge was
+        // captured in another scenario (a helper loaded once via callSingle and shared via
+        // config), getRuntime() resolves to that originating — and now dead — scenario, so
+        // its executor's buffer is never drained into a live step and the called feature
+        // vanishes from the report. Routing the result to the live scenario's executor
+        // makes it surface under the step that invoked the helper (#2928). For the ordinary
+        // call / keyword paths the live scenario IS this executor's, so this is a no-op.
+        StepExecutor target = collectingExecutor();
+        if (target.stepCallResults == null) {
+            target.stepCallResults = new ArrayList<>();
+        }
+        target.stepCallResults.add(result);
+    }
+
+    /**
+     * The executor whose step is currently collecting report output on this thread — the
+     * live scenario's, falling back to this one outside a scenario's call() (e.g. config
+     * evaluation, mock handling). Mirrors how logs and embeds already follow the thread via
+     * LogContext rather than the karate bridge's captured runtime.
+     */
+    private StepExecutor collectingExecutor() {
+        ScenarioRuntime current = ScenarioRuntime.currentOrNull();
+        return current != null ? current.getExecutor() : this;
+    }
+
+    /**
+     * Clear the call-results buffer so a non-step code path (a lifecycle hook) can
+     * collect karate.call() results in isolation from the previous step's execution.
+     */
+    void resetCallResults() {
+        stepCallResults = null;
+    }
+
+    /**
+     * Return accumulated call results and clear the buffer. Used by ScenarioRuntime
+     * when wrapping a lifecycle hook so the call results can be attached to a synthetic
+     * hook step instead of being discarded.
+     */
+    List<FeatureResult> drainCallResults() {
+        List<FeatureResult> out = stepCallResults;
+        stepCallResults = null;
+        return out;
+    }
+
+    private Suite getSuite() {
+        FeatureRuntime fr = runtime.getFeatureRuntime();
+        return fr != null ? fr.getSuite() : null;
+    }
+
+    public StepResult execute(Step step) {
+        long startTime = System.currentTimeMillis();
+        long startNanos = System.nanoTime();
+        // Note: stepCallResults is NOT cleared here. Any pending entries from pre-step JS
+        // evaluation (karate-config.js calling karate.call / karate.callSingle) belong to
+        // this step's callResults so they surface in the HTML / Cucumber JSON / JUnit report.
+        // The buffer is nulled inside collectLogsAndEmbeds AFTER attaching, so the next step
+        // still starts clean.
+
+        // Synthesized (fake) steps bypass listener events and the run interceptor.
+        boolean isFake = step.isFake();
+
+        // Fire STEP_ENTER event
+        Suite suite = isFake ? null : getSuite();
+        if (suite != null) {
+            boolean proceed = suite.fireEvent(StepRunEvent.enter(step, runtime));
+            if (!proceed) {
+                // Listener returned false - skip this step
+                StepResult skipped = StepResult.skipped(step, startTime);
+                collectLogsAndEmbeds(skipped);
+                return skipped;
+            }
+        }
+
+        @SuppressWarnings("unchecked")
+        io.karatelabs.js.RunInterceptor<Object> interceptor = isFake ? null
+                : (io.karatelabs.js.RunInterceptor<Object>) runtime.getInterceptor();
+        io.karatelabs.js.DebugPointFactory<Object> pointFactory = null;
+        Object point = null;
+        if (interceptor != null && runtime.getPointFactory() != null) {
+            @SuppressWarnings("unchecked")
+            io.karatelabs.js.DebugPointFactory<Object> factory = (io.karatelabs.js.DebugPointFactory<Object>) runtime.getPointFactory();
+            pointFactory = factory;
+            String sourcePath = step.getFeature().getResource().getRelativePath();
+            point = factory.create(io.karatelabs.js.DebugPointFactory.GHERKIN_STEP, step.getLine(), sourcePath, step, null);
+            io.karatelabs.js.RunInterceptor.Action action = interceptor.beforeExecute(point);
+            if (action == io.karatelabs.js.RunInterceptor.Action.SKIP) {
+                StepResult skipped = StepResult.skipped(step, startTime);
+                collectLogsAndEmbeds(skipped);
+                if (suite != null) {
+                    suite.fireEvent(StepRunEvent.exit(skipped, runtime));
+                }
+                return skipped;
+            } else if (action == io.karatelabs.js.RunInterceptor.Action.WAIT) {
+                action = interceptor.waitForResume();
+                if (action == io.karatelabs.js.RunInterceptor.Action.SKIP) {
+                    StepResult skipped = StepResult.skipped(step, startTime);
+                    collectLogsAndEmbeds(skipped);
+                    if (suite != null) {
+                        suite.fireEvent(StepRunEvent.exit(skipped, runtime));
+                    }
+                    return skipped;
+                }
+            }
+        }
+        // Keep these references for use in try/catch blocks
+        final io.karatelabs.js.RunInterceptor<Object> finalInterceptor = interceptor;
+        final io.karatelabs.js.DebugPointFactory<Object> finalPointFactory = pointFactory;
+        final Object finalPoint = point;
+
+        try {
+            String keyword = step.getKeyword();
+
+            String text = step.getText();
+            // Check if keyword contains punctuation - means it's a JS expression
+            // Examples: foo.bar, foo(), foo['bar'].baz('blah')
+            // Note: cases like foo[x] are handled by the lexer (rewinds to GS_RHS mode)
+            if (keyword != null && StepUtils.hasPunctuation(keyword)) {
+                String fullExpr = keyword + text;
+                if (step.getDocString() != null) {
+                    fullExpr = fullExpr + step.getDocString();
+                }
+                runtime.eval(fullExpr, step);
+            } else if (keyword == null) {
+                // Plain expression (e.g., "* print foo" or "* foo.bar()")
+                executeExpression(step);
+            } else {
+                switch (keyword) {
+                    // Variable assignment
+                    case "def" -> executeDef(step);
+                    case "set" -> executeSet(step);
+                    case "remove" -> executeRemove(step);
+                    case "text" -> executeText(step);
+                    case "json" -> executeJson(step);
+                    case "xml" -> executeXml(step);
+                    case "xmlstring" -> executeXmlString(step);
+                    case "string" -> executeString(step);
+                    case "bytes" -> executeBytes(step);
+                    case "csv" -> executeCsv(step);
+                    case "yaml" -> executeYaml(step);
+                    case "copy" -> executeCopy(step);
+                    case "table" -> executeTable(step);
+                    case "replace" -> executeReplace(step);
+
+                    // Assertions
+                    case "match" -> executeMatch(step);
+                    case "assert" -> executeAssert(step);
+                    case "print" -> executePrint(step);
+
+                    // HTTP
+                    case "url" -> executeUrl(step);
+                    case "path" -> executePath(step);
+                    case "param" -> executeParam(step);
+                    case "params" -> executeParams(step);
+                    case "header" -> executeHeader(step);
+                    case "headers" -> executeHeaders(step);
+                    case "cookie" -> executeCookie(step);
+                    case "cookies" -> executeCookies(step);
+                    case "form field" -> executeFormField(step);
+                    case "form fields" -> executeFormFields(step);
+                    case "request" -> executeRequest(step);
+                    case "retry until" -> executeRetryUntil(step);
+                    case "method" -> executeMethod(step);
+                    case "soap action" -> executeSoapAction(step);
+                    case "status" -> executeStatus(step);
+                    case "multipart file" -> executeMultipartFile(step);
+                    case "multipart field" -> executeMultipartField(step);
+                    case "multipart fields" -> executeMultipartFields(step);
+                    case "multipart files" -> executeMultipartFiles(step);
+                    case "multipart entity" -> executeMultipartEntity(step);
+
+                    // Control flow
+                    case "call" -> executeCall(step);
+                    case "callonce" -> executeCallOnce(step);
+                    case "eval" -> executeEval(step);
+                    case "doc" -> executeDoc(step);
+
+                    // Config
+                    case "configure" -> executeConfigure(step);
+
+                    // Browser driver
+                    case "driver" -> executeDriver(step);
+
+                    default -> {
+                        // Check if text starts with ( - means keyword is a function name like myFunc('a')
+                        // We only do this check here (not earlier) because valid keywords like "eval"
+                        // could have text starting with ( like "eval (1 + 2)"
+                        if (text != null && text.trim().startsWith("(")) {
+                            runtime.eval(keyword + text, step);
+                        } else {
+                            throw new RuntimeException("unknown keyword: " + keyword);
+                        }
+                    }
+                }
+            }
+
+            long elapsedNanos = System.nanoTime() - startNanos;
+            StepResult result = StepResult.passed(step, startTime, elapsedNanos);
+            collectLogsAndEmbeds(result);
+
+            // Notify interceptor of successful step execution
+            if (finalInterceptor != null && finalPointFactory != null) {
+                Object afterPoint = finalPoint;
+                if (afterPoint == null) {
+                    String sourcePath = step.getFeature().getResource().getRelativePath();
+                    afterPoint = finalPointFactory.create(io.karatelabs.js.DebugPointFactory.GHERKIN_STEP, step.getLine(), sourcePath, step, null);
+                }
+                finalInterceptor.afterExecute(afterPoint, result, null);
+            }
+
+            // Fire STEP_EXIT event
+            if (suite != null) {
+                suite.fireEvent(StepRunEvent.exit(result, runtime));
+            }
+
+            return result;
+
+        } catch (AssertionError | Exception e) {
+            long elapsedNanos = System.nanoTime() - startNanos;
+            // A `<Global> is not defined` whose ext the project forgot to declare gets that named here —
+            // the last point every step failure passes through, and after the recovery paths that branch
+            // on a raw ReferenceError (the ##() optional-embedded skip). Any other failure passes through
+            // untouched.
+            Throwable failure = ExtHint.decorate(e, suite);
+            StepResult result = StepResult.failed(step, startTime, elapsedNanos, failure);
+            collectLogsAndEmbeds(result);
+
+            // Notify interceptor of failed step execution
+            if (finalInterceptor != null && finalPointFactory != null) {
+                Object afterPoint = finalPoint;
+                if (afterPoint == null) {
+                    String sourcePath = step.getFeature().getResource().getRelativePath();
+                    afterPoint = finalPointFactory.create(io.karatelabs.js.DebugPointFactory.GHERKIN_STEP, step.getLine(), sourcePath, step, null);
+                }
+                finalInterceptor.afterExecute(afterPoint, result, failure);
+            }
+
+            // Fire STEP_EXIT event
+            if (suite != null) {
+                suite.fireEvent(StepRunEvent.exit(result, runtime));
+            }
+
+            return result;
+        }
+    }
+
+    private void collectLogsAndEmbeds(StepResult result) {
+        LogContext ctx = LogContext.get();
+        result.setLog(ctx.collect());
+        java.util.List<StepResult.Embed> embeds = ctx.collectEmbeds();
+        if (embeds != null) {
+            for (StepResult.Embed embed : embeds) {
+                result.addEmbed(embed);
+            }
+        }
+        // Set call results accumulated during this step's execution (plus any pending
+        // entries carried over from pre-step JS evaluation like karate-config.js).
+        if (stepCallResults != null && !stepCallResults.isEmpty()) {
+            result.setCallResults(stepCallResults);
+        }
+        // Wipe AFTER attaching so the next step starts with a clean buffer.
+        stepCallResults = null;
+    }
+
+    // ========== Expression Execution ==========
+
+    private void executeExpression(Step step) {
+        runtime.eval(step.getText(), step);
+    }
+
+    // ========== Variable Assignment ==========
+
+    private void executeDef(Step step) {
+        String text = step.getText();
+        int eqIndex = StepUtils.findAssignmentOperator(text);
+        if (eqIndex < 0) {
+            throw new RuntimeException("def requires '=' assignment: " + text);
+        }
+        String name = text.substring(0, eqIndex).trim();
+        validateVariableName(name);
+        String expr = text.substring(eqIndex + 1).trim();
+        String docString = step.getDocString();
+
+        // Handle docstring if expression is empty (docstring IS the RHS expression).
+        // Null it afterwards so it isn't ALSO treated as a separate call argument below.
+        if (expr.isEmpty() && docString != null) {
+            expr = docString;
+            docString = null;
+        }
+
+        // Check if RHS is a special karate expression (not standard JS)
+        if (expr.startsWith("call ")) {
+            String callExpr = appendDocStringCallArg(expr.substring(5).trim(), docString);
+            executeCallWithResult(callExpr, name);
+        } else if (expr.startsWith("callonce ")) {
+            String callExpr = appendDocStringCallArg(expr.substring(9).trim(), docString);
+            executeCallOnceWithResult(callExpr, name);
+        } else {
+            // Use common Karate expression evaluation which handles:
+            // - $varname/xpath, $varname[*].path (jsonpath)
+            // - get[N] varname path
+            // - <xml> literals
+            // - varname/xpath (XML XPath shorthand)
+            // - Regular JS expressions
+            Object value = evalKarateExpression(expr);
+            runtime.setVariable(name, value);
+        }
+    }
+
+    private void executeCallWithResult(String callExpr, String resultVar) {
+        // Try to evaluate the first token to see if it's a JS function or Feature
+        // Syntax: "fun" or "fun arg" where fun is a JS function variable or Feature
+        // Note: read('file.js') returns a JS function, read('file.feature') returns a Feature
+        StepUtils.CallParts parts = StepUtils.splitCallExpr(callExpr);
+        String firstToken = parts.callable();
+
+        // Check if it's a read() call for a literal feature file path - use parseCallExpression
+        // which properly handles embedded expressions like #(nodes)
+        // For read(variable) or read('file.js'), we evaluate to determine the type
+        if (StepUtils.isLiteralFeatureRead(callExpr)) {
+            // Fall through to standard feature call handling
+        } else {
+            // Type-probe first token as JS to distinguish js function / feature ref / path string.
+            // Only the probe itself is wrapped — failures inside the call must propagate, not
+            // silently fall through and cause double-execution.
+            Object evaluated = null;
+            try {
+                evaluated = runtime.eval(firstToken);
+            } catch (Exception e) {
+                // Not a valid JS expression, fall through to feature call
+                logger.debug("call target probe failed, treating as feature path: {}", e.getMessage());
+            }
+            if (evaluated instanceof JavaCallable fn) {
+                // It's a JS function - invoke it and store result.
+                // evalKarateExpression handles inline JSON with `#(...)`, lists,
+                // variables, and bare JS — single shared path for all call args.
+                Object arg = parts.arg() != null ? evalKarateExpression(parts.arg()) : null;
+                Object result = arg != null
+                        ? fn.call(null, new Object[]{arg})
+                        : fn.call(null, new Object[0]);
+                runtime.setVariable(resultVar, result);
+                return;
+            } else if (evaluated instanceof FeatureCall || evaluated instanceof Feature) {
+                executeFeatureCall(evaluated, parts.arg(), resultVar);
+                return;
+            }
+        }
+
+        // Standard feature call
+        CallExpression call = parseCallExpression(callExpr);
+        call.resultVar = resultVar;
+
+        // Resolve the feature file relative to current feature
+        FeatureRuntime fr = runtime.getFeatureRuntime();
+        Feature calledFeature;
+
+        if (call.sameFile) {
+            // Same-file tag call - use current feature
+            calledFeature = fr != null ? fr.getFeature() : null;
+            if (calledFeature == null) {
+                throw new RuntimeException("call with tag selector requires a feature context");
+            }
+        } else {
+            Resource calledResource = fr != null
+                    ? fr.resolve(call.path)
+                    : Resource.path(call.path);
+            calledFeature = Feature.read(calledResource);
+        }
+
+        // Check if it's an array loop call
+        if (call.argList != null) {
+            runtime.setVariable(resultVar, callFeatureLoop(calledFeature, call.argList, call.tagSelector, call.lineFilters));
+            return;
+        }
+
+        // Single call
+        Map<String, Object> resultVars = callFeatureSingle(calledFeature, call.arg, call.tagSelector, call.lineFilters);
+        if (resultVars != null) {
+            runtime.setVariable(resultVar, resultVars);
+        }
+    }
+
+    private void executeCallOnceWithResult(String callExpr, String resultVar) {
+        String cacheKey = "callonce:" + callExpr;
+
+        // Use feature-level cache (not suite-level) - callOnce is scoped per feature
+        FeatureRuntime fr = runtime.getFeatureRuntime();
+        if (fr == null) {
+            // No feature context - just execute normally
+            executeCallWithResult(callExpr, resultVar);
+            return;
+        }
+
+        Map<String, Object> cache = fr.getCallOnceCache();
+        java.util.concurrent.locks.ReentrantLock lock = fr.getCallOnceLock();
+
+        // Fast path - check cache without lock
+        Object cached = cache.get(cacheKey);
+        if (cached != null) {
+            // Return deep copy to prevent cross-scenario mutation
+            runtime.setVariable(resultVar, StepUtils.deepCopy(cached));
+            return;
+        }
+
+        // Slow path - acquire lock for execution
+        lock.lock();
+        try {
+            // Double-check after acquiring lock
+            Object rechecked = cache.get(cacheKey);
+            if (rechecked != null) {
+                runtime.setVariable(resultVar, StepUtils.deepCopy(rechecked));
+                return;
+            }
+
+            // Not cached - execute the call
+            executeCallWithResult(callExpr, resultVar);
+
+            // Cache a deep copy of the result (may be Map for single call or List for loop call)
+            Object resultValue = runtime.getVariable(resultVar);
+            if (resultValue != null) {
+                cache.put(cacheKey, StepUtils.deepCopy(resultValue));
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Build, run, and result-check a nested feature call. The single construction point
+     * for every call path (the `call` / `callonce` keywords, the `karate.call()` JS API,
+     * and the FeatureCall object path) so call semantics stay consistent. The called
+     * scenario's magic variables (__arg / __loop) are derived from the FeatureRuntime
+     * built here — see {@link ScenarioRuntime#initEngine}. A {@code loopIndex} of -1
+     * means "not a loop call". Returns the nested runtime so callers can pull results.
+     */
+    private FeatureRuntime runNestedFeature(Feature calledFeature, Map<String, Object> callArg,
+                                            boolean sharedScope, String tagSelector,
+                                            Set<Integer> lineFilters, int loopIndex) {
+        FeatureRuntime fr = runtime.getFeatureRuntime();
+        FeatureRuntime nestedFr = new FeatureRuntime(
+                fr != null ? fr.getSuite() : null,
+                calledFeature,
+                fr,
+                runtime,
+                sharedScope,
+                callArg,
+                tagSelector,
+                lineFilters
+        );
+        if (loopIndex >= 0) {
+            nestedFr.setLoopIndex(loopIndex);
+        }
+        FeatureResult featureResult = nestedFr.call();
+        addCallResult(featureResult);
+        checkFeatureResult(featureResult);
+        return nestedFr;
+    }
+
+    private static Map<String, Object> lastVars(FeatureRuntime nestedFr) {
+        return calleeResult(nestedFr.getLastExecuted());
+    }
+
+    /**
+     * The result map for an isolated-scope feature call: only the variables the called
+     * feature actually added or replaced, not the caller/config scope it merely inherited
+     * to read. A called feature runs with the caller's visible variables in scope, so its
+     * full binding set echoes them back; returning that would leak caller locals and
+     * config-level values into the result (and bloat logs). Matches v1, where inherited
+     * scope lived in a separate namespace excluded from the returned variables. Returns
+     * null when no scenario executed.
+     */
+    static Map<String, Object> calleeResult(ScenarioRuntime callee) {
+        if (callee == null) {
+            return null;
+        }
+        return StepUtils.calleeDelta(callee.getInheritedVariables(), callee.getAllVariables(),
+                callee.getAssignedVariables());
+    }
+
+    /**
+     * Execute a single isolated-scope feature call. Shared by the `call` / `callonce`
+     * keyword paths and the `karate.call()` JS API. Returns the last scenario's
+     * variables, or null if no scenario was executed. Throws on called-feature failure.
+     */
+    Map<String, Object> callFeatureSingle(Feature calledFeature, Map<String, Object> callArg, String tagSelector, Set<Integer> lineFilters) {
+        // Isolated scope - copy variables, don't share
+        return lastVars(runNestedFeature(calledFeature, callArg, false, tagSelector, lineFilters, -1));
+    }
+
+    /**
+     * Execute an array-loop call - iterate argList, invoking calledFeature in isolated
+     * scope once per element with __loop set to the iteration index. Shared by the
+     * `call` / `callonce` keyword paths and the `karate.call()` JS API.
+     */
+    @SuppressWarnings("unchecked")
+    List<Map<String, Object>> callFeatureLoop(Feature calledFeature, List<?> argList, String tagSelector, Set<Integer> lineFilters) {
+        List<Map<String, Object>> results = new ArrayList<>();
+        int loopIndex = 0;
+        for (Object item : argList) {
+            Map<String, Object> callArg = item instanceof Map ? (Map<String, Object>) item : null;
+            // Always isolated scope for array loop
+            Map<String, Object> vars = lastVars(runNestedFeature(calledFeature, callArg, false, tagSelector, lineFilters, loopIndex));
+            if (vars != null) {
+                results.add(vars);
+            }
+            loopIndex++;
+        }
+        return results;
+    }
+
+    void checkFeatureResult(FeatureResult featureResult) {
+        if (featureResult.isFailed()) {
+            String msg = featureResult.getFailureMessage();
+            throw new RuntimeException("called feature failed: "
+                    + featureResult.getDisplayName()
+                    + (msg != null ? " - " + msg : ""));
+        }
+    }
+
+    /**
+     * Propagate results from a called feature back to the caller.
+     * Handles both isolated scope (resultVar set) and shared scope (resultVar null).
+     * For shared scope, also propagates config, cookies, and driver.
+     */
+    private void propagateFromCallee(ScenarioRuntime calleeRuntime, String resultVar) {
+        if (calleeRuntime == null) {
+            return;
+        }
+        if (resultVar != null) {
+            // Isolated scope - store only the callee's own contribution (delta), not the
+            // caller/config scope it inherited to read. See calleeResult.
+            runtime.setVariable(resultVar, calleeResult(calleeRuntime));
+        } else {
+            // Shared scope - propagate all variables back to caller
+            Map<String, Object> resultVars = calleeRuntime.getAllVariables();
+            for (Map.Entry<String, Object> entry : resultVars.entrySet()) {
+                runtime.setVariable(entry.getKey(), entry.getValue());
+            }
+            // V1 compatibility: Also propagate config changes back to caller.
+            // The caller's HTTP client also needs to be re-projected so a callee-set
+            // proxy/ssl/timeout etc. takes effect on subsequent caller requests.
+            runtime.getConfig().copyFrom(calleeRuntime.getConfig());
+            runtime.getKarate().client.apply(runtime.getConfig());
+            // V1 compatibility: Also propagate cookie jar back to caller
+            runtime.getCookieJar().putAll(calleeRuntime.getCookieJar());
+            // Propagate driver upward for shared-scope calls (V1-compatible behavior)
+            if (calleeRuntime.getDriverIfPresent() != null) {
+                runtime.setDriverFromCallee(calleeRuntime);
+            }
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void executeSet(Step step) {
+        String text = step.getText().trim();
+        Table table = step.getTable();
+
+        if (table != null) {
+            // Table-based set: * set varname | path | value |
+            executeSetWithTable(text, table);
+            return;
+        }
+
+        // Check for Karate-style XML xpath: "varname /xpath = value"
+        // The key indicator is "space + /" pattern before the equals sign
+        int eqIndex = StepUtils.findAssignmentOperator(text);
+        if (eqIndex > 0) {
+            String leftPart = text.substring(0, eqIndex).trim();
+            String valueExpr = text.substring(eqIndex + 1).trim();
+            // An empty RHS means the docstring IS the expression — same rule as `def`.
+            // Splice it back into `text` as well, because the JS fall-through at the
+            // bottom re-reads `text` and would otherwise parse a dangling `=`.
+            if (valueExpr.isEmpty() && step.getDocString() != null) {
+                valueExpr = step.getDocString();
+                text = leftPart + " = " + valueExpr;
+            }
+
+            // Look for "varname /xpath" pattern (space followed by /)
+            int spaceSlashIdx = leftPart.indexOf(" /");
+            if (spaceSlashIdx > 0) {
+                String varName = leftPart.substring(0, spaceSlashIdx).trim();
+                String xpath = leftPart.substring(spaceSlashIdx + 1).trim();
+
+                Object target = runtime.getVariable(varName);
+                if (target == null) {
+                    throw new RuntimeException("variable is null or not set: " + varName);
+                }
+                if (!(target instanceof Node)) {
+                    throw new RuntimeException("cannot set xpath on non-XML variable: " + varName);
+                }
+
+                Object value = evalKarateExpression(valueExpr);
+                org.w3c.dom.Document doc = target instanceof org.w3c.dom.Document
+                        ? (org.w3c.dom.Document) target
+                        : ((Node) target).getOwnerDocument();
+                if (value instanceof Node) {
+                    Xml.setByPath(doc, xpath, (Node) value);
+                } else {
+                    Xml.setByPath(doc, xpath, value == null ? "" : value.toString());
+                }
+                return;
+            }
+
+            // V1-compatible: route LHS paths through Jayway. Covers JsonPath wildcards
+            // (`[*]`, `..`, `[?(...)]`) and auto-vivification of intermediate
+            // objects when an inner segment is undefined (e.g. `set foo.a.b = 1` where
+            // `foo.a` doesn't exist). JS-style dynamic indices like `arr[i]`
+            // fail `isPureJsonPath` and continue to route through the JS engine below.
+            // The v2-idiomatic alternative is a single `def` with an object literal;
+            // `set` is retained for v1 migration and XML xpath updates.
+            if (StepUtils.isPureJsonPath(leftPart)) {
+                StepUtils.VarAndPath vp = StepUtils.splitVarAndJsonPath(leftPart);
+                Object target = runtime.getVariable(vp.var);
+                if (target instanceof Map || target instanceof List) {
+                    Object value = evalKarateExpression(valueExpr);
+                    Json.of(target).set(vp.path, value);
+                    return;
+                }
+            }
+
+            // V1 compatibility: `set varname = expr` where varname is a bare identifier
+            // routes the RHS through evalKarateExpression — same path as `def`/`match`/
+            // `configure`. Without this, `set foo = { id: #(id) }` fails JS parsing on
+            // the `#`. This matches the broader RHS-semantics handling.
+            if (StepUtils.isPlainIdentifier(leftPart)) {
+                Object value = evalKarateExpression(valueExpr);
+                runtime.setVariable(leftPart, value);
+                return;
+            }
+        }
+
+        // Default: evaluate as JS expression (e.g., "foo.b = 2", "arr[0] = 99")
+        runtime.eval(text);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void executeSetWithTable(String varExpr, Table table) {
+        List<String> headers = new ArrayList<>(table.getKeys());
+        List<List<String>> rows = table.getRows();
+
+        // Determine the target variable and optional base path
+        // varExpr could be: "cat", "cat.kitten", "cat $.kitten", "search /xpath"
+        String varName;
+        String basePath = null;
+        int spaceIdx = varExpr.indexOf(' ');
+        int dotIdx = varExpr.indexOf('.');
+        if (spaceIdx > 0) {
+            varName = varExpr.substring(0, spaceIdx);
+            basePath = varExpr.substring(spaceIdx + 1).trim();
+        } else if (dotIdx > 0) {
+            varName = varExpr.substring(0, dotIdx);
+            basePath = varExpr.substring(dotIdx + 1);
+        } else {
+            varName = varExpr;
+        }
+
+        // Check if this is XML XPath-based table set (basePath starts with /)
+        // e.g., * set search /acc:getAccountByPhoneNumber
+        //       | path | value |
+        //       | acc:phoneNumber | 1234 |
+        if (basePath != null && basePath.startsWith("/")) {
+            executeSetXmlWithTable(varName, basePath, table);
+            return;
+        }
+
+        // Check if headers indicate array construction (column headers are numbers or "path"/"value")
+        boolean isPathValueFormat = headers.contains("path") && headers.contains("value");
+        boolean isArrayFormat = !isPathValueFormat && headers.size() > 1;
+
+        Object target = runtime.getVariable(varName);
+        if (target == null) {
+            target = isArrayFormat ? new ArrayList<>() : new LinkedHashMap<>();
+            runtime.setVariable(varName, target);
+        }
+
+        // Navigate to base path if specified
+        if (basePath != null && target instanceof Map) {
+            String cleanPath = basePath.startsWith("$.") ? basePath.substring(2) : basePath;
+            Object nested = StepUtils.getOrCreatePath((Map<String, Object>) target, cleanPath);
+            target = nested;
+        }
+
+        if (isPathValueFormat) {
+            // path | value format - skip header row (index 0)
+            int pathIdx = headers.indexOf("path");
+            int valueIdx = headers.indexOf("value");
+            for (int i = 1; i < rows.size(); i++) {
+                List<String> row = rows.get(i);
+                String path = row.get(pathIdx);
+                // Handle bounds - value column might not exist if row is shorter
+                String valueExpr = valueIdx < row.size() ? row.get(valueIdx) : "";
+                if (valueExpr == null || valueExpr.isEmpty()) continue;
+                // V1 behavior: (expr) with parens means "keep this value even if null"
+                boolean keepNull = valueExpr.startsWith("(") && valueExpr.endsWith(")");
+                Object value = runtime.eval(wrapJsonLikeExpression(valueExpr));
+                if (value != null || keepNull) {
+                    StepUtils.setValueAtPath(target, path, value);
+                }
+            }
+        } else if (isArrayFormat) {
+            // Column headers are array indices or just positional
+            // path | 0 | 1 | 2 format
+            int pathIdx = headers.indexOf("path");
+            if (pathIdx < 0) pathIdx = 0; // first column is path
+
+            List<Object> resultList;
+            if (target instanceof List) {
+                resultList = (List<Object>) target;
+            } else {
+                resultList = new ArrayList<>();
+                runtime.setVariable(varName, resultList);
+            }
+
+            // Ensure list has enough elements
+            int maxIdx = 0;
+            for (int i = 0; i < headers.size(); i++) {
+                if (i == pathIdx) continue;
+                try {
+                    int idx = Integer.parseInt(headers.get(i));
+                    maxIdx = Math.max(maxIdx, idx + 1);
+                } catch (NumberFormatException e) {
+                    maxIdx = Math.max(maxIdx, i);
+                }
+            }
+            while (resultList.size() < maxIdx) {
+                resultList.add(new LinkedHashMap<>());
+            }
+
+            // Fill in values - skip header row (index 0)
+            for (int rowIdx = 1; rowIdx < rows.size(); rowIdx++) {
+                List<String> row = rows.get(rowIdx);
+                String path = row.get(pathIdx);
+                for (int i = 0; i < headers.size(); i++) {
+                    if (i == pathIdx) continue;
+                    // Check bounds - rows may have fewer cells than headers if trailing cells are empty
+                    if (i >= row.size()) continue;
+                    String valueExpr = row.get(i);
+                    if (valueExpr == null || valueExpr.isEmpty()) continue;
+
+                    int targetIdx;
+                    try {
+                        targetIdx = Integer.parseInt(headers.get(i));
+                    } catch (NumberFormatException e) {
+                        targetIdx = i - (pathIdx < i ? 1 : 0);
+                    }
+
+                    while (resultList.size() <= targetIdx) {
+                        resultList.add(new LinkedHashMap<>());
+                    }
+
+                    // V1 behavior: (expr) with parens means "keep this value even if null"
+                    boolean keepNull = valueExpr.startsWith("(") && valueExpr.endsWith(")");
+                    Object value = runtime.eval(wrapJsonLikeExpression(valueExpr));
+                    if (value != null || keepNull) {
+                        Object element = resultList.get(targetIdx);
+                        if (element == null) {
+                            element = new LinkedHashMap<>();
+                            resultList.set(targetIdx, element);
+                        }
+                        StepUtils.setValueAtPath(element, path, value);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Handle set with table for XML auto-build.
+     * e.g., * set search /acc:getAccountByPhoneNumber
+     *       | path | value |
+     *       | acc:phoneNumber | 1234 |
+     * This creates XML structure from XPath paths.
+     */
+    private void executeSetXmlWithTable(String varName, String basePath, Table table) {
+        List<String> headers = new ArrayList<>(table.getKeys());
+        List<List<String>> rows = table.getRows();
+
+        // Create or get existing XML document
+        Object existing = runtime.getVariable(varName);
+        org.w3c.dom.Document doc;
+        if (existing instanceof org.w3c.dom.Document) {
+            doc = (org.w3c.dom.Document) existing;
+        } else if (existing instanceof org.w3c.dom.Node) {
+            doc = ((org.w3c.dom.Node) existing).getOwnerDocument();
+        } else {
+            doc = Xml.newDocument();
+            runtime.setVariable(varName, doc);
+        }
+
+        // Ensure the base path root element exists
+        Xml.getNodeByPath(doc, basePath, true);
+
+        // Determine column indices for path and value
+        int pathIdx = headers.indexOf("path");
+        int valueIdx = headers.indexOf("value");
+        if (pathIdx < 0) pathIdx = 0;
+
+        // Check if this is multi-column indexed format: | path | 1 | 2 | 3 |
+        // Headers after 'path' would be numeric index values
+        List<Integer> indexColumns = new ArrayList<>();
+        for (int col = 0; col < headers.size(); col++) {
+            if (col == pathIdx) continue;
+            String header = headers.get(col);
+            try {
+                Integer.parseInt(header);
+                indexColumns.add(col);
+            } catch (NumberFormatException e) {
+                // Not a numeric column
+            }
+        }
+
+        if (!indexColumns.isEmpty()) {
+            // Multi-column indexed format: | path | 1 | 2 | 3 |
+            // Process each row (skip header row at index 0)
+            for (int i = 1; i < rows.size(); i++) {
+                List<String> row = rows.get(i);
+                if (row.size() <= pathIdx) continue;
+                String rowPath = row.get(pathIdx);
+
+                // Process each indexed column
+                for (int col : indexColumns) {
+                    if (col >= row.size()) continue;
+                    String valueExpr = row.get(col);
+                    if (valueExpr == null || valueExpr.isEmpty()) continue;
+
+                    // Get the index value from the header
+                    String indexStr = headers.get(col);
+                    // Build path: basePath[index]/rowPath
+                    String fullPath = basePath + "[" + indexStr + "]/" + rowPath;
+
+                    // Evaluate the value expression
+                    Object value = evalKarateExpression(valueExpr);
+
+                    // Set the value at the XPath
+                    if (value instanceof org.w3c.dom.Node) {
+                        Xml.setByPath(doc, fullPath, (org.w3c.dom.Node) value);
+                    } else {
+                        Xml.setByPath(doc, fullPath, value == null ? "" : value.toString());
+                    }
+                }
+            }
+        } else {
+            // Standard format: | path | value |
+            if (valueIdx < 0) valueIdx = 1;
+
+            // Process each row (skip header row at index 0)
+            for (int i = 1; i < rows.size(); i++) {
+                List<String> row = rows.get(i);
+                if (row.size() <= pathIdx) continue;
+                String rowPath = row.get(pathIdx);
+                String valueExpr = valueIdx < row.size() ? row.get(valueIdx) : "";
+                if (valueExpr == null || valueExpr.isEmpty()) continue;
+
+                // Build the full XPath: basePath + "/" + rowPath
+                String fullPath = basePath + "/" + rowPath;
+
+                // Evaluate the value expression (use evalKarateExpression for XML literal support)
+                Object value = evalKarateExpression(valueExpr);
+
+                // Set the value at the XPath
+                if (value instanceof org.w3c.dom.Node) {
+                    Xml.setByPath(doc, fullPath, (org.w3c.dom.Node) value);
+                } else {
+                    Xml.setByPath(doc, fullPath, value == null ? "" : value.toString());
+                }
+            }
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void executeRemove(Step step) {
+        String text = step.getText().trim();
+
+        // Check for path syntax: "varName xpath" or "varName $jsonpath"
+        int spaceIndex = text.indexOf(' ');
+        if (spaceIndex > 0) {
+            String varName = text.substring(0, spaceIndex);
+            String path = text.substring(spaceIndex + 1).trim();
+
+            Object target = runtime.getVariable(varName);
+            if (target == null) return;
+
+            // Handle XPath removal - path starts with /
+            if (path.startsWith("/") && target instanceof Node node) {
+                org.w3c.dom.Document doc = node instanceof org.w3c.dom.Document
+                        ? (org.w3c.dom.Document) node
+                        : node.getOwnerDocument();
+                Xml.removeByPath(doc, path);
+                return;
+            }
+
+            // Handle jsonpath removal
+            if (path.startsWith("$")) {
+                if (target instanceof Map || target instanceof List) {
+                    Json.of(target).remove(path);
+                    return;
+                }
+                // Fallback: traverse and remove for simple paths
+                String pathWithoutDollar = path.substring(1);
+                if (pathWithoutDollar.startsWith(".")) {
+                    pathWithoutDollar = pathWithoutDollar.substring(1);
+                }
+                if (target instanceof Map) {
+                    Map<String, Object> map = (Map<String, Object>) target;
+                    StepUtils.removeAtPath(map, pathWithoutDollar);
+                }
+            }
+        } else {
+            // V1-compatible JsonPath wildcard support: e.g. * remove body[*].value
+            // JS can't parse [*] / .. / [? — route these through Jayway.
+            if (StepUtils.containsJsonPathWildcard(text)) {
+                StepUtils.VarAndPath vp = StepUtils.splitVarAndJsonPath(text);
+                Object target = runtime.getVariable(vp.var);
+                if (target instanceof Map || target instanceof List) {
+                    Json.of(target).remove(vp.path);
+                    return;
+                }
+            }
+            // Pure-JsonPath dot path — route through Jayway, mirroring `set`. Covers
+            // hyphenated keys like `remove obj.hyphen-key`, which would otherwise hit the
+            // `delete` JS-eval fallback below and be misread as subtraction (issue #2896).
+            if (StepUtils.isPureJsonPath(text)) {
+                StepUtils.VarAndPath vp = StepUtils.splitVarAndJsonPath(text);
+                Object target = runtime.getVariable(vp.var);
+                if (target instanceof Map || target instanceof List) {
+                    Json.of(target).remove(vp.path);
+                    return;
+                }
+            }
+            // Check for dot notation: "varName.key" or just "varName"
+            int dotIndex = text.indexOf('.');
+            if (dotIndex < 0) {
+                // Remove entire variable
+                runtime.setVariable(text, null);
+            } else {
+                // Remove nested property - use delete in JS
+                runtime.eval("delete " + text);
+            }
+        }
+    }
+
+    private void executeText(Step step) {
+        String text = step.getText();
+        int eqIndex = StepUtils.findAssignmentOperator(text);
+        String name = text.substring(0, eqIndex).trim();
+        // text keyword preserves the docstring as-is (no JS evaluation)
+        String value = step.getDocString();
+        if (value == null) {
+            value = text.substring(eqIndex + 1).trim();
+        }
+        runtime.setVariable(name, value);
+    }
+
+    private void executeJson(Step step) {
+        String text = step.getText();
+        int eqIndex = StepUtils.findAssignmentOperator(text);
+        String name = text.substring(0, eqIndex).trim();
+        // a doc string is the RHS, same as xml / yaml / csv / bytes / text: json foo = """..."""
+        String expr = step.getDocString() != null
+                ? step.getDocString()
+                : text.substring(eqIndex + 1).trim();
+        // Use evalKarateExpression to handle XML literals like: json foo = <bar>baz</bar>
+        // It is also what resolves embedded expressions for a JSON literal RHS - and only for
+        // a literal. That split is deliberate and v1-exact: text the user typed at this step is
+        // a template, so '#(var)' is substituted, but a string parsed into JSON here (typically
+        // karate.readAsString() of a schema file) is left exactly as authored. Re-processing it
+        // would inline an '##(subSchema)' reference and silently turn an optional nested schema
+        // into a required one - see the match engine, which resolves both markers at match time.
+        Object value = evalKarateExpression(expr);
+        // Convert to JSON map/object
+        if (value instanceof Node) {
+            value = Xml.toObject((Node) value);
+        } else if (value instanceof String s) {
+            // Parse string as JSON: json foo = strVar where strVar = '{ "foo": "bar" }'
+            value = Json.of(s).value();
+        } else if (value instanceof Map || value instanceof List) {
+            // Already JSON-like, keep as is
+        } else if (value != null) {
+            // POJO or other Java object - convert using Jackson
+            value = Json.of(value).value();
+        }
+        runtime.setVariable(name, value);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void executeXml(Step step) {
+        String text = step.getText();
+        int eqIndex = StepUtils.findAssignmentOperator(text);
+        String name = text.substring(0, eqIndex).trim();
+        String expr;
+        if (step.getDocString() != null) {
+            expr = step.getDocString();
+        } else {
+            expr = text.substring(eqIndex + 1).trim();
+        }
+        // Evaluate expression using Karate expression evaluation (handles $var /xpath, etc.)
+        Object value = evalKarateExpression(expr);
+        if (value instanceof String) {
+            value = Xml.toXmlDoc((String) value);
+        } else if (value instanceof Node) {
+            // Already XML, keep as is
+        } else if (value instanceof Map) {
+            // JSON/Map to XML
+            value = Xml.fromMap((Map<String, Object>) value);
+        } else if (value != null) {
+            // POJO or other Java object - convert to JSON first, then wrap in root element
+            Object jsonValue = Json.of(value).value();
+            value = Xml.fromObject("root", jsonValue);
+        }
+        runtime.setVariable(name, value);
+    }
+
+    private void executeXmlString(Step step) {
+        String text = step.getText();
+        int eqIndex = StepUtils.findAssignmentOperator(text);
+        String name = text.substring(0, eqIndex).trim();
+        String expr = text.substring(eqIndex + 1).trim();
+        Object value = runtime.eval(wrapJsonLikeExpression(expr));
+        // Convert to XML string representation
+        String xmlString;
+        if (value instanceof Node) {
+            xmlString = Xml.toString((Node) value, false);
+        } else {
+            xmlString = value.toString();
+        }
+        runtime.setVariable(name, xmlString);
+    }
+
+    private void executeString(Step step) {
+        String text = step.getText();
+        int eqIndex = StepUtils.findAssignmentOperator(text);
+        String name = text.substring(0, eqIndex).trim();
+        String expr = text.substring(eqIndex + 1).trim();
+        Object value = runtime.eval(wrapJsonLikeExpression(expr));
+        // Process embedded expressions like #(foo)
+        value = processEmbeddedExpressions(value);
+        // Convert to string representation - XML uses Xml.toString(), others use JSON
+        String stringValue;
+        if (value instanceof Node) {
+            stringValue = Xml.toString((Node) value, false);
+        } else {
+            stringValue = Json.stringifyStrict(value);
+        }
+        runtime.setVariable(name, stringValue);
+    }
+
+    private void executeBytes(Step step) {
+        String text = step.getText();
+        int eqIndex = StepUtils.findAssignmentOperator(text);
+        String name = text.substring(0, eqIndex).trim();
+        Object value;
+        if (step.getDocString() != null) {
+            // Doc string: bytes data = """..."""
+            value = step.getDocString();
+        } else {
+            // Expression: bytes data = someVar / read('file')
+            String expr = text.substring(eqIndex + 1).trim();
+            value = runtime.eval(wrapJsonLikeExpression(expr));
+            value = processEmbeddedExpressions(value);
+        }
+        runtime.setVariable(name, Json.toBytes(value));
+    }
+
+    private void executeCsv(Step step) {
+        String text = step.getText();
+        int eqIndex = StepUtils.findAssignmentOperator(text);
+        String name = text.substring(0, eqIndex).trim();
+        String csvText;
+        if (step.getDocString() != null) {
+            // Doc string: csv data = """..."""
+            csvText = step.getDocString();
+        } else {
+            // Expression: csv data = someVar
+            String expr = text.substring(eqIndex + 1).trim();
+            Object value = runtime.eval(expr);
+            if (value instanceof byte[]) {
+                csvText = new String((byte[]) value, StandardCharsets.UTF_8);
+            } else {
+                csvText = value.toString();
+            }
+        }
+        List<Map<String, Object>> result = DataUtils.fromCsv(csvText);
+        runtime.setVariable(name, result);
+    }
+
+    private void executeYaml(Step step) {
+        String text = step.getText();
+        int eqIndex = StepUtils.findAssignmentOperator(text);
+        String name = text.substring(0, eqIndex).trim();
+        String yamlText;
+        if (step.getDocString() != null) {
+            // Doc string: yaml data = """..."""
+            yamlText = step.getDocString();
+        } else {
+            // Expression: yaml data = someVar
+            String expr = text.substring(eqIndex + 1).trim();
+            Object value = runtime.eval(expr);
+            yamlText = value.toString();
+        }
+        Object result = DataUtils.fromYaml(yamlText);
+        runtime.setVariable(name, result);
+    }
+
+    private void executeCopy(Step step) {
+        String text = step.getText();
+        int eqIndex = StepUtils.findAssignmentOperator(text);
+        String name = text.substring(0, eqIndex).trim();
+        String expr = text.substring(eqIndex + 1).trim();
+        Object value = runtime.eval(wrapJsonLikeExpression(expr));
+        // a JSON round-trip would mangle non-JSON values: byte[] (writer crash), XML Node
+        // (degrades to a toString garbage string), even a top-level string (not valid JSON)
+        Object copy = StepUtils.deepCopy(value);
+        runtime.setVariable(name, copy);
+    }
+
+    private void executeTable(Step step) {
+        String text = step.getText().trim();
+        Table table = step.getTable();
+        if (table == null) {
+            throw new RuntimeException("table keyword requires a data table");
+        }
+        // Get raw string values, then evaluate each as a Karate expression (V1 behavior)
+        List<Map<String, String>> rawRows = table.getRowsAsMaps();
+        List<Map<String, Object>> result = new ArrayList<>(rawRows.size());
+        for (Map<String, String> rawRow : rawRows) {
+            Map<String, Object> row = new LinkedHashMap<>(rawRow.size());
+            for (Map.Entry<String, String> entry : rawRow.entrySet()) {
+                String expr = entry.getValue();
+                if (expr == null || expr.isEmpty()) {
+                    // Skip empty values (V1 strips these by default)
+                    continue;
+                }
+                // V1 behavior: (expr) with parens means "keep this value even if null"
+                // Without parens, null values are skipped
+                boolean keepNull = expr.startsWith("(") && expr.endsWith(")");
+                Object value = runtime.eval(wrapJsonLikeExpression(expr));
+                if (value != null || keepNull) {
+                    row.put(entry.getKey(), value);
+                }
+            }
+            result.add(row);
+        }
+        runtime.setVariable(text, result);
+    }
+
+    private void executeReplace(Step step) {
+        String text = step.getText();
+        Table table = step.getTable();
+
+        if (table != null) {
+            // Table syntax: replace varName
+            //   | token | value   |
+            //   | one   | 'cruel' |
+            String varName = text.trim();
+            Object varValue = runtime.getVariable(varName);
+            if (varValue == null) {
+                throw new RuntimeException("no variable found with name: " + varName);
+            }
+            String varText;
+            if (varValue instanceof Node) {
+                varText = Xml.toString((Node) varValue, false);
+            } else if (varValue instanceof Map || varValue instanceof List) {
+                varText = Json.stringifyStrict(varValue);
+            } else {
+                varText = varValue.toString();
+            }
+
+            // Process each row in the table
+            List<Map<String, String>> rows = table.getRowsAsMaps();
+            for (Map<String, String> row : rows) {
+                String token = row.get("token");
+                String valueExpr = row.get("value");
+
+                // Evaluate the replacement expression
+                Object replaceValue = runtime.eval(valueExpr);
+                String replacement = replaceValue != null ? replaceValue.toString() : "";
+
+                // If token is alphanumeric, wrap with < >
+                if (token != null && !token.isEmpty() && Character.isLetterOrDigit(token.charAt(0))) {
+                    token = '<' + token + '>';
+                }
+
+                // Perform replacement
+                if (token != null) {
+                    varText = varText.replace(token, replacement);
+                }
+            }
+            runtime.setVariable(varName, varText);
+        } else {
+            // Single-line syntax: replace varName.token = 'replacement'
+            int eqIndex = StepUtils.findAssignmentOperator(text);
+            if (eqIndex < 0) {
+                throw new RuntimeException("replace requires '=' assignment: " + text);
+            }
+            String nameAndToken = text.substring(0, eqIndex).trim();
+            String replaceExpr = text.substring(eqIndex + 1).trim();
+
+            // Parse varName.token
+            int dotIndex = nameAndToken.indexOf('.');
+            if (dotIndex < 0) {
+                throw new RuntimeException("replace requires varName.token syntax: " + nameAndToken);
+            }
+            String varName = nameAndToken.substring(0, dotIndex).trim();
+            String token = nameAndToken.substring(dotIndex + 1).trim();
+
+            // Get the variable value as string
+            Object varValue = runtime.getVariable(varName);
+            if (varValue == null) {
+                throw new RuntimeException("no variable found with name: " + varName);
+            }
+            String varText;
+            if (varValue instanceof Node) {
+                varText = Xml.toString((Node) varValue, false);
+            } else if (varValue instanceof Map || varValue instanceof List) {
+                varText = Json.stringifyStrict(varValue);
+            } else {
+                varText = varValue.toString();
+            }
+
+            // Evaluate the replacement expression
+            Object replaceValue = runtime.eval(replaceExpr);
+            String replacement = replaceValue != null ? replaceValue.toString() : "";
+
+            // If token is alphanumeric, wrap with < >
+            if (!token.isEmpty() && Character.isLetterOrDigit(token.charAt(0))) {
+                token = '<' + token + '>';
+            }
+
+            // Perform replacement and update variable
+            String replaced = varText.replace(token, replacement);
+            runtime.setVariable(varName, replaced);
+        }
+    }
+
+    // ========== Assertions ==========
+
+    private void executeMatch(Step step) {
+        Result result = evalMatchString(step.getText(), step.getDocString());
+        if (!result.pass) {
+            throw new AssertionError(withCommentLabel(step, result.message));
+        }
+    }
+
+    /**
+     * Prepend the step's closest preceding Gherkin comment as an assertion label, so a
+     * {@code # explains what this checks} line above a {@code match} / {@code assert} rides
+     * along in the failure message. The console summary lifts this label back out and renders
+     * it above the step line (where it sits in the feature). Shared by {@code match} and
+     * {@code assert} so the two analogous assertions behave identically.
+     */
+    private static String withCommentLabel(Step step, String message) {
+        List<String> comments = step.getComments();
+        if (comments != null && !comments.isEmpty()) {
+            // the last comment is the one closest to the step
+            return comments.getLast() + "\n" + message;
+        }
+        return message;
+    }
+
+    /**
+     * Parses and evaluates a full match-expression string (e.g. {@code "foo contains { a: 1 }"}
+     * or {@code "$json.orders[*].category contains 'electronics'"}) and returns the
+     * {@link Result}. Both operands route through {@link #evalMatchExpression}, so a `$`-prefixed
+     * JsonPath (wildcards included) resolves identically on either side — exactly as the `match`
+     * keyword does. This is the single entry point shared by the `match` keyword
+     * ({@link #executeMatch}) and the {@code karate.match("...")} JS API, so the two never drift.
+     *
+     * @param expression the match expression sans the leading {@code match} keyword
+     * @param docString   optional doc-string supplying the expected value (keyword path only;
+     *                    pass {@code null} from the JS API)
+     */
+    public Result evalMatchString(String expression, String docString) {
+        MatchExpression expr = GherkinParser.parseMatchExpression(expression);
+        Object actual = evalMatchExpression(expr.getActualExpr(), false);
+        Object expected;
+        if (docString != null && (expr.getExpectedExpr() == null || expr.getExpectedExpr().isEmpty())) {
+            // DocString provides the expected value (e.g. match foo contains deep """ {...} """)
+            expected = evalMatchExpression(docString, true);
+        } else {
+            expected = evalMatchExpression(expr.getExpectedExpr(), true);
+        }
+        Match.Type matchType = Match.Type.valueOf(expr.getMatchTypeName());
+        boolean matchEachEmptyAllowed = runtime.getConfig().isMatchEachEmptyAllowed();
+        Result result = Match.execute(runtime.getEngine(), runtime.markerPolicy(), matchType, actual, expected, matchEachEmptyAllowed);
+        String expectedExpr = docString != null && (expr.getExpectedExpr() == null || expr.getExpectedExpr().isEmpty())
+                ? docString : expr.getExpectedExpr();
+        // fired before the caller throws, so a failed match still carries its evidence
+        fireMatchEvent(matchType, expr.getActualExpr(), expectedExpr, actual, expected, result);
+        return result;
+    }
+
+    /** Best-effort — {@link Suite#fireEvent} does not shield the caller from a listener, and an
+     *  evidence listener must never fail the assertion it is observing. */
+    private void fireMatchEvent(Match.Type matchType, String actualExpr, String expectedExpr,
+                                Object actual, Object expected, Result result) {
+        Suite suite = getSuite();
+        if (suite == null) {
+            return;
+        }
+        try {
+            suite.fireEvent(MatchRunEvent.exit(matchType, actualExpr, expectedExpr, actual, expected, result, runtime));
+        } catch (Exception e) {
+            logger.debug("match event listener failed: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Evaluates expressions in match statements, handling both JS and jsonpath.
+     * Detects jsonpath patterns like var[*].path, $var[*].path, and uses
+     * jsonpath evaluation for those instead of JS.
+     */
+    private Object evalMatchExpression(String expr, boolean forMatch) {
+        if (expr == null || expr.isEmpty()) {
+            return null;
+        }
+
+        // Handle XML literal - expression starting with <
+        if (expr.startsWith("<")) {
+            return Xml.toXmlDoc(expr);
+        }
+
+        // Handle JSON literal - expression starting with { or [
+        // V1 behavior: parse as JSON first, then evaluate embedded expressions
+        if (StringUtils.looksLikeJson(expr)) {
+            try {
+                Object value = Json.of(expr).value();
+                warnBareReferences(expr, value);
+                // Process embedded expressions like #(varName) in the parsed JSON
+                return processEmbeddedExpressions(value, false, forMatch);
+            } catch (Exception e) {
+                // Fall through to JS eval if JSON parsing fails
+            }
+        }
+
+        // Handle "header <name>" syntax for accessing response headers (V1 compatibility)
+        // e.g., "match header Content-Type contains 'application/json'"
+        if (expr.startsWith("header ")) {
+            String headerName = expr.substring(7).trim();
+            return getResponseHeader(headerName);
+        }
+
+        // Handle get[N] or get syntax (same as in def)
+        if (expr.startsWith("get[") || expr.startsWith("get ")) {
+            return evalGetExpression(expr);
+        }
+
+        // Handle $varname patterns - could be jsonpath OR xpath on XML variable
+        // $varname/xpath, $varname /xpath, $[...], $., $varname[*].path
+        if (expr.startsWith("$")) {
+            // A missing JSONPath surfaces as #notpresent — see evalDollarPrefixedExpression.
+            return evalDollarPrefixedExpression(expr);
+        }
+
+        // Handle bare xpath on response: "//xpath" or "/xpath"
+        // e.g., "match //myelement == 'foo'" operates on response variable
+        if (expr.startsWith("/")) {
+            Object response = runtime.getVariable("response");
+            if (response instanceof Node) {
+                return KarateJsUtils.evalXmlPath((Node) response, expr);
+            }
+        }
+
+        // Handle "varname /" syntax - XPath root shortcut for XML variable
+        // e.g., "temp /" means the root of the XML document stored in 'temp'
+        if (expr.endsWith(" /") || expr.equals("/")) {
+            String varName = expr.endsWith(" /") ? expr.substring(0, expr.length() - 2).trim() : null;
+            if (varName != null) {
+                Object target = runtime.getVariable(varName);
+                if (target instanceof Node) {
+                    return target; // Return the XML node directly
+                }
+            }
+        }
+
+        // Handle XPath patterns with or without space:
+        // - "varname /xpath/path" (with space)
+        // - "varname/xpath/path" (no space) - V1 compatibility
+        // - "varname //xpath" (double-slash xpath)
+        Object xpathResult = tryEvalXPathExpression(expr);
+        if (xpathResult != null) {
+            // If XPath was evaluated but path not found, return #notpresent
+            if (xpathResult == XPATH_NOT_PRESENT) {
+                return "#notpresent";
+            }
+            return xpathResult;
+        }
+
+        // Handle XPath function syntax: "varname function(/xpath)"
+        // e.g., "foo count(/records//record)" or "xml //record[@index=2]"
+        int spaceIdx = expr.indexOf(' ');
+        if (spaceIdx > 0) {
+            String varName = expr.substring(0, spaceIdx);
+            String remainder = expr.substring(spaceIdx + 1).trim();
+            // Check if remainder is XPath (starts with /) or XPath function (like count(...))
+            if (remainder.startsWith("/") || isXPathFunction(remainder)) {
+                Object target = runtime.getVariable(varName);
+                if (target instanceof Node) {
+                    return evalXmlPathWithFunction((Node) target, remainder);
+                }
+            }
+        }
+
+        // Check if expression contains jsonpath wildcard [*], filter [?(...)] or deep-scan (..)
+        if (expr.contains("[*]") || expr.contains("[?") || expr.contains("..")) {
+            // Check if it's var[*].path, var[?...].path, var..path, or var.prop[*].path pattern
+            int bracketIdx = expr.indexOf('[');
+            int doubleDotIdx = expr.indexOf("..");
+            // Split at whichever operator appears first — e.g. `response..items[*].type`
+            // would otherwise split at `[` and try to JS-eval `response..items`.
+            int splitIdx;
+            if (bracketIdx > 0 && (doubleDotIdx < 0 || bracketIdx < doubleDotIdx)) {
+                splitIdx = bracketIdx;
+            } else {
+                splitIdx = doubleDotIdx;
+            }
+            if (splitIdx > 0) {
+                String basePath = expr.substring(0, splitIdx);
+                // Verify it starts with a valid identifier
+                int firstDot = basePath.indexOf('.');
+                String varName = firstDot > 0 ? basePath.substring(0, firstDot) : basePath;
+                if (varName.matches("[a-zA-Z_][a-zA-Z0-9_]*")) {
+                    Object target;
+                    if (firstDot > 0) {
+                        // Evaluate dotted path (e.g., "response.kittens") via JS
+                        target = runtime.eval(basePath);
+                    } else {
+                        target = runtime.getVariable(varName);
+                    }
+                    if (target != null) {
+                        String jsonPath = "$" + expr.substring(splitIdx);
+                        return JsonPath.read(target, jsonPath);
+                    }
+                }
+            }
+        }
+
+        // Handle "varname $jsonpath" pattern for JSONPath on a variable
+        // e.g., "jsonVar $.root.foo._" means apply JSONPath "$.root.foo._" to jsonVar
+        int dollarIdx = expr.indexOf(" $");
+        if (dollarIdx > 0) {
+            String varName = expr.substring(0, dollarIdx).trim();
+            String jsonPath = expr.substring(dollarIdx + 1).trim();
+            if (StepUtils.isValidVariableName(varName) && jsonPath.startsWith("$")) {
+                Object target = runtime.getVariable(varName);
+                if (target != null) {
+                    return JsonPath.read(target, jsonPath);
+                }
+            }
+        }
+
+        // Default: evaluate as JS. A pure property-access chain (dots/brackets, no
+        // function call) is JSON navigation; v1 routed it through JsonPath and degraded
+        // a missing path to #notpresent. Mirror that for both shapes the JS engine can
+        // produce: a null leaf (eval returns null, handled below) and an undefined/null
+        // intermediate (eval throws a TypeError before reaching the leaf, handled here).
+        boolean propertyAccessChain = expr.contains(".") && !expr.contains("(");
+        Object result;
+        try {
+            result = runtime.eval(wrapJsonLikeExpression(expr));
+        } catch (Exception e) {
+            // Navigating through an undefined/null intermediate throws. Degrade to
+            // #notpresent — but only when the chain's root variable is actually defined,
+            // so a genuinely undefined root (e.g. a typo'd variable) still surfaces.
+            if (propertyAccessChain && rootVariableDefined(expr)) {
+                return "#notpresent";
+            }
+            throw e;
+        }
+
+        // Check for "not present" case: if result is null and expression is property access
+        // We need to distinguish between "property exists and is null" vs "property doesn't exist"
+        if (result == null && propertyAccessChain) {
+            // Check if it's a simple property access like "foo.bar"
+            int lastDot = expr.lastIndexOf('.');
+            if (lastDot > 0) {
+                String basePath = expr.substring(0, lastDot);
+                String propName = expr.substring(lastDot + 1);
+                // Resolve the base and check key presence directly. The JS `in`
+                // operator can misreport Java Map keys, so we cannot rely on it
+                // (a real null property looked like #notpresent).
+                try {
+                    Object base = runtime.eval(basePath);
+                    if (base instanceof Map<?, ?> baseMap) {
+                        if (!baseMap.containsKey(propName)) {
+                            return "#notpresent";
+                        }
+                        // key exists with a null value — return real null
+                    } else {
+                        return "#notpresent";
+                    }
+                } catch (Exception e) {
+                    return "#notpresent";
+                }
+            }
+        }
+        return result;
+    }
+
+    /**
+     * True when the leading identifier of a dotted/bracketed path is a currently
+     * defined variable. Distinguishes navigating into existing JSON — where a missing
+     * or null branch should degrade to {@code #notpresent} — from a genuinely undefined
+     * root (e.g. a typo'd variable name), which should still surface as an error.
+     */
+    private boolean rootVariableDefined(String expr) {
+        int i = 0;
+        while (i < expr.length()) {
+            char c = expr.charAt(i);
+            if (Character.isLetterOrDigit(c) || c == '_' || c == '$') {
+                i++;
+            } else {
+                break;
+            }
+        }
+        String root = expr.substring(0, i);
+        return !root.isEmpty() && runtime.getAllVariables().containsKey(root);
+    }
+
+    /** Sentinel value indicating XPath was evaluated but returned no result. */
+    private static final Object XPATH_NOT_PRESENT = new Object();
+
+    /**
+     * Tries to evaluate an expression as XPath on an XML variable.
+     * Handles patterns like:
+     * - "varname /xpath" (with space)
+     * - "varname/xpath" (no space, V1 compatibility)
+     * - "varname //xpath" (double-slash xpath)
+     *
+     * @return the XPath result, XPATH_NOT_PRESENT if path not found, or null if expression is not an XPath pattern
+     */
+    private Object tryEvalXPathExpression(String expr) {
+        // Pattern 1: "varname /xpath" or "varname //xpath" (with space)
+        int spaceSlashIdx = expr.indexOf(" /");
+        if (spaceSlashIdx > 0) {
+            String varName = expr.substring(0, spaceSlashIdx).trim();
+            String xpath = expr.substring(spaceSlashIdx + 1).trim();
+            if (StepUtils.isValidVariableName(varName)) {
+                Object target = runtime.getVariable(varName);
+                if (target instanceof Node) {
+                    Object result = KarateJsUtils.evalXmlPath((Node) target, xpath);
+                    return result == null ? XPATH_NOT_PRESENT : result;
+                }
+            }
+        }
+
+        // Pattern 2: "varname/xpath" (no space, V1 compatibility)
+        // Find first / that's not preceded by space
+        int slashIdx = expr.indexOf('/');
+        if (slashIdx > 0 && (spaceSlashIdx < 0 || slashIdx < spaceSlashIdx)) {
+            // Make sure the character before / is not a space
+            if (expr.charAt(slashIdx - 1) != ' ') {
+                String varName = expr.substring(0, slashIdx);
+                if (StepUtils.isValidVariableName(varName)) {
+                    Object target = runtime.getVariable(varName);
+                    if (target instanceof Node) {
+                        String xpath = expr.substring(slashIdx);
+                        Object result = KarateJsUtils.evalXmlPath((Node) target, xpath);
+                        return result == null ? XPATH_NOT_PRESENT : result;
+                    }
+                }
+            }
+        }
+
+        return null; // Not an XPath expression
+    }
+
+    /**
+     * Checks if text is an XPath function like count(), sum(), etc.
+     * Pattern: starts with lowercase letters followed by opening paren.
+     */
+    private boolean isXPathFunction(String text) {
+        return text.matches("^[a-z-]+\\(.+");
+    }
+
+    /**
+     * Evaluates XPath or XPath function on an XML node.
+     * Handles functions like count() that return values instead of nodes.
+     */
+    private Object evalXmlPathWithFunction(Node node, String path) {
+        // Try to evaluate as normal XPath returning nodes
+        try {
+            Object result = KarateJsUtils.evalXmlPath(node, path);
+            if (result != null) {
+                return result;
+            }
+        } catch (Exception e) {
+            // XPath functions like count() throw exceptions when trying to get NodeList
+        }
+
+        // For XPath functions that don't return nodes (e.g., count, sum, string-length),
+        // evaluate as text value
+        String textValue = Xml.getTextValueByPath(node, path);
+        if (textValue != null && !textValue.isEmpty()) {
+            // Special case: count() returns an integer
+            if (path.startsWith("count(") || path.startsWith("count ")) {
+                try {
+                    return Integer.parseInt(textValue.split("\\.")[0]); // Handle "3.0" -> 3
+                } catch (NumberFormatException e) {
+                    return textValue;
+                }
+            }
+            // Try to return as number if applicable
+            try {
+                if (textValue.contains(".")) {
+                    return Double.parseDouble(textValue);
+                }
+                return Integer.parseInt(textValue);
+            } catch (NumberFormatException e) {
+                return textValue;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Evaluate a {@code $}-prefixed JSONPath/XPath expression. A missing JSONPath
+     * degrades to {@code #notpresent} (v1 parity) rather than throwing — this holds for
+     * both a match operand and a {@code def}/assignment RHS, so {@code def x = $.missing}
+     * continues and a later {@code match x == '#notpresent'} passes. Jayway raises
+     * {@link PathNotFoundException} for an absent leaf ("No results for path") and an
+     * absent intermediate ("Missing property in path"); both collapse to the same marker.
+     */
+    private Object evalDollarPrefixedExpression(String expr) {
+        try {
+            return evalDollarPrefixedExpressionInternal(expr);
+        } catch (PathNotFoundException e) {
+            return "#notpresent";
+        }
+    }
+
+    /**
+     * Resolves a $varname prefixed expression. Could be:
+     * - $varname/xpath or $varname /xpath - XPath on XML variable
+     * - $varname//xpath - double-slash XPath
+     * - $[...] or $. - jsonpath on response
+     * - $varname[*].path - jsonpath on variable
+     */
+    private Object evalDollarPrefixedExpressionInternal(String expr) {
+        String withoutDollar = expr.substring(1);
+
+        // Special case: bare $ means 'response' variable
+        if (withoutDollar.isEmpty()) {
+            return runtime.getVariable("response");
+        }
+
+        // Special case: $[...] or $. means use 'response' variable for jsonpath
+        if (withoutDollar.startsWith("[") || withoutDollar.startsWith(".")) {
+            Object target = runtime.getVariable("response");
+            String path = "$" + withoutDollar;
+            return JsonPath.read(toJsonForJsonPath(target), path);
+        }
+
+        // Find where the path starts (at space+/, /, ., or [)
+        int spaceSlashIdx = withoutDollar.indexOf(" /");
+        int slashIdx = withoutDollar.indexOf('/');
+        int dotIdx = withoutDollar.indexOf('.');
+        int bracketIdx = withoutDollar.indexOf('[');
+
+        // Determine variable name and path type
+        String varName;
+        String path;
+        boolean isXPath = false;
+
+        // Check for XPath patterns first: $varname /xpath or $varname/xpath
+        if (spaceSlashIdx > 0) {
+            // $varname /xpath (with space)
+            varName = withoutDollar.substring(0, spaceSlashIdx);
+            path = withoutDollar.substring(spaceSlashIdx + 1).trim();
+            isXPath = true;
+        } else if (slashIdx > 0 && (dotIdx < 0 || slashIdx < dotIdx) && (bracketIdx < 0 || slashIdx < bracketIdx)) {
+            // $varname/xpath (no space)
+            varName = withoutDollar.substring(0, slashIdx);
+            path = withoutDollar.substring(slashIdx);
+            isXPath = true;
+        } else if (dotIdx > 0 && (bracketIdx < 0 || dotIdx < bracketIdx)) {
+            // $varname.path - jsonpath
+            varName = withoutDollar.substring(0, dotIdx);
+            path = "$" + withoutDollar.substring(dotIdx);
+        } else if (bracketIdx > 0) {
+            // $varname[...] - jsonpath
+            varName = withoutDollar.substring(0, bracketIdx);
+            path = "$" + withoutDollar.substring(bracketIdx);
+        } else {
+            // Just $varname - return the variable itself
+            return runtime.getVariable(withoutDollar);
+        }
+
+        Object target = runtime.getVariable(varName);
+        if (target == null) {
+            return null;
+        }
+
+        if (isXPath) {
+            if (target instanceof Node) {
+                return KarateJsUtils.evalXmlPath((Node) target, path);
+            }
+            // Fall back to jsonpath if not XML
+            return JsonPath.read(toJsonForJsonPath(target), "$" + path);
+        } else {
+            // JsonPath
+            return JsonPath.read(toJsonForJsonPath(target), path);
+        }
+    }
+
+    /**
+     * Coerces a variable into something a JSONPath can actually be walked over, mirroring
+     * v1's Variable.getValueAndForceParsingAsJson(): XML becomes a Map, bytes become text,
+     * and text that looks like JSON is parsed. Jayway treats anything it doesn't recognise
+     * as an opaque scalar leaf, so without this a path over an XML or JSON-string target
+     * silently answers nothing instead of the value.
+     */
+    private Object toJsonForJsonPath(Object value) {
+        if (value instanceof Node node) {
+            return Xml.toObject(node);
+        }
+        if (value instanceof byte[] bytes) {
+            value = new String(bytes, StandardCharsets.UTF_8);
+        }
+        if (value instanceof String s) {
+            if (StringUtils.looksLikeJson(s)) {
+                try {
+                    // Use JS engine to parse - handles both JSON and JS object literals
+                    return runtime.eval("(" + s + ")");
+                } catch (Exception e) {
+                    // If parsing fails, return the original string
+                    return value;
+                }
+            }
+        }
+        return value;
+    }
+
+    /**
+     * Validates a variable name and throws if invalid.
+     */
+    private void validateVariableName(String name) {
+        if (!StepUtils.isValidVariableName(name)) {
+            throw new RuntimeException("invalid variable name: " + name);
+        }
+        if ("karate".equals(name)) {
+            throw new RuntimeException("'karate' is a reserved name");
+        }
+    }
+
+    /**
+     * Evaluates a Karate expression, handling:
+     * - $varname/xpath, $varname[*].path (jsonpath)
+     * - get[N] varname path
+     * - <xml> literals
+     * - varname/xpath (XML XPath shorthand)
+     * - Regular JS expressions with embedded expression processing
+     */
+    Object evalKarateExpression(String expr) {
+        if (expr == null || expr.isEmpty()) {
+            return null;
+        }
+
+        expr = expr.trim();
+
+        // Handle call/callonce expressions (V1 compatibility for RHS usage like: header X = call fun {...})
+        if (expr.startsWith("call ")) {
+            return evalCallExpression(expr.substring(5).trim());
+        }
+        if (expr.startsWith("callonce ")) {
+            return evalCallOnceExpression(expr.substring(9).trim());
+        }
+
+        // Handle $varname patterns - could be jsonpath OR xpath on XML variable
+        if (expr.startsWith("$")) {
+            return evalDollarPrefixedExpression(expr);
+        }
+
+        // Handle get[N] or get syntax
+        if (expr.startsWith("get[") || expr.startsWith("get ")) {
+            return evalGetExpression(expr);
+        }
+
+        // Handle XML literal - expression starting with <
+        if (expr.startsWith("<")) {
+            Object value = Xml.toXmlDoc(expr);
+            return processEmbeddedExpressions(value);
+        }
+
+        // Handle bare xpath on response: "//xpath" or "/xpath"
+        if (expr.startsWith("/")) {
+            Object response = runtime.getVariable("response");
+            if (response instanceof Node) {
+                return KarateJsUtils.evalXmlPath((Node) response, expr);
+            }
+        }
+
+        // Handle XPath patterns: "varname/xpath" or "varname /xpath"
+        Object xpathResult = tryEvalXPathExpression(expr);
+        if (xpathResult != null) {
+            // For def/assignment: if XPath returned not present, use null
+            return xpathResult == XPATH_NOT_PRESENT ? null : xpathResult;
+        }
+
+        // V1 behavior: expressions starting with { or [ are parsed as Karate's
+        // relaxed JSON (with embedded-expression substitution), not JS. To force
+        // JS / ES6 evaluation, wrap in parens: ({ id: id }), ([a, b, c]).
+        if (StringUtils.looksLikeJson(expr)) {
+            try {
+                Object value = Json.of(expr).value();
+                warnBareReferences(expr, value);
+                return processEmbeddedExpressions(value);
+            } catch (Exception e) {
+                // Fall through to JS eval if JSON parsing fails (e.g., ES6 shorthand { id })
+            }
+        }
+
+        // Default: evaluate as JS. The result is data produced by a JS evaluation —
+        // read() JSON, a karate.call/callSingle variable map, a schema template variable —
+        // not a literal the user typed at this step. Resolve embedded expressions
+        // leniently (defer, don't fail-fast) so an unresolved placeholder carried inside
+        // the result (e.g. a Scenario-Outline example value '#(var)' echoed back through a
+        // called feature's returned variables) is left intact instead of crashing the step.
+        Object value = runtime.eval(wrapJsonLikeExpression(expr));
+        if (value instanceof Map || value instanceof List) {
+            // A JSON literal the user deliberately wrapped in round brackets is the documented
+            // escape hatch for building a re-usable schema: the brackets exist precisely to keep
+            // an optional '##(chunk)' reference alive until the match. Everything else reaching
+            // here is incidental data (a read() result, a called feature's variable map), where
+            // '##(chunk)' still means "inline the chunk, drop the key if null".
+            value = processEmbeddedExpressions(value, true, isParenWrappedJson(expr));
+        }
+        return value;
+    }
+
+    /**
+     * True for an expression like {@code ({ a: 1 })} or {@code ([1, 2])} — a JSON literal
+     * the user forced through JS evaluation by wrapping it in round brackets.
+     */
+    private static boolean isParenWrappedJson(String expr) {
+        if (expr.length() < 3 || expr.charAt(0) != '(' || expr.charAt(expr.length() - 1) != ')') {
+            return false;
+        }
+        return StringUtils.looksLikeJson(expr.substring(1, expr.length() - 1).trim());
+    }
+
+    private void executeAssert(Step step) {
+        Object result = runtime.eval(step.getText());
+        if (result instanceof Boolean b) {
+            String message = "assert failed: " + step.getText();
+            fireMatchEvent(null, step.getText(), null, b, null, b ? Result.PASS : Result.fail(message));
+            if (!b) {
+                throw new AssertionError(withCommentLabel(step, message));
+            }
+        } else {
+            throw new RuntimeException("assert expression must return boolean: " + step.getText());
+        }
+    }
+
+    private static final LogContext.LogWriter SCENARIO_LOG = LogContext.with(LogContext.SCENARIO_LOGGER);
+
+    private static final java.util.regex.Pattern BARE_REFERENCE =
+            java.util.regex.Pattern.compile("[A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*|\\[\\d+])*");
+
+    /**
+     * Relaxed JSON reads an unquoted value as a string, so {@code { id: foo.id }} holds the text
+     * "foo.id" — almost never what the author meant when {@code foo} is a variable. Warn (never fail:
+     * the relaxed-JSON contract stands) when a string value is spelled unquoted in the literal and
+     * its head names a defined variable.
+     */
+    private void warnBareReferences(String expr, Object value) {
+        if (value instanceof Map<?, ?> map) {
+            map.values().forEach(v -> warnBareReferences(expr, v));
+        } else if (value instanceof List<?> list) {
+            list.forEach(v -> warnBareReferences(expr, v));
+        } else if (value instanceof String s && BARE_REFERENCE.matcher(s).matches()) {
+            java.util.regex.Pattern unquoted = java.util.regex.Pattern.compile(
+                    "[:\\[,]\\s*" + java.util.regex.Pattern.quote(s) + "\\s*[,}\\]]");
+            if (!unquoted.matcher(expr).find()) {
+                return;
+            }
+            String head = s.split("[.\\[]", 2)[0];
+            Object defined;
+            try {
+                defined = runtime.getVariable(head);
+            } catch (RuntimeException e) {
+                return;
+            }
+            if (defined != null) {
+                SCENARIO_LOG.warn("unquoted '" + s + "' in a JSON literal is the string \"" + s
+                        + "\", not the value of variable '" + head + "' - use '#(" + s + ")', or ( … ) for JS");
+            }
+        }
+    }
+
+    private void executePrint(Step step) {
+        // Wrap in array to handle comma-separated expressions like: print 'foo', 'bar'
+        // Without wrapping, JS comma operator would return only the last value
+        Object value = runtime.eval("[" + step.getText() + "]");
+        if (value instanceof List<?> list) {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < list.size(); i++) {
+                if (i > 0) {
+                    sb.append(' ');
+                }
+                sb.append(StepUtils.stringify(list.get(i)));
+            }
+            SCENARIO_LOG.info(sb.toString());
+        } else {
+            SCENARIO_LOG.info(StepUtils.stringify(value));
+        }
+    }
+
+    // ========== HTTP ==========
+
+    private HttpRequestBuilder http() {
+        return runtime.getHttp();
+    }
+
+    private void applyCookiesFromMap(Map<?, ?> cookieMap) {
+        for (Map.Entry<?, ?> entry : cookieMap.entrySet()) {
+            http().cookie(entry.getKey().toString(), entry.getValue().toString());
+        }
+    }
+
+    private AuthHandler buildAuthHandler(KarateConfig config) {
+        Map<String, Object> auth = config.getAuth();
+        if (auth == null || auth.isEmpty()) {
+            return null;
+        }
+        String type = (String) auth.get("type");
+        if (type == null) {
+            return null;
+        }
+        return switch (type) {
+            case "basic" -> new BasicAuthHandler(
+                    (String) auth.get("username"),
+                    (String) auth.get("password")
+            );
+            case "bearer" -> new BearerAuthHandler(
+                    (String) auth.get("token")
+            );
+            case "oauth2" -> {
+                Map<String, Object> oauth2Config = new HashMap<>();
+                oauth2Config.put("url", auth.get("accessTokenUrl"));
+                oauth2Config.put("client_id", auth.get("clientId"));
+                oauth2Config.put("client_secret", auth.get("clientSecret"));
+                if (auth.containsKey("scope")) {
+                    oauth2Config.put("scope", auth.get("scope"));
+                }
+                yield new ClientCredentialsAuthHandler(oauth2Config);
+            }
+            default -> null;
+        };
+    }
+
+    private void executeUrl(Step step) {
+        String urlExpr = step.getText();
+        String url = (String) runtime.eval(urlExpr);
+        http().url(url);
+    }
+
+    private void executePath(Step step) {
+        String pathExpr = step.getText().trim();
+        // If expression contains comma, wrap in array to handle multiple segments
+        // e.g., path 'users', '123' becomes ['users', '123']
+        Object path;
+        if (pathExpr.contains(",")) {
+            path = runtime.eval("[" + pathExpr + "]");
+        } else {
+            path = runtime.eval(pathExpr);
+        }
+        if (path instanceof List<?> list) {
+            for (Object item : list) {
+                http().path(item.toString());
+            }
+        } else {
+            http().path(path.toString());
+        }
+    }
+
+    private void executeParam(Step step) {
+        String text = step.getText();
+        int eqIndex = StepUtils.findAssignmentOperator(text);
+        String name = text.substring(0, eqIndex).trim();
+        Object value = runtime.eval(wrapJsonLikeExpression(text.substring(eqIndex + 1).trim()));
+        // V1 behavior: a null value omits the query parameter instead of failing
+        if (value == null) {
+            return;
+        }
+        if (value instanceof List<?> list) {
+            for (Object item : list) {
+                if (item != null) {
+                    http().param(name, item.toString());
+                }
+            }
+        } else {
+            http().param(name, value.toString());
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void executeParams(Step step) {
+        Object value = evalKarateExpression(step.getText());
+        if (value instanceof Map<?, ?> map) {
+            for (Map.Entry<?, ?> entry : map.entrySet()) {
+                String name = entry.getKey().toString();
+                Object v = entry.getValue();
+                // V1 behavior: skip null values
+                if (v == null) {
+                    continue;
+                }
+                if (v instanceof List<?> list) {
+                    for (Object item : list) {
+                        if (item != null) {
+                            http().param(name, item.toString());
+                        }
+                    }
+                } else {
+                    http().param(name, v.toString());
+                }
+            }
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void executeHeader(Step step) {
+        Table table = step.getTable();
+        if (table != null) {
+            for (Map<String, String> row : table.getRowsAsMaps()) {
+                String name = row.get("name");
+                String value = row.get("value");
+                http().header(name, value);
+            }
+        } else {
+            String text = step.getText();
+            int eqIndex = StepUtils.findAssignmentOperator(text);
+            String name = text.substring(0, eqIndex).trim();
+            // Use evalKarateExpression to handle call expressions like: header X = call fun {...}
+            Object value = evalKarateExpression(text.substring(eqIndex + 1).trim());
+            // V1 compatibility: function calls can return arrays for multi-value headers
+            if (value instanceof List) {
+                List<String> list = ((List<?>) value).stream()
+                        .map(Object::toString)
+                        .toList();
+                http().header(name, list);
+            } else {
+                http().header(name, value.toString());
+            }
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void executeHeaders(Step step) {
+        Object value = evalKarateExpression(step.getText());
+        if (value instanceof Map<?, ?> map) {
+            http().headers((Map<String, Object>) map);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void executeCookie(Step step) {
+        // Cookies are accumulated in HttpRequestBuilder and combined when request is built
+        String text = step.getText();
+        int eqIndex = StepUtils.findAssignmentOperator(text);
+        String name = text.substring(0, eqIndex).trim();
+        Object value = runtime.eval(wrapJsonLikeExpression(text.substring(eqIndex + 1).trim()));
+        if (value instanceof Map) {
+            // V1 behavior: cookie foo = { value: 'bar', domain: '.abc.com' }
+            Map<String, Object> map = (Map<String, Object>) value;
+            map.put("name", name);
+            http().cookie(map);
+        } else {
+            http().cookie(name, value.toString());
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void executeCookies(Step step) {
+        Object value = evalKarateExpression(step.getText());
+        if (value instanceof Map<?, ?> map) {
+            for (Map.Entry<?, ?> entry : map.entrySet()) {
+                http().cookie(entry.getKey().toString(), entry.getValue().toString());
+            }
+        }
+    }
+
+    private void executeFormField(Step step) {
+        String text = step.getText();
+        int eqIndex = StepUtils.findAssignmentOperator(text);
+        String name = text.substring(0, eqIndex).trim();
+        Object value = runtime.eval(wrapJsonLikeExpression(text.substring(eqIndex + 1).trim()));
+        http().formField(name, value.toString());
+    }
+
+    @SuppressWarnings("unchecked")
+    private void executeFormFields(Step step) {
+        Object value = evalKarateExpression(step.getText());
+        if (value instanceof Map<?, ?> map) {
+            for (Map.Entry<?, ?> entry : map.entrySet()) {
+                http().formField(entry.getKey().toString(), entry.getValue().toString());
+            }
+        }
+    }
+
+    private void executeRequest(Step step) {
+        String expr = step.getDocString() != null ? step.getDocString() : step.getText();
+        Object body = evalKarateExpression(expr);
+        http().body(body);
+    }
+
+    private void executeRetryUntil(Step step) {
+        String condition = step.getText().trim();
+        http().retryUntil(condition);
+    }
+
+    private void executeSoapAction(Step step) {
+        String text = step.getText();
+        String action = "";
+        if (text != null && !text.isBlank()) {
+            Object result = runtime.eval(text.trim());
+            action = result != null ? result.toString() : "";
+        }
+        http().header("SOAPAction", action);
+        http().contentType("text/xml");
+        doMethod("POST");
+    }
+
+    private static final Set<String> HTTP_METHODS = Set.of(
+            "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "CONNECT", "TRACE");
+
+    private void executeMethod(Step step) {
+        String text = step.getText().trim();
+        String method = text.toUpperCase();
+        if (!HTTP_METHODS.contains(method) && !isLiteralMethod(text)) {
+            // e.g. `method httpMethod` where httpMethod is a variable holding 'get'
+            Object result = runtime.eval(text, step);
+            if (result == null) {
+                throw new RuntimeException("http method expression evaluated to null: " + text);
+            }
+            method = result.toString().trim().toUpperCase();
+        }
+        doMethod(method);
+    }
+
+    /**
+     * True when the text after {@code method} should be taken as the verb itself instead of
+     * being evaluated. A bare word that is not a variable is a custom verb such as PURGE or
+     * PROPFIND - anything else (a variable name, a quoted string, a function call) is an
+     * expression that resolves to the verb.
+     */
+    private boolean isLiteralMethod(String text) {
+        for (int i = 0; i < text.length(); i++) {
+            if (!Character.isLetter(text.charAt(i))) {
+                return false;
+            }
+        }
+        return !runtime.getAllVariables().containsKey(text);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void doMethod(String method) {
+        KarateConfig config = runtime.getConfig();
+
+        // Set method on the builder up-front so any build() below sees the real method.
+        // Without this, build() defaults method to GET and destructively drains form fields
+        // into the URL (HttpRequestBuilder.buildInternal).
+        http().method(method);
+
+        // Apply cookies from the cookie jar (V1 compatibility: auto-send responseCookies)
+        // Use the full cookie map to preserve the wrap flag from Set-Cookie parsing
+        Map<String, Map<String, Object>> cookieJar = runtime.getCookieJar();
+        for (Map.Entry<String, Map<String, Object>> entry : cookieJar.entrySet()) {
+            http().cookie(entry.getValue());
+        }
+
+        // Apply configured cookies before invoking request - may be a Map or a JsCallable
+        Object configCookies = config.getCookies();
+        if (configCookies instanceof JavaCallable cookiesFn) {
+            // Call function to get cookies dynamically
+            Object result = cookiesFn.call(null);
+            if (result instanceof Map<?, ?> cookieMap) {
+                applyCookiesFromMap(cookieMap);
+            }
+        } else if (configCookies instanceof Map<?, ?> cookieMap) {
+            applyCookiesFromMap(resolveConfigMap(cookieMap));
+        }
+
+        // Apply configured headers - may be a Map or a JsCallable
+        Object configHeaders = config.getHeaders();
+        if (configHeaders instanceof JavaCallable headersFn) {
+            // Build request first so function can access current state (for signing etc.)
+            HttpRequest request = http().build();
+            Object result = headersFn.call(null, request);
+            if (result instanceof Map<?, ?> headersMap) {
+                http().headers((Map<String, Object>) headersMap);
+            }
+        } else if (configHeaders instanceof Map<?, ?> headersMap) {
+            http().headers(resolveConfigMap(headersMap));
+        }
+
+        // Apply configured auth handler
+        AuthHandler authHandler = buildAuthHandler(config);
+        if (authHandler != null) {
+            http().auth(authHandler);
+        }
+
+        // Get perf event name before request (if in perf mode)
+        String perfEventName = null;
+        if (runtime.isPerfMode()) {
+            HttpRequest builtRequest = http().build();
+            PerfHook perfHook = runtime.getPerfHook();
+            if (perfHook != null) {
+                perfEventName = perfHook.getPerfEventName(builtRequest, runtime);
+            }
+        }
+
+        // Check for retry condition
+        String retryUntil = http().getRetryUntil();
+        HttpResponse response;
+        if (retryUntil != null) {
+            // Retry logic handles its own HTTP events per attempt
+            response = executeMethodWithRetry(method, retryUntil, config);
+        } else {
+            // Build request for HTTP_ENTER event
+            HttpRequest request = http().build();
+
+            // Fire HTTP_ENTER event - listener can return false to skip
+            Suite suite = getSuite();
+            boolean shouldProceed = true;
+            if (suite != null) {
+                shouldProceed = suite.fireEvent(HttpRunEvent.enter(request, runtime));
+            }
+
+            if (shouldProceed) {
+                response = http().invoke(method);
+                // client-independent guarantee: a custom HttpClient (a pooled perf client, a
+                // test double) is not obliged to stamp this, so the feature lane stamps it
+                // BEFORE HTTP_EXIT fires — listeners capturing evidence and the response
+                // variable must convert the body identically
+                response.setStrictParsing(runtime.getConfig().isStrictResponseParsing());
+            } else {
+                // Request skipped by listener
+                response = HttpResponse.skipped(request);
+            }
+
+            // Fire HTTP_EXIT event (always, even for skipped)
+            if (suite != null) {
+                suite.fireEvent(HttpRunEvent.exit(response.getRequest(), response, runtime));
+            }
+        }
+
+        // Track previous request for karate.prevRequest
+        if (response.getRequest() != null) {
+            runtime.getKarate().setPrevRequest(response.getRequest());
+        }
+        // Track previous response for karate.response (non-mock context)
+        runtime.getKarate().setPrevResponse(response);
+
+        setResponseVariables(response);
+
+        // Capture perf event (if in perf mode)
+        if (perfEventName != null) {
+            PerfEvent perfEvent = new PerfEvent(
+                    response.getStartTime(),
+                    response.getStartTime() + response.getResponseTime(),
+                    perfEventName,
+                    response.getStatus()
+            );
+            runtime.capturePerfEvent(perfEvent);
+        }
+
+        // Log HTTP request/response to context
+        LogContext ctx = LogContext.get();
+        if (response.getRequest() != null) {
+            ctx.log("{} {}", method, response.getRequest().getUrlAndPath());
+        }
+        ctx.log("{} ({} ms)", response.getStatus(), response.getResponseTime());
+    }
+
+    private void setResponseVariables(HttpResponse response) {
+        Object body = response.getBodyConverted();
+        runtime.setVariable("response", body);
+        runtime.setVariable("responseStatus", response.getStatus());
+        runtime.setVariable("responseHeaders", response.getHeaders());
+        runtime.setVariable("responseTime", response.getResponseTime());
+        // Hidden variables (accessible but not in getAllVariables())
+        runtime.setHiddenVariable("responseBytes", response.getBodyBytes());
+        runtime.setHiddenVariable("responseStatusText", response.getStatusText());
+        Object responseCookies = response.getCookies();
+        runtime.setHiddenVariable("responseCookies", responseCookies);
+        runtime.setHiddenVariable("requestTimeStamp", response.getStartTime());
+
+        // Update cookie jar with responseCookies for auto-send on subsequent requests (V1 compatibility)
+        runtime.updateCookieJar(responseCookies);
+
+        // Determine response type for V1 compatibility
+        String responseType;
+        if (body instanceof byte[]) {
+            responseType = "binary";
+        } else if (body instanceof Map || body instanceof List) {
+            responseType = "json";
+        } else if (body instanceof org.w3c.dom.Node) {
+            responseType = "xml";
+        } else {
+            responseType = "string";
+        }
+        runtime.setHiddenVariable("responseType", responseType);
+    }
+
+    private HttpResponse executeMethodWithRetry(String method, String retryUntil, KarateConfig config) {
+        int maxRetries = config.getRetryCount();
+        int sleepInterval = config.getRetryInterval();
+        int retryCount = 0;
+        Suite suite = getSuite();
+
+        while (true) {
+            if (retryCount == maxRetries) {
+                throw new RuntimeException("retry failed after " + maxRetries + " attempts: " + retryUntil);
+            }
+            if (retryCount > 0) {
+                try {
+                    logger.debug("sleeping {} ms before retry #{}", sleepInterval, retryCount);
+                    Thread.sleep(sleepInterval);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("retry interrupted", e);
+                }
+            }
+
+            // Make a copy of the request builder to preserve state for retry
+            HttpRequestBuilder httpCopy = http().copy();
+
+            // Build request for HTTP_ENTER event (method already set in doMethod)
+            HttpRequest request = http().build();
+
+            // Fire HTTP_ENTER event - listener can return false to skip
+            boolean shouldProceed = true;
+            if (suite != null) {
+                shouldProceed = suite.fireEvent(HttpRunEvent.enter(request, runtime));
+            }
+
+            HttpResponse response;
+            if (shouldProceed) {
+                response = http().invoke(method);
+                // same client-independent stamp as the non-retry lane, per attempt
+                response.setStrictParsing(config.isStrictResponseParsing());
+            } else {
+                // Request skipped by listener
+                response = HttpResponse.skipped(request);
+            }
+
+            // Fire HTTP_EXIT event (always, even for skipped)
+            if (suite != null) {
+                suite.fireEvent(HttpRunEvent.exit(response.getRequest(), response, runtime));
+            }
+
+            // Set response variables so the condition can access them
+            setResponseVariables(response);
+
+            // Evaluate retry condition
+            boolean conditionMet;
+            try {
+                Object result = runtime.eval(retryUntil);
+                conditionMet = Boolean.TRUE.equals(result);
+            } catch (Exception e) {
+                logger.warn("retry condition evaluation failed: {}", e.getMessage());
+                conditionMet = false;
+            }
+
+            if (conditionMet) {
+                if (retryCount > 0) {
+                    logger.debug("retry condition satisfied after {} attempts", retryCount + 1);
+                }
+                return response;
+            } else {
+                logger.debug("retry condition not satisfied: {}", retryUntil);
+            }
+
+            // Restore request state for next retry (http().invoke() resets it)
+            http().restoreFrom(httpCopy);
+
+            retryCount++;
+        }
+    }
+
+    private void executeStatus(Step step) {
+        int expected = Integer.parseInt(step.getText().trim());
+        Object statusObj = runtime.getVariable("responseStatus");
+        int actual = statusObj instanceof Number n ? n.intValue() : Integer.parseInt(statusObj.toString());
+        if (actual != expected) {
+            throw new AssertionError("expected status: " + expected + ", actual: " + actual);
+        }
+    }
+
+    /**
+     * Handles: multipart file myFile = { read: 'file.txt', filename: 'test.txt', contentType: 'text/plain' }
+     * Or shorthand: multipart file myFile = read('file.txt')
+     */
+    @SuppressWarnings("unchecked")
+    private void executeMultipartFile(Step step) {
+        String text = step.getText();
+        int eqIndex = StepUtils.findAssignmentOperator(text);
+        if (eqIndex < 0) {
+            throw new RuntimeException("multipart file requires '=' assignment: " + text);
+        }
+        String name = text.substring(0, eqIndex).trim();
+        String expr = text.substring(eqIndex + 1).trim();
+
+        Object value = evalKarateExpression(expr);
+
+        Map<String, Object> multipartMap = new HashMap<>();
+        multipartMap.put("name", name);
+
+        if (value instanceof Map) {
+            Map<String, Object> fileMap = (Map<String, Object>) value;
+            // Handle { read: 'path', filename: 'name', contentType: 'type' }
+            Object readPath = fileMap.get("read");
+            if (readPath != null) {
+                Resource resource = resolveResource(readPath.toString());
+                File file = getFileFromResource(resource);
+                if (file != null) {
+                    multipartMap.put("value", file);
+                } else {
+                    // For classpath or in-memory resources, read bytes
+                    try (InputStream is = resource.getStream()) {
+                        byte[] bytes = is.readAllBytes();
+                        multipartMap.put("value", bytes);
+                    } catch (Exception e) {
+                        throw new RuntimeException("failed to read file: " + readPath, e);
+                    }
+                }
+            } else if (fileMap.get("value") != null) {
+                multipartMap.put("value", fileMap.get("value"));
+            }
+            // Copy other properties
+            if (fileMap.get("filename") != null) {
+                multipartMap.put("filename", fileMap.get("filename"));
+            }
+            if (fileMap.get("contentType") != null) {
+                multipartMap.put("contentType", fileMap.get("contentType"));
+            }
+            if (fileMap.get("charset") != null) {
+                multipartMap.put("charset", fileMap.get("charset"));
+            }
+            if (fileMap.get("transferEncoding") != null) {
+                multipartMap.put("transferEncoding", fileMap.get("transferEncoding"));
+            }
+        } else if (value instanceof String) {
+            // Direct string value - could be file path or content
+            multipartMap.put("value", value);
+        } else if (value instanceof byte[]) {
+            multipartMap.put("value", value);
+        } else {
+            multipartMap.put("value", value);
+        }
+
+        http().multiPart(multipartMap);
+    }
+
+    /**
+     * Handles: multipart field name = 'value'
+     */
+    private void executeMultipartField(Step step) {
+        String text = step.getText();
+        int eqIndex = StepUtils.findAssignmentOperator(text);
+        if (eqIndex < 0) {
+            throw new RuntimeException("multipart field requires '=' assignment: " + text);
+        }
+        String name = text.substring(0, eqIndex).trim();
+        String expr = text.substring(eqIndex + 1).trim();
+
+        Object value = runtime.eval(wrapJsonLikeExpression(expr));
+
+        Map<String, Object> multipartMap = new HashMap<>();
+        multipartMap.put("name", name);
+        multipartMap.put("value", value);
+
+        http().multiPart(multipartMap);
+    }
+
+    /**
+     * Handles: multipart fields { name: 'value', other: 'data' }
+     * V1 behavior: if field value is a map with 'value' key, merge it (not nest it)
+     */
+    @SuppressWarnings("unchecked")
+    private void executeMultipartFields(Step step) {
+        Object value = evalKarateExpression(step.getText());
+        if (value instanceof Map) {
+            Map<String, Object> fields = (Map<String, Object>) value;
+            for (Map.Entry<String, Object> entry : fields.entrySet()) {
+                Map<String, Object> multipartMap = new HashMap<>();
+                multipartMap.put("name", entry.getKey());
+                Object fieldValue = entry.getValue();
+                if (fieldValue instanceof Map) {
+                    // V1 behavior: merge map fields (e.g., { value: 'x', contentType: 'y' })
+                    multipartMap.putAll((Map<String, Object>) fieldValue);
+                } else {
+                    multipartMap.put("value", fieldValue);
+                }
+                http().multiPart(multipartMap);
+            }
+        } else {
+            throw new RuntimeException("multipart fields expects a map: " + step.getText());
+        }
+    }
+
+    /**
+     * Handles: multipart files [{ read: 'file1.txt', name: 'file1' }, { read: 'file2.txt', name: 'file2' }]
+     * Also handles V1 map syntax: multipart files { myFile1: {...}, myFile2: {...} }
+     * where map keys become the part names.
+     */
+    @SuppressWarnings("unchecked")
+    private void executeMultipartFiles(Step step) {
+        Object value = evalKarateExpression(step.getText());
+        if (value instanceof List) {
+            List<Object> files = (List<Object>) value;
+            for (Object item : files) {
+                processMultipartFileEntry(item, null);
+            }
+        } else if (value instanceof Map) {
+            // V1 compatibility: map where keys are part names
+            Map<String, Object> filesMap = (Map<String, Object>) value;
+            for (Map.Entry<String, Object> entry : filesMap.entrySet()) {
+                processMultipartFileEntry(entry.getValue(), entry.getKey());
+            }
+        } else {
+            throw new RuntimeException("multipart files expects a list or map: " + step.getText());
+        }
+    }
+
+    private void processMultipartFileEntry(Object item, String defaultName) {
+        if (item instanceof Map) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> fileMap = (Map<String, Object>) item;
+            Map<String, Object> multipartMap = new HashMap<>();
+
+            // Name from map entry key (V1 compat) or from 'name' property
+            String name = defaultName != null ? defaultName : (String) fileMap.get("name");
+            if (name == null) {
+                throw new RuntimeException("multipart files entry requires 'name': " + item);
+            }
+            multipartMap.put("name", name);
+
+            // Handle file read
+            Object readPath = fileMap.get("read");
+            if (readPath != null) {
+                Resource resource = resolveResource(readPath.toString());
+                File file = getFileFromResource(resource);
+                if (file != null) {
+                    multipartMap.put("value", file);
+                } else {
+                    try (InputStream is = resource.getStream()) {
+                        byte[] bytes = is.readAllBytes();
+                        multipartMap.put("value", bytes);
+                    } catch (Exception e) {
+                        throw new RuntimeException("failed to read file: " + readPath, e);
+                    }
+                }
+            } else if (fileMap.get("value") != null) {
+                multipartMap.put("value", fileMap.get("value"));
+            }
+
+            // Copy other properties
+            if (fileMap.get("filename") != null) {
+                multipartMap.put("filename", fileMap.get("filename"));
+            }
+            if (fileMap.get("contentType") != null) {
+                multipartMap.put("contentType", fileMap.get("contentType"));
+            }
+
+            http().multiPart(multipartMap);
+        } else {
+            throw new RuntimeException("multipart files entry must be a map: " + item);
+        }
+    }
+
+    /**
+     * Handles: multipart entity value
+     * For sending a single entity as the multipart body (advanced use case)
+     */
+    @SuppressWarnings("unchecked")
+    private void executeMultipartEntity(Step step) {
+        String expr = step.getDocString() != null ? step.getDocString() : step.getText();
+        Object value = evalKarateExpression(expr);
+
+        if (value instanceof Map) {
+            // Single entity map with name, value, etc.
+            http().multiPart((Map<String, Object>) value);
+        } else {
+            // Wrap in a default map
+            Map<String, Object> multipartMap = new HashMap<>();
+            multipartMap.put("name", "file");
+            multipartMap.put("value", value);
+            http().multiPart(multipartMap);
+        }
+    }
+
+    // ========== Multipart Helpers ==========
+
+    private Resource resolveResource(String path) {
+        FeatureRuntime fr = runtime.getFeatureRuntime();
+        if (fr != null) {
+            return fr.resolve(path);
+        }
+        return Resource.path(path);
+    }
+
+    private File getFileFromResource(Resource resource) {
+        if (resource.isLocalFile()) {
+            Path path = resource.getPath();
+            if (path != null && Files.exists(path)) {
+                return path.toFile();
+            }
+        }
+        return null;
+    }
+
+    // ========== Control Flow ==========
+
+    /**
+     * When a {@code call} / {@code callonce} step carries a doc-string and no inline
+     * argument, the doc-string IS the call argument:
+     * <pre>
+     * * call read('helper.feature')
+     *   """
+     *   { id: '#(userId)' }
+     *   """
+     * </pre>
+     * Append it so the standard call-arg path picks it up — that path routes through
+     * {@link #evalKarateExpression}, so inline JSON, embedded {@code #(...)}, lists and
+     * bare JS all resolve uniformly. An inline argument (if somehow also present) wins.
+     * Note: v1 did not support doc-string call args; this is a v2 convenience.
+     */
+    private static String appendDocStringCallArg(String callExpr, String docString) {
+        if (docString != null && !docString.isBlank()
+                && StepUtils.splitCallExpr(callExpr).arg() == null) {
+            return callExpr + " " + docString.trim();
+        }
+        return callExpr;
+    }
+
+    private void executeCall(Step step) {
+        String text = appendDocStringCallArg(step.getText().trim(), step.getDocString());
+
+        // Try to evaluate the first token to see if it's a JS function
+        // Syntax: "call fun" or "call fun arg" where fun is a JS function variable
+        // Note: read('file.js') returns a JS function, read('file.feature') returns a Feature
+        StepUtils.CallParts parts = StepUtils.splitCallExpr(text);
+        String firstToken = parts.callable();
+
+        // Check if it's a read() call for a literal feature file path - use parseCallExpression
+        // which properly handles embedded expressions like #(nodes)
+        // For read(variable) or read('file.js'), we evaluate to determine the type
+        if (StepUtils.isLiteralFeatureRead(text)) {
+            // Fall through to standard feature call handling
+        } else {
+            // Type-probe first token as JS to distinguish js function / feature ref / path string.
+            // Only the probe itself is wrapped — failures inside the call must propagate, not
+            // silently fall through and cause double-execution.
+            Object evaluated = null;
+            try {
+                evaluated = runtime.eval(firstToken);
+            } catch (Exception e) {
+                // Not a valid JS expression, fall through to feature call
+                logger.debug("call target probe failed, treating as feature path: {}", e.getMessage());
+            }
+            if (evaluated instanceof JavaCallable fn) {
+                // It's a JS function - invoke it. Route the arg through the same
+                // karate-expression entry point used everywhere else (handles
+                // inline JSON with `#(...)`, lists, variables, bare JS).
+                Object arg = parts.arg() != null ? evalKarateExpression(parts.arg()) : null;
+                Object result = arg != null
+                        ? fn.call(null, arg)
+                        : fn.call(null);
+                // V1 behavior: if result is a Map, spread all keys as shared scope variables
+                if (result instanceof Map) {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> map = (Map<String, Object>) result;
+                    for (Map.Entry<String, Object> entry : map.entrySet()) {
+                        runtime.setVariable(entry.getKey(), entry.getValue());
+                    }
+                }
+                return;
+            } else if (evaluated instanceof FeatureCall || evaluated instanceof Feature) {
+                executeFeatureCall(evaluated, parts.arg(), null);
+                return;
+            }
+        }
+
+        // Standard feature call
+        CallExpression call = parseCallExpression(text);
+
+        // Resolve the feature file relative to current feature
+        FeatureRuntime fr = runtime.getFeatureRuntime();
+        Feature calledFeature;
+
+        if (call.sameFile) {
+            // Same-file tag call - use current feature
+            calledFeature = fr != null ? fr.getFeature() : null;
+            if (calledFeature == null) {
+                throw new RuntimeException("call with tag selector requires a feature context");
+            }
+        } else {
+            Resource calledResource = fr != null
+                    ? fr.resolve(call.path)
+                    : Resource.path(call.path);
+            calledFeature = Feature.read(calledResource);
+        }
+
+        // Check if it's an array loop call
+        if (call.argList != null) {
+            List<Map<String, Object>> results = callFeatureLoop(calledFeature, call.argList, call.tagSelector, call.lineFilters);
+            if (call.resultVar != null) {
+                runtime.setVariable(call.resultVar, results);
+            }
+            return;
+        }
+
+        // Scope: a bare `call` (no result var) shares scope with the caller; `def x = call ...`
+        // isolates. Build, run, report-attach, and result-check via the shared helper.
+        boolean sharedScope = call.resultVar == null;
+        FeatureRuntime nestedFr = runNestedFeature(calledFeature, call.arg, sharedScope,
+                call.tagSelector, call.lineFilters, -1);
+
+        // Propagate results back to caller
+        propagateFromCallee(nestedFr.getLastExecuted(), call.resultVar);
+    }
+
+    /**
+     * Execute a feature call with a Feature or FeatureCall object.
+     * Used when the call expression evaluates to a Feature variable.
+     * Supports array loop calling when argExpr evaluates to a List.
+     */
+    @SuppressWarnings("unchecked")
+    private void executeFeatureCall(Object featureObj, String argExpr, String resultVar) {
+        FeatureRuntime fr = runtime.getFeatureRuntime();
+
+        Feature calledFeature;
+        String tagSelector = null;
+
+        if (featureObj instanceof FeatureCall) {
+            FeatureCall fc = (FeatureCall) featureObj;
+            if (fc.isSameFile()) {
+                calledFeature = fr != null ? fr.getFeature() : null;
+                if (calledFeature == null) {
+                    throw new RuntimeException("same-file tag call requires a feature context");
+                }
+            } else {
+                calledFeature = fc.getFeature();
+            }
+            tagSelector = fc.getTagSelector();
+        } else if (featureObj instanceof Feature) {
+            calledFeature = (Feature) featureObj;
+        } else {
+            throw new RuntimeException("expected Feature or FeatureCall, got: " + featureObj.getClass());
+        }
+
+        // Karate-expression eval handles inline JSON with embedded `#(...)`,
+        // arrays, variables, and bare JS uniformly.
+        Object argObj = argExpr == null ? null : evalKarateExpression(argExpr);
+
+        // Check if it's an array loop call
+        if (argObj instanceof List) {
+            List<Map<String, Object>> results = callFeatureLoop(calledFeature, (List<?>) argObj, tagSelector, null);
+            if (resultVar != null) {
+                runtime.setVariable(resultVar, results);
+            }
+            return;
+        }
+
+        // Single call with Map argument
+        Map<String, Object> callArg = null;
+        if (argObj instanceof Map) {
+            callArg = (Map<String, Object>) argObj;
+        }
+
+        // Determine scope: a bare `call` (no result var) shares scope with the caller;
+        // `def x = call ...` isolates. Build, run, and result-check via the shared helper.
+        boolean sharedScope = resultVar == null;
+        FeatureRuntime nestedFr = runNestedFeature(calledFeature, callArg, sharedScope, tagSelector, null, -1);
+
+        // Propagate results back to caller
+        propagateFromCallee(nestedFr.getLastExecuted(), resultVar);
+    }
+
+    private void executeCallOnce(Step step) {
+        // Include the doc-string arg in the cache key so calls differing only by their
+        // doc-string argument cache separately. executeCall (invoked below) re-derives
+        // the same effective text from the step, so the actual call stays consistent.
+        String text = appendDocStringCallArg(step.getText().trim(), step.getDocString());
+        String cacheKey = text;
+
+        // Use feature-level cache (not suite-level) - callOnce is scoped per feature
+        FeatureRuntime fr = runtime.getFeatureRuntime();
+        if (fr == null) {
+            // No feature context - just execute normally
+            executeCall(step);
+            return;
+        }
+
+        Map<String, Object> cache = fr.getCallOnceCache();
+        java.util.concurrent.locks.ReentrantLock lock = fr.getCallOnceLock();
+
+        // Fast path - check cache without lock
+        CallOnceResult cached = (CallOnceResult) cache.get(cacheKey);
+        if (cached != null) {
+            applyCachedCallOnceResult(cached);
+            return;
+        }
+
+        // Slow path - acquire lock for execution
+        lock.lock();
+        try {
+            // Double-check after acquiring lock (another thread may have populated cache)
+            CallOnceResult rechecked = (CallOnceResult) cache.get(cacheKey);
+            if (rechecked != null) {
+                applyCachedCallOnceResult(rechecked);
+                return;
+            }
+
+            // Snapshot caller bindings before the call so we cache only the callee's
+            // contribution — the full post-call binding set echoes back pre-existing caller
+            // vars (notably Scenario Outline example-row vars), which would then overwrite the
+            // next row's value on a cache hit. callonce shares scope with the caller, so the
+            // snapshot must be taken before the call (unlike isolated-scope callSingle, which
+            // diffs against the caller's still-current vars). See StepUtils.calleeDelta.
+            Map<String, Object> preCallVars = runtime.getAllVariables();
+            // Config is cached as a before/after pair for the same reason - see CallOnceResult.
+            KarateConfig preCallConfig = runtime.getConfig().copy();
+
+            // Not cached - execute the call
+            executeCall(step);
+
+            Map<String, Object> delta = StepUtils.calleeDelta(preCallVars, runtime.getAllVariables());
+            @SuppressWarnings("unchecked")
+            Map<String, Object> vars = (Map<String, Object>) StepUtils.deepCopy(delta);
+            @SuppressWarnings("unchecked")
+            Map<String, Map<String, Object>> cookieJarCopy = (Map<String, Map<String, Object>>) StepUtils.deepCopy(runtime.getCookieJar());
+            cache.put(cacheKey, new CallOnceResult(vars, preCallConfig, runtime.getConfig().copy(), cookieJarCopy));
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Cached result from a callonce execution, containing variables, config, and cookie jar.
+     * Config is held as the snapshot pair taken around the one real execution so that a replay
+     * applies only what the callee itself changed (KarateConfig.copyChangedFrom) - the caller's
+     * own config at that moment must not leak into later scenarios, which is exactly the
+     * variables/calleeDelta rule applied to config.
+     */
+    private record CallOnceResult(Map<String, Object> vars, KarateConfig configBefore, KarateConfig configAfter,
+                                  Map<String, Map<String, Object>> cookieJar) {}
+
+    @SuppressWarnings("unchecked")
+    private void applyCachedCallOnceResult(CallOnceResult cached) {
+        Map<String, Object> copies = (Map<String, Object>) StepUtils.deepCopy(cached.vars());
+        for (Map.Entry<String, Object> entry : copies.entrySet()) {
+            runtime.setVariable(entry.getKey(), entry.getValue());
+        }
+        runtime.getConfig().copyChangedFrom(cached.configBefore(), cached.configAfter());
+        // Push the restored config to the HTTP client so callonce hits made
+        // earlier (e.g. that set a proxy or token-derived auth) still apply
+        // to the cached-replay scenario's requests.
+        runtime.getKarate().client.apply(runtime.getConfig());
+        // V1 compatibility: Also restore cookie jar from cache
+        if (cached.cookieJar() != null) {
+            Map<String, Map<String, Object>> cookieJarCopy = (Map<String, Map<String, Object>>) StepUtils.deepCopy(cached.cookieJar());
+            runtime.getCookieJar().putAll(cookieJarCopy);
+        }
+    }
+
+    /**
+     * Parses call expression like:
+     * - read('file.feature')
+     * - read('file.feature') { arg: 1 }
+     * - read('file.feature') argVar
+     */
+    private CallExpression parseCallExpression(String text) {
+        CallExpression expr = new CallExpression();
+
+        // Check if it's a read() call
+        if (text.startsWith("read(")) {
+            // Quote- and nested-paren-aware close paren — handles read('foo)bar.feature')
+            // and inline JSON args that contain parens, e.g. { val: foo() }.
+            int closeParen = StepUtils.findReadCloseParen(text);
+            if (closeParen > 0) {
+                // Extract path from read('path')
+                String readArg = text.substring(5, closeParen).trim();
+                String rawPath;
+                if (StepUtils.isSingleQuotedLiteral(readArg)) {
+                    // one quoted literal: strip the quotes verbatim, so backslashes
+                    // (e.g. Windows paths) survive without JS escape processing
+                    rawPath = readArg.substring(1, readArg.length() - 1);
+                } else {
+                    // a variable reference or expression, e.g. 'a-' + ext + '.feature'
+                    Object pathObj = runtime.eval(readArg);
+                    rawPath = pathObj != null ? pathObj.toString() : readArg;
+                }
+
+                // Parse tag selector from path
+                parsePathAndTag(rawPath, expr);
+
+                // Karate-expression eval handles inline JSON with embedded `#(...)`
+                // (the V1 path — see evalKarateExpression). Variables and JS exprs
+                // also resolve here; embedded-expression walking is built in.
+                Object argObj = evalKarateExpression(text.substring(closeParen + 1).trim());
+                if (argObj instanceof List) {
+                    expr.argList = (List<?>) argObj;
+                } else if (argObj instanceof Map) {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> argMap = (Map<String, Object>) argObj;
+                    expr.arg = argMap;
+                }
+            }
+        } else {
+            // Not a read() call - try evaluating as expression
+            // Could be a variable that holds a feature path
+            Object result = runtime.eval(text);
+            if (result instanceof String) {
+                parsePathAndTag((String) result, expr);
+            } else {
+                throw new RuntimeException("call expression must resolve to a feature path: " + text);
+            }
+        }
+
+        return expr;
+    }
+
+    /**
+     * Parse path and tag/line selector from a feature path.
+     * Supports:
+     * - file.feature@tag - call specific scenario by tag
+     * - file.feature:N (or file.feature:N:M) - call by line number(s)
+     * - @tag - call scenario in same file by tag
+     */
+    private void parsePathAndTag(String rawPath, CallExpression expr) {
+        StepUtils.ParsedFeaturePath parsed = StepUtils.parseFeaturePath(rawPath);
+        expr.path = parsed.path();
+        expr.tagSelector = parsed.tagSelector();
+        expr.sameFile = parsed.sameFile();
+        expr.lineFilters = parsed.lineFilters();
+    }
+
+    private static class CallExpression {
+        String path;
+        Map<String, Object> arg;
+        List<?> argList;     // For loop calls with array argument
+        String resultVar;
+        String tagSelector;  // For call-by-tag syntax
+        boolean sameFile;    // true if calling scenario in same file
+        Set<Integer> lineFilters;  // For file.feature:N(:N)* call-by-line syntax
+    }
+
+    private void executeEval(Step step) {
+        String expr = step.getDocString();
+        if (expr != null) {
+            runtime.evalDocString(expr, step);
+        } else {
+            expr = step.getText();
+            runtime.eval(expr, step);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void executeDoc(Step step) {
+        String text = step.getText();
+        Object value = runtime.eval(wrapJsonLikeExpression(text));
+        // karate.doc() expects either a string path or a map with 'read' key
+        // Convert string to the expected format
+        String html;
+        if (value instanceof String path) {
+            html = runtime.getKarate().doc(Map.of("read", path));
+        } else if (value instanceof Map) {
+            html = runtime.getKarate().doc((Map<String, Object>) value);
+        } else {
+            throw new RuntimeException("doc requires a string path or map with 'read' key, got: " + value);
+        }
+        // Embed the rendered HTML in the step result for reports
+        if (html != null && !html.isEmpty()) {
+            LogContext.get().embed(html.getBytes(java.nio.charset.StandardCharsets.UTF_8), "text/html");
+        }
+    }
+
+    // ========== Config ==========
+
+    private void executeConfigure(Step step) {
+        String text = step.getText();
+        int eqIndex = StepUtils.findAssignmentOperator(text);
+        if (eqIndex < 0) {
+            throw new RuntimeException("configure requires '=' assignment: " + text);
+        }
+        String key = text.substring(0, eqIndex).trim();
+        String expr = text.substring(eqIndex + 1).trim();
+        if (expr.isEmpty() && step.getDocString() != null) {
+            expr = step.getDocString();
+        }
+        Object value;
+        if (key.equals("javaBridgeEnabled")) {
+            // Toggle Java interop (Java.type) for this engine. Mocks disable it by default
+            // so untrusted request data evaluated as embedded expressions cannot reach Java
+            // class loading; a trusted feature opts back in with `configure javaBridgeEnabled = true`.
+            Object enabled = evalKarateExpression(expr);
+            runtime.getKarate().setJavaBridgeEnabled(Boolean.parseBoolean(String.valueOf(enabled)));
+            return;
+        }
+        if (key.equals("requestExpressionsEnabled")) {
+            // Opt a mock back in to evaluating embedded expressions in request-derived data
+            // (off by default). Re-opens the injection surface - only for trusted mocks.
+            Object enabled = evalKarateExpression(expr);
+            runtime.setRequestExpressionsEnabled(Boolean.parseBoolean(String.valueOf(enabled)));
+            return;
+        }
+        if (key.equals("headers") || key.equals("cookies")) {
+            // v1 parity: `configure headers = obj` (and cookies) must hold a live
+            // reference to the source object so mutations made after the configure
+            // step are reflected on the wire. evalKarateExpression rebuilds Maps via
+            // processEmbeddedExpressions, which detaches the value into a snapshot;
+            // skip that here and instead resolve embedded #(...) expressions per
+            // request on a fresh copy (where config headers/cookies are applied).
+            value = evalConfigReferenceExpression(expr);
+        } else {
+            value = evalKarateExpression(expr);
+        }
+        runtime.configure(key, value);
+    }
+
+    /**
+     * Evaluate a {@code configure headers}/{@code configure cookies} RHS while
+     * preserving object identity. Unlike {@link #evalKarateExpression(String)},
+     * this does NOT walk the result to resolve embedded {@code #(...)} expressions
+     * (which would rebuild Maps/Lists into a detached snapshot). For a bare variable
+     * reference this returns the live object the user can keep mutating; embedded
+     * expressions are left intact and resolved at request-build time.
+     */
+    private Object evalConfigReferenceExpression(String expr) {
+        if (expr == null || expr.isEmpty()) {
+            return null;
+        }
+        expr = expr.trim();
+        // Inline relaxed-JSON literal: there is no external object to keep live, so
+        // evaluate it like any other RHS (resolving embedded #(...) now). This
+        // preserves the v1 contract that karate.config.headers reflects resolved
+        // values immediately.
+        if (StringUtils.looksLikeJson(expr)) {
+            return evalKarateExpression(expr);
+        }
+        // Bare variable / JS expression: return the live object so mutations made
+        // after the configure step are reflected. Any embedded #(...) it carries is
+        // left intact and resolved per-request on a fresh copy.
+        return runtime.eval(wrapJsonLikeExpression(expr));
+    }
+
+    // ========== Browser Driver ==========
+
+    /**
+     * Execute the driver keyword - navigate to a URL.
+     * Examples:
+     * - driver 'http://localhost:8080'
+     * - driver serverUrl + '/path'
+     * - driver myUrl
+     */
+    private void executeDriver(Step step) {
+        String text = step.getText();
+        if (text == null || text.trim().isEmpty()) {
+            throw new RuntimeException("driver keyword requires a URL argument");
+        }
+
+        // Evaluate the expression to get the URL
+        Object result = runtime.eval(text.trim());
+        if (result == null) {
+            throw new RuntimeException("driver URL evaluated to null: " + text);
+        }
+
+        String url = result.toString();
+
+        // Get the driver (initializes lazily if needed)
+        io.karatelabs.driver.Driver driver = runtime.getDriver();
+
+        // Navigate to the URL
+        driver.setUrl(url);
+    }
+
+    // ========== Karate Expression Helpers ==========
+
+    /**
+     * Gets a response header value by name (case-insensitive).
+     * V1 compatibility: "match header Content-Type contains '...'"
+     * Returns the first value if header has multiple values, null if not found.
+     */
+    @SuppressWarnings("unchecked")
+    private Object getResponseHeader(String headerName) {
+        Object responseHeaders = runtime.getVariable("responseHeaders");
+        if (responseHeaders instanceof Map) {
+            Map<String, Object> headers = (Map<String, Object>) responseHeaders;
+            Object headerValue = StringUtils.getIgnoreKeyCase(headers, headerName);
+            if (headerValue instanceof List<?> list) {
+                return list.isEmpty() ? null : list.get(0);
+            }
+            return headerValue;
+        }
+        return null;
+    }
+
+    /**
+     * Evaluates a call expression and returns the result.
+     * Used for RHS expressions like: header X = call fun { arg: 1 }
+     */
+    private Object evalCallExpression(String callExpr) {
+        String tempVar = "__callResult__" + System.nanoTime();
+        executeCallWithResult(callExpr, tempVar);
+        return runtime.getVariable(tempVar);
+    }
+
+    /**
+     * Evaluates a callonce expression and returns the result.
+     * Used for RHS expressions like: def x = callonce read('setup.feature')
+     */
+    private Object evalCallOnceExpression(String callExpr) {
+        String tempVar = "__callOnceResult__" + System.nanoTime();
+        executeCallOnceWithResult(callExpr, tempVar);
+        return runtime.getVariable(tempVar);
+    }
+
+    /**
+     * Evaluates get[N] varname path or get varname path syntax.
+     * Examples: get[0] foo[*].name, get foo $..bar, get xml //xpath
+     */
+    private Object evalGetExpression(String expr) {
+        int index = -1;
+        String remainder;
+
+        if (expr.startsWith("get[")) {
+            // get[N] syntax
+            int closeBracket = expr.indexOf(']');
+            if (closeBracket < 0) {
+                throw new RuntimeException("Invalid get expression, missing ]: " + expr);
+            }
+            index = Integer.parseInt(expr.substring(4, closeBracket));
+            remainder = expr.substring(closeBracket + 1).trim();
+        } else {
+            // get varname path
+            remainder = expr.substring(4).trim();
+        }
+
+        // Parse varname and path - could be "varname path" or "varname[...]"
+        String varName;
+        String path;
+
+        // Check if path starts with $ (explicit jsonpath)
+        if (remainder.startsWith("$")) {
+            // get $..path or get[0] $[*].foo - operates on 'response'
+            varName = "response";
+            path = remainder;
+        } else {
+            int spaceIdx = remainder.indexOf(' ');
+            int dotIdx = remainder.indexOf('.');
+            int bracketIdx = remainder.indexOf('[');
+
+            if (spaceIdx > 0
+                    && (dotIdx < 0 || spaceIdx < dotIdx)
+                    && (bracketIdx < 0 || spaceIdx < bracketIdx)) {
+                // "varname path" format with an explicit path - e.g. "json $['sp ace']",
+                // "json .foo" or the XPath shorthand "xml //xpath"
+                varName = remainder.substring(0, spaceIdx);
+                path = remainder.substring(spaceIdx).trim();
+            } else {
+                // "varname", "varname.path" or "varname[*].path" - the variable is the leading
+                // identifier and the rest is a JsonPath continuation. Reuse the shared splitter
+                // so "response.data.items[?(@.title=='x')]" roots at "response", not the whole
+                // dotted chain (which getVariable can't resolve).
+                StepUtils.VarAndPath vp = StepUtils.splitVarAndJsonPath(remainder);
+                varName = vp.var;
+                path = vp.path; // already '$'-prefixed
+            }
+        }
+
+        Object target = runtime.getVariable(varName);
+        if (target == null) {
+            return null;
+        }
+
+        // Handle XPath for XML nodes
+        if (target instanceof Node && path != null && path.startsWith("/")) {
+            Object result = KarateJsUtils.evalXmlPath((Node) target, path);
+            return applyGetIndex(result, index);
+        }
+
+        // Default to JsonPath
+        String jsonPath;
+        if (path == null) {
+            jsonPath = "$";
+        } else if (path.startsWith("$")) {
+            jsonPath = path;
+        } else {
+            jsonPath = "$" + path;
+        }
+
+        Object result;
+        try {
+            // toJsonForJsonPath, not the raw target: a variable holding a JSON string has to be
+            // parsed first or jayway treats it as a scalar leaf. v1 force-parsed here too, and
+            // the sibling `$`-path form already does - without it `get json.a.b` silently
+            // answers #notpresent (or [] for an indefinite path) where `$json.a.b` answers 1.
+            result = JsonPath.read(toJsonForJsonPath(target), jsonPath);
+        } catch (PathNotFoundException e) {
+            // v1 parity: a missing property in the JsonPath (e.g. a filter like
+            // `get[0] $.items[?(@.type=='x')].id` where `items` is absent) degrades to
+            // #notpresent rather than throwing — mirroring evalDollarPrefixedExpression
+            // for the bare `$`-path form. Holds for both `def x = get ...` and a match operand.
+            return "#notpresent";
+        }
+
+        return applyGetIndex(result, index);
+    }
+
+    /**
+     * Applies the optional {@code get[N]} index to a path result. An empty result set is
+     * handed back untouched instead of collapsing to null - v1 parity, and it keeps the
+     * common `get[0] $..items[?(...)]` idiom chainable, since `[].id` is undefined in JS
+     * whereas `null.id` throws.
+     */
+    private static Object applyGetIndex(Object result, int index) {
+        if (index >= 0 && result instanceof List) {
+            List<?> list = (List<?>) result;
+            if (list.isEmpty()) {
+                return list;
+            }
+            if (index < list.size()) {
+                return list.get(index);
+            }
+            return null;
+        }
+        return result;
+    }
+
+    // ========== Embedded Expression Processing ==========
+
+    // evalKarateExpression removed - use evalKarateExpression which handles all Karate patterns
+
+    /**
+     * Marker object to indicate a key should be removed (for ##() optional expressions).
+     */
+    private static final Object REMOVE_MARKER = new Object();
+
+    /**
+     * Wrap a Gherkin RHS expression for JS eval. Per ES6 spec, { or [ at statement
+     * position starts a block or is ambiguous. Wrapping in () ensures JSON-like
+     * expressions are parsed as object/array literals by the JS engine.
+     */
+    static String wrapJsonLikeExpression(String expr) {
+        if (expr != null && !expr.isEmpty()) {
+            char c = expr.charAt(0);
+            if (c == '{' || c == '[') {
+                return "(" + expr + ")";
+            }
+        }
+        return expr;
+    }
+
+    /**
+     * Resolve a configured {@code headers}/{@code cookies} Map for the current
+     * request. The stored map is a live reference (see {@link #evalConfigReferenceExpression}),
+     * so embedded {@code #(...)} expressions are resolved onto a fresh copy each
+     * request: later mutations to the source object are reflected, and the config
+     * map is never polluted by per-request header/cookie additions.
+     */
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> resolveConfigMap(Map<?, ?> configMap) {
+        return (Map<String, Object>) processEmbeddedExpressions(configMap, true);
+    }
+
+    /**
+     * Process embedded expressions (#() and ##()) in a value.
+     * - #(expr) evaluates expr and substitutes the result
+     * - ##(expr) evaluates expr; if null, removes the key (returns REMOVE_MARKER)
+     */
+    private Object processEmbeddedExpressions(Object value) {
+        return processEmbeddedExpressions(value, false, false);
+    }
+
+    private Object processEmbeddedExpressions(Object value, boolean lenient) {
+        return processEmbeddedExpressions(value, lenient, false);
+    }
+
+    /**
+     * Walk a value tree resolving embedded {@code #(...)} / {@code ##(...)} expressions.
+     *
+     * <p>{@code lenient} controls what happens when an expression cannot be evaluated
+     * (e.g. {@code ReferenceError} because a referenced variable isn't defined):
+     * <ul>
+     *   <li>{@code false} (user-authored data — inline JSON/XML literals, {@code def text},
+     *       etc.): inline {@code #(...)} fail-fast, matching v2's interpolation contract.</li>
+     *   <li>{@code true} (data returned by a JS evaluation — {@code read()} JSON, the
+     *       variable map from {@code karate.call}/{@code callSingle}, schema templates):
+     *       leave the placeholder untouched, mirroring v1's {@code recurseEmbeddedExpressions},
+     *       which always caught eval failures and left the node unchanged. This is what
+     *       lets a called feature's returned variables carry an unresolved Scenario-Outline
+     *       example placeholder (e.g. {@code '#(config.itemId)'}) without blowing up the
+     *       calling step.</li>
+     * </ul>
+     *
+     * <p>{@code forMatch} marks the value as destined for a {@code match} (the RHS of the
+     * keyword, or a schema the user deliberately forced through JS with {@code (...)}) rather
+     * than for a payload. It only changes one thing: an optional {@code ##(expr)} that resolves
+     * to a JSON chunk (map / list / XML node) is left as the placeholder string instead of being
+     * substituted, so the match engine sees the {@code ##} and can apply optional semantics
+     * (null or absent passes). Substituting would collapse {@code ##(schema)} into a plain
+     * required schema. v1 drew exactly this line in {@code recurseEmbeddedExpressions}, and it
+     * has to stay a line: for a payload, {@code ##(chunk)} must still inline the chunk.
+     */
+    private Object processEmbeddedExpressions(Object value, boolean lenient, boolean forMatch) {
+        return processEmbeddedExpressions(value, lenient, forMatch, null);
+    }
+
+    /**
+     * {@code ancestors} maps each container on the current path to its in-progress copy, so a
+     * cyclic value (a JS object graph with a back-edge) copies to the same cycle instead of
+     * recursing until StackOverflowError. Only the path is tracked: a container reached twice
+     * without a cycle is still copied twice.
+     */
+    private Object processEmbeddedExpressions(Object value, boolean lenient, boolean forMatch,
+                                              IdentityHashMap<Object, Object> ancestors) {
+        // Untrusted HTTP request data (Mock Server) must never be evaluated as embedded
+        // expressions - returning it verbatim leaves any `#(...)` it carries as inert data.
+        // Short-circuiting at the first request-derived container protects every nested value.
+        // No-op for ordinary execution, where nothing is ever marked request-derived.
+        // (the marking is pure provenance — the opt-in is applied HERE, so a mock that opted in still
+        // knows which values came off the wire)
+        if (!runtime.isRequestExpressionsEnabled() && runtime.isRequestDerived(value)) {
+            return value;
+        }
+        if (value instanceof Node) {
+            processXmlEmbeddedExpressions((Node) value);
+            return value;
+        } else if (value instanceof JavaCallable) {
+            // JsCallable functions shouldn't be processed as maps - return them unchanged
+            return value;
+        } else if (value instanceof Map || value instanceof List) {
+            if (ancestors == null) {
+                ancestors = new IdentityHashMap<>();
+            } else if (ancestors.containsKey(value)) {
+                return ancestors.get(value);
+            }
+            Object result;
+            if (value instanceof Map) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> map = (Map<String, Object>) value;
+                Map<String, Object> copy = new LinkedHashMap<>();
+                ancestors.put(value, copy);
+                for (Map.Entry<String, Object> entry : map.entrySet()) {
+                    Object processed = processEmbeddedExpressions(entry.getValue(), lenient, forMatch, ancestors);
+                    if (processed != REMOVE_MARKER) {
+                        copy.put(entry.getKey(), processed);
+                    }
+                }
+                result = copy;
+            } else {
+                @SuppressWarnings("unchecked")
+                List<Object> list = (List<Object>) value;
+                List<Object> copy = new ArrayList<>();
+                ancestors.put(value, copy);
+                for (Object item : list) {
+                    Object processed = processEmbeddedExpressions(item, lenient, forMatch, ancestors);
+                    if (processed != REMOVE_MARKER) {
+                        copy.add(processed);
+                    }
+                }
+                result = copy;
+            }
+            ancestors.remove(value);
+            return result;
+        } else if (value instanceof String str) {
+            return processEmbeddedString(str, lenient, forMatch);
+        }
+        return value;
+    }
+
+    /**
+     * Process a string that may contain embedded expressions.
+     */
+    private Object processEmbeddedString(String str, boolean lenient, boolean forMatch) {
+        // a JS-produced value (lenient) may hold request text reshaped past its mark; in a mock
+        // such a token runs only when it is author text (see ScenarioRuntime.embeddedTrusted)
+        if (lenient && str.startsWith("#") && !runtime.embeddedTrusted(str)) {
+            return str;
+        }
+        // Check for optional embedded: ##(...)
+        if (str.startsWith("##(") && str.endsWith(")")) {
+            String expr = str.substring(3, str.length() - 1);
+            try {
+                Object result = runtime.eval(expr);
+                if (result == null) {
+                    return REMOVE_MARKER;
+                }
+                if (forMatch && (result instanceof Map || result instanceof List || result instanceof Node)) {
+                    // an optional reference to a re-usable JSON / XML chunk — leave the placeholder
+                    // intact so the match engine can honour the '##' (null or absent is fine).
+                    // See processEmbeddedExpressions for why this is gated on forMatch.
+                    return str;
+                }
+                return result;
+            } catch (Exception e) {
+                // Lenient (JS-eval result): leave the placeholder untouched, like v1.
+                if (lenient) {
+                    return str;
+                }
+                // For optional ##() expressions, treat undefined variables as null (remove)
+                // V1 compatibility: undefined variables in ##() should result in removal
+                if (e instanceof EngineException ee && "ReferenceError".equals(ee.getJsErrorName())) {
+                    return REMOVE_MARKER;
+                }
+                throw e;
+            }
+        }
+        // Check for regular embedded: #(...)
+        if (str.startsWith("#(") && str.endsWith(")")) {
+            String expr = str.substring(2, str.length() - 1);
+            try {
+                return runtime.eval(expr);
+            } catch (Exception e) {
+                // V1 parity: an embedded expression `#(...)` can be any
+                // valid JS — a bare identifier, a property chain, a ternary, a call —
+                // and at `def` time we may not yet have the surrounding context the
+                // expression needs. Rather than special-casing error kinds, we mirror
+                // v1: if eval fails at def time, preserve the placeholder string and
+                // let the match engine try again at match time
+                // (Operation.macroEqualsExpected). If it still fails there, the error
+                // surfaces with the right scenario context.
+                // This is the schema-as-template pattern — schemas are loaded ahead
+                // of the variables they reference and resolved on use.
+                //
+                // But RECORD it. Some consumers — a mock response above all — never
+                // get the second chance this leniency is banking on, and for them a
+                // surviving placeholder goes out on the wire as data. Recording it
+                // HERE is what makes that detectable precisely: it is the only point
+                // that knows an evaluation was attempted and failed. Re-deriving the
+                // same fact downstream by scanning a body cannot work, because a
+                // `#(...)` in a body may equally be text that was never an expression
+                // at all — echoed request data, or a value some other expression
+                // computed — and 500ing on those would turn attacker-supplied text
+                // into a denial of service.
+                runtime.recordFailedEmbedded(str, e);
+                return str;
+            }
+        }
+        // A string that *starts* with '#' is a fuzzy-match marker, not free text —
+        // e.g. '#string', '#[] schema', '#[] ##(itemSchema)'. Such a marker may embed
+        // a #(...) / ##(...) expression that the match engine resolves later (the #[]
+        // each-schema path). Inline-interpolating here would stringify the resolved
+        // schema into the marker and corrupt it. v1 never inline-interpolated (it only
+        // processed whole-value #(...)/##(...) strings), so markers survived verbatim;
+        // mirror that and leave the marker intact for the match engine.
+        if (str.startsWith("#")) {
+            return str;
+        }
+        // Check for embedded expressions within a larger string
+        // e.g., "Hello #(name)!" or "Value: ##(optional)"
+        if (str.contains("#(")) {
+            return processInlineEmbedded(str, lenient);
+        }
+        return str;
+    }
+
+    /**
+     * Process inline embedded expressions like "Hello #(name)!".
+     *
+     * <p>Note: for user-authored strings ({@code lenient == false}) the lazy-defer-on-eval-failure
+     * treatment applied to whole-value `#(...)` strings (see processEmbeddedString) is intentionally
+     * NOT applied here. For a whole-value placeholder, the match engine can resolve `#(...)`
+     * later (Operation.macroEqualsExpected); for an inline substitution there is
+     * no such recovery — leaving a literal `#(name)` inside the string would be
+     * surprising rather than helpful. So eval failures here fail fast.
+     *
+     * <p>When {@code lenient == true} the string is incidental data produced by a JS
+     * evaluation (e.g. a variable map returned by {@code karate.call}/{@code callSingle}),
+     * not something the user wrote at this step. A failing token is then left verbatim,
+     * matching v1's data-tree handling, so a leaked unresolved placeholder doesn't fail the step.
+     */
+    private Object processInlineEmbedded(String str) {
+        return processInlineEmbedded(str, false);
+    }
+
+    private Object processInlineEmbedded(String str, boolean lenient) {
+        StringBuilder result = new StringBuilder();
+        int i = 0;
+        while (i < str.length()) {
+            int hashPos = str.indexOf('#', i);
+            if (hashPos < 0) {
+                result.append(str.substring(i));
+                break;
+            }
+            result.append(str.substring(i, hashPos));
+
+            boolean optional = false;
+            int exprStart;
+            if (hashPos + 1 < str.length() && str.charAt(hashPos + 1) == '#') {
+                // ##( optional
+                if (hashPos + 2 < str.length() && str.charAt(hashPos + 2) == '(') {
+                    optional = true;
+                    exprStart = hashPos + 3;
+                } else {
+                    result.append("##");
+                    i = hashPos + 2;
+                    continue;
+                }
+            } else if (hashPos + 1 < str.length() && str.charAt(hashPos + 1) == '(') {
+                // #( regular
+                exprStart = hashPos + 2;
+            } else {
+                result.append('#');
+                i = hashPos + 1;
+                continue;
+            }
+
+            // Find matching closing paren
+            int depth = 1;
+            int j = exprStart;
+            while (j < str.length() && depth > 0) {
+                char c = str.charAt(j);
+                if (c == '(') depth++;
+                else if (c == ')') depth--;
+                j++;
+            }
+            if (depth != 0) {
+                // Unbalanced parens, treat as literal
+                result.append(optional ? "##(" : "#(");
+                i = exprStart;
+                continue;
+            }
+
+            String expr = str.substring(exprStart, j - 1);
+            if (lenient && !runtime.embeddedTrusted(str.substring(hashPos, j))) {
+                result.append(str, hashPos, j); // see processEmbeddedString
+                i = j;
+                continue;
+            }
+            Object value;
+            try {
+                value = runtime.eval(expr);
+            } catch (Exception e) {
+                if (lenient) {
+                    // Leave the failing token (#(...) / ##(...)) verbatim and move on.
+                    result.append(str, hashPos, j);
+                    i = j;
+                    continue;
+                }
+                throw e;
+            }
+            if (optional && value == null) {
+                // For inline optional, substitute empty string
+                // (key removal only applies to whole-value expressions)
+            } else if (value != null) {
+                result.append(StepUtils.stringify(value));
+            }
+            i = j;
+        }
+        return result.toString();
+    }
+
+    /**
+     * Process embedded expressions in XML nodes.
+     * Handles both attribute values and text content with #() and ##() expressions.
+     */
+    private void processXmlEmbeddedExpressions(Node node) {
+        if (node.getNodeType() == Node.DOCUMENT_NODE) {
+            node = node.getFirstChild();
+        }
+        if (node == null) return;
+
+        // Process attributes
+        org.w3c.dom.NamedNodeMap attribs = node.getAttributes();
+        if (attribs != null) {
+            List<org.w3c.dom.Attr> toRemove = new ArrayList<>();
+            for (int i = 0; i < attribs.getLength(); i++) {
+                org.w3c.dom.Attr attrib = (org.w3c.dom.Attr) attribs.item(i);
+                String value = attrib.getValue();
+                if (value != null && value.contains("#(")) {
+                    boolean optional = value.startsWith("##(");
+                    if (value.startsWith("#(") || optional) {
+                        String expr = value.substring(optional ? 3 : 2, value.length() - 1);
+                        try {
+                            Object result = runtime.eval(expr);
+                            if (optional && result == null) {
+                                toRemove.add(attrib);
+                            } else {
+                                attrib.setValue(result == null ? "" : StepUtils.stringify(result));
+                            }
+                        } catch (Exception e) {
+                            // Leave as-is on error — and record it, so a consumer that EMITS this
+                            // document rather than matching it can tell a failed expression from
+                            // ordinary text (see ScenarioRuntime.recordFailedEmbedded)
+                            runtime.recordFailedEmbedded(value, e);
+                        }
+                    } else {
+                        // Inline embedded in attribute
+                        attrib.setValue(processInlineEmbedded(value).toString());
+                    }
+                }
+            }
+            for (org.w3c.dom.Attr attr : toRemove) {
+                attribs.removeNamedItem(attr.getName());
+            }
+        }
+
+        // Process child nodes
+        org.w3c.dom.NodeList children = node.getChildNodes();
+        List<Node> childList = new ArrayList<>();
+        for (int i = 0; i < children.getLength(); i++) {
+            childList.add(children.item(i));
+        }
+
+        List<Node> elementsToRemove = new ArrayList<>();
+        for (Node child : childList) {
+            String value = child.getNodeValue();
+            if (value != null) {
+                value = value.trim();
+                if (value.startsWith("#(") || value.startsWith("##(")) {
+                    boolean optional = value.startsWith("##(");
+                    String expr = value.substring(optional ? 3 : 2, value.length() - 1);
+                    try {
+                        Object result = runtime.eval(expr);
+                        if (optional && result == null) {
+                            elementsToRemove.add(child);
+                        } else if (result instanceof Node evalNode && child.getNodeType() != Node.CDATA_SECTION_NODE) {
+                            // Replace text node with XML node (but not for CDATA)
+                            if (evalNode.getNodeType() == Node.DOCUMENT_NODE) {
+                                evalNode = evalNode.getFirstChild();
+                            }
+                            evalNode = node.getOwnerDocument().importNode(evalNode, true);
+                            child.getParentNode().replaceChild(evalNode, child);
+                        } else {
+                            // For CDATA or non-Node results, convert to string
+                            String strResult = (result instanceof Node)
+                                    ? Xml.toString((Node) result, false)
+                                    : (result == null ? "" : StepUtils.stringify(result));
+                            child.setNodeValue(strResult);
+                        }
+                    } catch (Exception e) {
+                        // Leave as-is on error — and record it (see above)
+                        runtime.recordFailedEmbedded(value, e);
+                    }
+                } else if (value.contains("#(")) {
+                    // Inline embedded in text
+                    child.setNodeValue(processInlineEmbedded(value).toString());
+                }
+            } else if (child.hasChildNodes() || child.hasAttributes()) {
+                processXmlEmbeddedExpressions(child);
+            }
+        }
+
+        // Remove elements marked for removal (for ##() that evaluated to null)
+        for (Node toRemove : elementsToRemove) {
+            Node parent = toRemove.getParentNode();
+            if (parent != null) {
+                Node grandParent = parent.getParentNode();
+                if (grandParent != null) {
+                    grandParent.removeChild(parent);
+                }
+            }
+        }
+    }
+
+}

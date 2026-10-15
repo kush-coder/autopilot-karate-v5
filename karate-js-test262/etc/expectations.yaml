@@ -1,0 +1,206 @@
+# test262 expectations for karate-js
+#
+# Only concept: SKIP. If a test matches any rule below, it's not run
+# and appears in results.jsonl as {"status":"SKIP","reason":...}.
+# Everything else is attempted — failures are failures, recorded as FAIL.
+#
+# Match order: paths -> flags -> features -> includes. First match wins.
+# All entries MUST have a `reason` (one short sentence).
+#
+# To add a skip: put the rule in the right section, write the reason, commit.
+
+version: 1
+
+skip:
+
+  # Entire suite directories that are out of scope for an ES6 core engine.
+  # Paths use glob syntax (* matches within a segment, ** across segments).
+  paths:
+    - path: test/intl402/**
+      reason: internationalization (ECMA-402) out of scope
+    - path: test/staging/**
+      reason: experimental proposals not yet ratified
+    - path: test/annexB/**
+      reason: legacy-web-browser behaviors out of scope
+    # class syntax: Phases 1+2+3 implemented (constructor, instance/static
+    # methods, get/set accessors, computed keys, class expressions, default
+    # constructor, extends, super(...) / super.method(), public instance+static
+    # fields), and as of 2026-08-12 also the full ES2022 private-element
+    # surface (#x fields/methods/accessors, #x in obj) plus derived-class
+    # parent-field initialization; covered by JsClassTest (100+ cases).
+    # STILL path-skipped — re-measured 2026-08-16 at HEAD (worktree probe,
+    # both path rules + all six class feature rules removed): of the 8549
+    # shadowed tests, 2377 PASS / 1418 FAIL / 4754 stay SKIP under surviving
+    # rules (async flag, generators, ...); 0 baseline-PASS regressions. The
+    # 1418 FAILs bucket as: 574 unicode/escaped identifiers in class member
+    # names (ONE lexer gap — the cheapest big lever, 39% of the noise),
+    # 513 real semantic gaps (top: extends Map/Set/Date/RegExp lacks internal
+    # slots, static init blocks, private names invisible to class expressions
+    # in field initializers, literal method-name canonicalization, methods
+    # wrongly constructable, this-TDZ before super() unenforced), 290 negative
+    # early-error tests, 105 untagged generator/async/decorator tests. NOTE:
+    # dropping the class-fields/methods-private feature rules also unshadows
+    # 61 non-class tests that all FAIL — those rules canNOT be removed yet
+    # despite the surface being implemented. Un-skip still not clean: floor
+    # without generators is ~500 residual FAILs. Gate: (a) re-measure now
+    # that escaped / astral identifiers lex, (b) class early-error sweep, (c) features:
+    # [decorators] rule. Until then the path-skip stays; the engine
+    # capability is proven by JsClassTest.
+    - path: test/language/**/class/**
+      reason: class generators/async/decorators + field/early-error conformance tail not done (Phases 1-3 + private elements done — see JsClassTest)
+    - path: test/language/expressions/super/**
+      reason: object-literal-method super + super edge cases (this-TDZ, return-override) not done (class super done — see JsClassTest)
+    - path: test/language/statements/with/**
+      reason: with-statement is conformance-only, negligible in real-world JS and LLM-written code
+    - path: test/language/eval-code/direct/**
+      reason: direct-eval lexical-environment semantics are exotic, negligible in real-world JS
+
+  # Tests whose YAML frontmatter contains any of these `flags:` values.
+  flags:
+    - flag: module
+      reason: karate-js does not support ES modules
+    # `flags: [async]` tests run for real as of 2026-08-16: the runner loads
+    # harness/doneprintHandle.js for them, captures the engine's console sink,
+    # and reads the Test262:AsyncTestComplete / Test262:AsyncTestFailure
+    # protocol after Engine.eval drains the async scope to quiescence
+    # (Test262Runner.evaluate). A test completing without calling $DONE FAILs
+    # as Harness.
+    # onlyStrict is NOT skipped: the runner prepends a "use strict" directive for
+    # these tests (Test262Runner.evaluate) and the parser enforces the strict-mode
+    # early errors (octal literals, eval/arguments binding+assignment, simple +
+    # destructuring duplicate params, catch BoundNames — JsParser.checkStrictEarlyErrors).
+    # Measured un-skip (2026-05-30, test/language/**): 428 tests -> 282 PASS /
+    # 146 FAIL, 0 regressions (lang pass 5433 -> 5715). The 146 residual fails are
+    # real not-yet-done strict semantics: ~99 negative parse-phase early errors
+    # (function-decl-in-statement-position et al.), ~16 runtime SyntaxError, ~14
+    # strict-assignment runtime TypeError — see Active priorities for the tail.
+    - flag: CanBlockIsTrue
+      reason: engine cannot block on shared-memory worker agents
+    - flag: CanBlockIsFalse
+      reason: CanBlock flag not modeled
+
+  # Tests whose YAML frontmatter contains any of these `features:` values.
+  features:
+    - feature: Symbol
+      reason: Symbol primitive type / unique identity / Symbol() constructor not supported
+    - feature: Symbol.toStringTag
+      reason: requires Symbol primitive (well-known @@toStringTag tested via Symbol[])
+    - feature: Symbol.asyncIterator
+      reason: async iteration (@@asyncIterator protocol) not supported
+    # Symbol.iterator un-skipped: karate-js exposes @@iterator (string-keyed
+    # stand-in) on JsArray / JsString and routes for-of / spread / destructuring /
+    # Array.from through IterUtils.getIterator.
+    # Symbol.toPrimitive un-skipped: dispatch now routes through obj["@@toPrimitive"]
+    # (Terms.toPrimitive + Terms.add). Tests that ALSO need the Symbol primitive
+    # (e.g. `typeof Symbol.toPrimitive === "symbol"`) still skip via `feature: Symbol`.
+    # Tests using only the well-known stand-in pass on the new dispatch.
+    # BigInt un-skipped: lexer recognizes the `n` literal suffix, runtime is backed
+    # by java.math.BigInteger, arithmetic dispatches through Terms with TypeError on
+    # mixing with Number, JSON.stringify throws TypeError per spec.
+    - feature: class
+      reason: class syntax not supported (use prototypes)
+    - feature: class-fields-public
+      reason: class syntax not supported
+    - feature: class-fields-private
+      reason: implemented 2026-08-12, but the owning class slices are path-skipped pending the class un-skip gate above
+    - feature: class-methods-private
+      reason: implemented 2026-08-12, but the owning class slices are path-skipped pending the class un-skip gate above
+    - feature: class-static-fields-public
+      reason: class syntax not supported
+    - feature: class-static-methods-private
+      reason: class syntax not supported
+    - feature: Proxy
+      reason: Proxy not implemented
+    - feature: Reflect
+      reason: Reflect not implemented
+    # async-functions un-skipped: `async function` / `async` arrows / `await` run
+    # on the vthread-activation model (see JS_ENGINE.md § Async). Tests that also
+    # carry `flags: [async]` still skip on the flag rule above (harness gap, not
+    # an engine gap).
+    - feature: async-iteration
+      reason: async generators / for-await-of / @@asyncIterator not supported
+    - feature: Temporal
+      reason: Temporal proposal not implemented
+    - feature: TypedArray
+      reason: only Uint8Array is supported
+    - feature: Float16Array
+      reason: Float16Array (ES2025) not implemented; Math.f16round depends on it
+    - feature: ArrayBuffer
+      reason: ArrayBuffer semantics not implemented
+    - feature: resizable-arraybuffer
+      reason: resizable ArrayBuffer (ES2024) not implemented; harness requires Int8Array
+    - feature: cross-realm
+      reason: multi-realm semantics not modeled ($262.createRealm absent)
+    - feature: SharedArrayBuffer
+      reason: SharedArrayBuffer not implemented
+    - feature: DataView
+      reason: DataView not implemented
+    - feature: Atomics
+      reason: Atomics not supported
+    - feature: WeakRef
+      reason: WeakRef not implemented
+    - feature: FinalizationRegistry
+      reason: FinalizationRegistry not implemented
+    # WeakMap / WeakSet un-skipped 2026-08-12: Map/Set-backed non-weak
+    # stand-ins (JsWeakMap* / JsWeakSet*) — full method surface, object-key
+    # TypeErrors, no size/iteration. GC-weakness itself is not modeled
+    # (short-lived scripts), which test262 cannot observe anyway.
+    # Promise / Promise.any / Promise.allSettled un-skipped: JsPromise +
+    # JsPromiseConstructor implement the constructor, all / allSettled / any /
+    # race / resolve / reject and then / catch / finally, driven by the async job
+    # queue. `flags: [async]` Promise tests still skip on the flag rule above.
+    # Not yet implemented and left to FAIL (few tests, no rule): Promise.try,
+    # Promise.withResolvers.
+    - feature: regexp-lookbehind
+      reason: regex lookbehind not yet implemented
+    - feature: regexp-unicode-property-escapes
+      reason: unicode property escapes not implemented
+    - feature: regexp-match-indices
+      reason: match indices not implemented
+    - feature: regexp-duplicate-named-groups
+      reason: duplicate named groups not implemented
+    - feature: regexp-v-flag
+      reason: /v regex flag not implemented
+    - feature: dynamic-import
+      reason: dynamic import not supported
+    # numeric-separator-literal un-skipped: lexer accepts `_` between digits in
+    # decimal, hex, exponent, and BigInt literals; first-char and trailing/doubled
+    # separators are early errors.
+    - feature: tail-call-optimization
+      reason: tail-call optimization not guaranteed
+    - feature: Math.sumPrecise
+      reason: Math.sumPrecise (ES2025 stage 3+) not implemented
+    - feature: explicit-resource-management
+      reason: using / await-using declarations and DisposableStack not implemented
+    # destructuring-binding is INTENTIONALLY NOT skipped — LLM-written JS uses
+    # `const { a, b } = obj` constantly; we want to surface real breakage here.
+    # If engine support proves too incomplete, re-add with a specific reason.
+    - feature: new.target
+      reason: new.target not supported
+    # Array.prototype.includes un-skipped: implemented in JsArrayPrototype.
+    # globalThis un-skipped: the global object is exposed as `globalThis`.
+
+  # Tests whose YAML frontmatter `includes:` references any of these harness helpers
+  # (the harness file itself may exist, but it depends on engine internals we do not expose).
+  # propertyHelper.js + compareArray.js un-skipped: per-property attribute bits
+  # (writable / enumerable / configurable) are now tracked on JsObject and
+  # enforced on putMember / removeMember / for-in / propertyIsEnumerable.
+  # compareArray.js itself is now an empty stub (the helper moved into assert.js);
+  # its users no longer need a special harness.
+  # promiseHelper.js un-skipped: it is plain JS (checkSequence /
+  # checkSettledPromises) over assert.js + Test262Error, no engine internals.
+  includes:
+    - include: nativeFunctionMatcher.js
+      reason: depends on Function.prototype.toString internals
+    - include: detachArrayBuffer.js
+      reason: ArrayBuffer semantics not implemented
+    - include: testTypedArray.js
+      reason: TypedArray (beyond Uint8Array) not supported
+    - include: testAtomics.js
+      reason: Atomics not supported
+    - include: testBigIntTypedArray.js
+      reason: BigInt64Array / BigUint64Array (TypedArray beyond Uint8Array) not supported
+    - include: testIntl.js
+      reason: internationalization out of scope
+    - include: proxyTrapsHelper.js
+      reason: Proxy not implemented

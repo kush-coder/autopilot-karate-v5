@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Logging config for the test262 runner + report.
+
+  Writes `<run-dir>/progress.log` where <run-dir> is the per-run directory
+  resolved by Test262Runner / Test262Report (system property
+  `test262.run.dir`, set before the first SLF4J call). When the property
+  isn't set (e.g. a stray invocation outside the runner), the log lands
+  under `target/test262/progress.log` as a fallback.
+
+  Captures the startup banner, periodic [progress] lines, and the final
+  Summary / Aborted line. FAIL lines and per-test metadata go to stdout
+  only — that data lives (with full fidelity) in
+  <run-dir>/results.jsonl(.partial), and mirroring it into the log would
+  just be duplication without a new signal.
+
+  `<append>true</append>` is critical: Test262Report runs in a separate
+  JVM after Test262Runner, and a truncating appender would wipe the
+  runner's banner+summary on first report log call.
+-->
+<configuration>
+    <appender name="FILE" class="ch.qos.logback.core.FileAppender">
+        <file>${test262.run.dir:-target/test262}/progress.log</file>
+        <append>true</append>
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- Runner / report traffic goes only to the file; the runner also writes to
+         stdout directly, so we don't want the logger to double-print. -->
+    <logger name="io.karatelabs.js.test262" level="INFO" additivity="false">
+        <appender-ref ref="FILE"/>
+    </logger>
+
+    <!-- The runner puts the engine in warn-only unhandled-rejection mode (test262
+         has no such notion, and whole families drop a rejected promise on purpose).
+         Those warnings would interleave with the FAIL lines the runner writes to
+         stdout; the per-test outcome lives in results.jsonl with full fidelity. -->
+    <logger name="io.karatelabs.js.AsyncSupport" level="ERROR"/>
+
+    <!-- Everything else (libraries, karate-js itself) goes to console at WARN. -->
+    <root level="WARN">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+</configuration>

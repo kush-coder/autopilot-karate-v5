@@ -1,0 +1,3294 @@
+/*
+ * The MIT License
+ *
+ * Copyright 2025 Karate Labs Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package io.karatelabs.parser;
+
+import io.karatelabs.common.Resource;
+
+import java.util.ArrayList;
+import java.util.EnumSet;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import static io.karatelabs.parser.TokenType.*;
+
+public class JsParser extends BaseParser {
+
+    // ECMA "no-in" production flag. Set inside the for-statement init
+    // expression (between `for (` and the first `;`) so the IN_EXPR branch
+    // skips IN — leaving it to be consumed as the for-in / for-of header
+    // token. Reset to false inside parens / brackets / function calls so
+    // `for (var x = (a in b); cond; upd)` still works as a relational `in`.
+    private boolean noIn;
+
+    // True where `await` is an operator rather than an identifier: inside an async
+    // function / method / arrow, and at the top level of a program (top-level await
+    // is supported by design — this engine embeds as a scripting engine). Every
+    // function body sets it to its own async-ness and restores it after, so an
+    // ordinary function nested inside an async one goes back to treating `await` as
+    // a plain identifier, as the spec requires.
+    private boolean inAsync = true;
+    // True where `yield` is an operator rather than an identifier: inside a
+    // generator function body. Unlike inAsync it defaults to FALSE at program
+    // level (there is no top-level yield). Save/restored together with inAsync
+    // around every function body — an ordinary function nested inside a
+    // generator goes back to treating `yield` as an identifier, and arrows are
+    // never generators.
+    private boolean inGenerator = false;
+    // inAsync minus the top level: where `await` is reserved even as an identifier.
+    private boolean inAsyncBody = false;
+
+    // The source text, for the allocation-free identifier comparisons that decide
+    // the `async` / `await` contextual keywords (see isIdentText).
+    private final String source;
+
+    // EnumSet token sets for O(1) lookup in hot paths
+    private static final EnumSet<TokenType> T_VAR_STMT = EnumSet.of(VAR, CONST, LET);
+    private static final EnumSet<TokenType> T_ASSIGN_EXPR = EnumSet.of(EQ, PLUS_EQ, MINUS_EQ, STAR_EQ, SLASH_EQ, PERCENT_EQ, STAR_STAR_EQ, GT_GT_EQ, LT_LT_EQ, GT_GT_GT_EQ, AMP_EQ, PIPE_EQ, CARET_EQ, PIPE_PIPE_EQ, AMP_AMP_EQ, QUES_QUES_EQ);
+    private static final EnumSet<TokenType> T_LOGIC_EQ_EXPR = EnumSet.of(EQ_EQ_EQ, NOT_EQ_EQ, EQ_EQ, NOT_EQ);
+    private static final EnumSet<TokenType> T_LOGIC_CMP_EXPR = EnumSet.of(LT, GT, LT_EQ, GT_EQ);
+    private static final EnumSet<TokenType> T_LOGIC_SHIFT_EXPR = EnumSet.of(GT_GT, LT_LT, GT_GT_GT);
+    private static final EnumSet<TokenType> T_MATH_ADD_EXPR = EnumSet.of(PLUS, MINUS);
+    private static final EnumSet<TokenType> T_MATH_MUL_EXPR = EnumSet.of(STAR, SLASH, PERCENT);
+    private static final EnumSet<TokenType> T_REF_DOT_EXPR = EnumSet.of(DOT, QUES_DOT);
+    private static final EnumSet<TokenType> T_MATH_POST_EXPR = EnumSet.of(PLUS_PLUS, MINUS_MINUS);
+    private static final EnumSet<TokenType> T_UNARY_EXPR = EnumSet.of(NOT, TILDE, VOID);
+    private static final EnumSet<TokenType> T_MATH_PRE_EXPR = EnumSet.of(PLUS_PLUS, MINUS_MINUS, MINUS, PLUS);
+    // PropertyName is an IdentifierName (identifier OR any reserved word),
+    // plus string/numeric literals, computed-key bracket, and spread. The
+    // spec allows `{break: 1}`, `{default: 1}`, etc. in object literals and
+    // destructuring patterns alike. Keywords are added at class-init time
+    // from TokenType.keyword.
+    private static final EnumSet<TokenType> T_OBJECT_ELEM = buildObjectElemSet();
+    private static final EnumSet<TokenType> T_ACCESSOR_KEY_START = buildAccessorKeySet();
+
+    private static EnumSet<TokenType> buildObjectElemSet() {
+        // STAR admits the ES6 generator shorthand method `*name() { ... }`.
+        EnumSet<TokenType> s = EnumSet.of(IDENT, S_STRING, D_STRING, NUMBER, BIGINT, DOT_DOT_DOT, L_BRACKET, STAR);
+        for (TokenType t : TokenType.values()) {
+            if (t.keyword) s.add(t);
+        }
+        return s;
+    }
+
+    private static EnumSet<TokenType> buildAccessorKeySet() {
+        EnumSet<TokenType> s = EnumSet.of(IDENT, S_STRING, D_STRING, NUMBER, BIGINT, L_BRACKET);
+        for (TokenType t : TokenType.values()) {
+            if (t.keyword) s.add(t);
+        }
+        return s;
+    }
+    private static final EnumSet<TokenType> T_LIT_EXPR = EnumSet.of(S_STRING, D_STRING, NUMBER, BIGINT, TRUE, FALSE, NULL);
+    private static final EnumSet<TokenType> T_FOR_IN_OF = EnumSet.of(IN, OF);
+
+    // Lookahead sets - EnumSet for O(1) contains() via bitmask
+    private static final EnumSet<TokenType> T_EXPR_START = EnumSet.of(
+            IDENT, S_STRING, D_STRING, NUMBER, BIGINT, TRUE, FALSE, NULL,  // literals & ref
+            L_CURLY, L_BRACKET, BACKTICK, REGEX,                           // compound literals
+            FUNCTION, CLASS, SUPER, L_PAREN, NEW, TYPEOF, VOID, DELETE,    // keywords & grouping
+            NOT, TILDE, PLUS_PLUS, MINUS_MINUS, MINUS, PLUS,               // unary operators
+            PRIVATE_NAME                                                   // only as `#x in obj`
+    );
+    private static final EnumSet<TokenType> T_LIT_EXPR_START = EnumSet.of(
+            S_STRING, D_STRING, NUMBER, BIGINT, TRUE, FALSE, NULL,         // simple literals
+            L_CURLY, L_BRACKET, BACKTICK, REGEX                            // compound literals
+    );
+
+    private Node ast;
+
+    // True if any `?.` was consumed during parsing — gates the
+    // post-parse early-error walk so files with no optional chaining
+    // pay no AST-traversal cost. Reset to false implicitly per JsParser
+    // instance (one parse per instance).
+    private boolean sawOptionalChain;
+
+    // True if any `#name` was consumed — gates the private-name family of
+    // early-error checks so files without private class elements pay nothing.
+    private boolean sawPrivateName;
+
+    // True if any label was consumed during parsing — either a `label:` prefix or the
+    // label of a `break`/`continue`. Gates the label early-error checks in the fused
+    // walk so label-free files pay only a boolean test per node.
+    private boolean sawLabel;
+
+    // True if any object-literal element spelled `__proto__` as a plain (non-computed)
+    // key — gates the duplicate-proto-setter early error so ordinary literals pay only
+    // a boolean test per node.
+    private boolean sawProtoKey;
+
+    // Identifier-position tokens spelling a word reserved only in strict code (§13.1.1);
+    // strictness is known only in the early-error walk, which rejects them there.
+    private Set<Token> strictReservedIdents;
+
+    public JsParser(Resource resource) {
+        this(resource, false);
+    }
+
+    public JsParser(Resource resource, boolean errorRecovery) {
+        super(resource, JsLexer.getTokens(resource), errorRecovery);
+        source = resource.getText();
+    }
+
+    private boolean leadingFunctionExpression;
+
+    /** Karate's convention, opt-in: a source that opens with an anonymous function parses it
+     *  as an expression statement, so the source evaluates to that function. */
+    public JsParser leadingFunctionExpression() {
+        leadingFunctionExpression = true;
+        return this;
+    }
+
+    /**
+     * @return the AST root node (PROGRAM) for IDE features
+     */
+    public Node getAst() {
+        return ast;
+    }
+
+    public Node parse() {
+        enter(NodeType.PROGRAM);
+        ast = markerNode();
+        while (true) {
+            if (!statement(false)) {
+                // In recovery mode, skip unparseable tokens to find next statement
+                if (errorRecoveryEnabled && !peekIf(EOF)) {
+                    error("cannot parse statement");
+                    recoverToStatement();
+                    continue;
+                }
+                break;
+            }
+        }
+        if (!consumeIf(EOF)) {
+            error("cannot parse statement");
+        }
+        exit();
+        // Spec early errors: one post-parse descent runs every per-node check.
+        // Three distinct rule families share a single traversal (they previously
+        // ran as three independent full-tree walks): assignment-target validity /
+        // optional-chain / declaration-position (mode-independent), the
+        // CoverInitializedName rule (gated on pattern context, threaded as
+        // `inPattern`), the label rules (gated on `sawLabel`, threaded as the chain of
+        // enclosing labels), and the strict-mode family (gated on lexical strictness,
+        // computed top-down and threaded as `strict` — the program starts sloppy
+        // unless it opens with a "use strict" directive prologue). Adding a new
+        // early-error rule means adding a per-node helper to `earlyErrors`, never
+        // another whole-tree walk.
+        if (!errorRecoveryEnabled) {
+            earlyErrors(ast, false, false, null, null);
+        }
+        return ast;
+    }
+
+    /**
+     * Single post-parse descent that runs all spec early-error checks per node and
+     * recurses once. Threads the three pieces of top-down state the individual rule
+     * families need — {@code strict} (lexical strictness), {@code inPattern}
+     * (destructuring-pattern context) and {@code labels} (the enclosing label chain,
+     * always null unless the file used a label) — and recomputes each for the children. The
+     * per-node check bodies live in dedicated helpers so this stays the one place
+     * the tree is walked; a new early-error rule plugs in as another helper call,
+     * not another traversal.
+     * <p>
+     * Per-node check order mirrors the former pass order
+     * (assignment-target/decl-position → CoverInitializedName → strict-mode) so a
+     * node that could trip more than one rule reports the same message as before.
+     */
+    private void earlyErrors(Node node, boolean strict, boolean inPattern, PrivateScope privates, Label labels) {
+        if (node == null) {
+            return;
+        }
+        // Mode-independent: assignment-target validity, optional-chain restrictions,
+        // declaration-in-statement-position.
+        earlyErrorNodeChecks(node);
+        // CoverInitializedName / rest-element rules, gated on pattern context.
+        if (node.type == NodeType.OBJECT_ELEM && hasCoverInitForm(node) && !inPattern) {
+            throw new ParserException("invalid shorthand initializer: only allowed in destructuring pattern");
+        }
+        if (inPattern && node.type == NodeType.LIT_ARRAY) {
+            validateRestElementRules(node);
+        }
+        // §15.7.1 static-block family — scans only the block's own subtree.
+        if (node.type == NodeType.CLASS_STATIC_BLOCK) {
+            checkStaticBlockBody(node, 0);
+        }
+        // At most one B.3.1 proto-setter per ObjectLiteral; not a rule for patterns.
+        if (sawProtoKey && !inPattern && node.type == NodeType.LIT_OBJECT) {
+            checkNoDuplicateProtoSetter(node);
+        }
+        // Private-name family; returns the private scope to propagate to children.
+        PrivateScope childPrivates = sawPrivateName ? privateNodeChecks(node, privates) : privates;
+        // Strict-mode family; returns the strictness to propagate to children.
+        boolean childStrict = strictNodeChecks(node, strict);
+        // Label family; returns the label chain to propagate to children.
+        Label childLabels = sawLabel ? labelNodeChecks(node, labels) : null;
+        for (int i = 0, n = node.size(); i < n; i++) {
+            Node child = node.get(i);
+            if (!child.isToken()) {
+                earlyErrors(child, childStrict, childInPatternContext(node, i, inPattern), childPrivates, childLabels);
+            } else if (childStrict && strictReservedIdents != null && strictReservedIdents.contains(child.token)) {
+                throw new ParserException("'" + child.getText() + "' is a reserved word in strict mode");
+            }
+        }
+    }
+
+    /** The private names declared by one class body, chained to the enclosing
+     *  class's scope — the parse-time half of the spec's PrivateEnvironment. */
+    private record PrivateScope(PrivateScope parent, Set<String> names) {
+        boolean declares(String name) {
+            for (PrivateScope s = this; s != null; s = s.parent) {
+                if (s.names.contains(name)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
+    /**
+     * Private-name spec early errors at a single node (no recursion —
+     * {@link #earlyErrors} drives the traversal), returning the private scope its
+     * children see. Only reached when the file actually contains a {@code #name}.
+     * <ul>
+     *   <li>A class body's declared names form a new scope nested in the enclosing
+     *       one; duplicates are an error except a same-placement get/set pair, and
+     *       {@code #constructor} is reserved (§15.7.1).</li>
+     *   <li>Every {@code obj.#x} / {@code #x in obj} reference must resolve to a
+     *       name declared by an enclosing class body (§13.2.5.1) — a reference with
+     *       no declaration is a SyntaxError, not a runtime miss.</li>
+     *   <li>{@code delete obj.#x} is an error (§13.5.1), and a bare {@code #x} is
+     *       legal only as the left operand of {@code in}.</li>
+     * </ul>
+     */
+    private PrivateScope privateNodeChecks(Node node, PrivateScope privates) {
+        switch (node.type) {
+            case CLASS_EXPR -> {
+                return classPrivateScope(node, privates);
+            }
+            case REF_DOT_EXPR -> {
+                Node key = node.size() > 2 ? node.get(2) : null;
+                if (key != null && key.isToken() && key.token.type == PRIVATE_NAME) {
+                    requirePrivateDeclared(key.getText(), privates);
+                }
+            }
+            case PRIVATE_NAME_EXPR -> {
+                Node parent = node.getParent();
+                if (parent == null || parent.type != NodeType.IN_EXPR || parent.getFirst() != node) {
+                    throw new ParserException("unexpected private name '" + node.getText()
+                            + "': only valid as the left operand of `in`");
+                }
+                requirePrivateDeclared(node.getText(), privates);
+            }
+            case DELETE_EXPR -> {
+                Node target = node.size() > 1 ? node.get(1) : null;
+                while (target != null && !target.isToken()) {
+                    if (target.type == NodeType.REF_DOT_EXPR) {
+                        Node key = target.size() > 2 ? target.get(2) : null;
+                        if (key != null && key.isToken() && key.token.type == PRIVATE_NAME) {
+                            throw new ParserException("cannot delete private member " + key.getText());
+                        }
+                        break;
+                    }
+                    if (target.type == NodeType.PAREN_EXPR) {
+                        target = target.size() > 1 ? target.get(1) : null;
+                    } else if (target.type == NodeType.EXPR || target.type == NodeType.EXPR_LIST) {
+                        target = target.size() == 1 ? target.getFirst() : null;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            default -> {
+            }
+        }
+        return privates;
+    }
+
+    private static void requirePrivateDeclared(String name, PrivateScope privates) {
+        if (privates == null || !privates.declares(name)) {
+            throw new ParserException("private name " + name + " is not declared in an enclosing class");
+        }
+    }
+
+    /** Collects the {@code #name} keys declared directly by a class body. Each
+     *  CLASS_METHOD holds its key as a direct token child, so at most one
+     *  PRIVATE_NAME can appear per member (an initializer lives in a nested EXPR). */
+    private static PrivateScope classPrivateScope(Node classNode, PrivateScope parent) {
+        Set<String> names = null;
+        Map<String, Integer> kinds = null;
+        for (int i = 0, n = classNode.size(); i < n; i++) {
+            Node member = classNode.get(i);
+            if (member.type != NodeType.CLASS_METHOD) {
+                continue;
+            }
+            Node key = null;
+            int kind = 4; // 1 = get, 2 = set, 4 = anything else; 8 = static
+            for (int j = 0, m = member.size(); j < m; j++) {
+                Node c = member.get(j);
+                if (!c.isToken()) {
+                    continue;
+                }
+                if (c.token.type == PRIVATE_NAME) {
+                    key = c;
+                    break;
+                }
+                String t = c.getText();
+                if ("get".equals(t)) {
+                    kind = 1;
+                } else if ("set".equals(t)) {
+                    kind = 2;
+                } else if ("static".equals(t)) {
+                    kind |= 8;
+                }
+            }
+            if (key == null) {
+                continue;
+            }
+            String name = key.getText();
+            if ("#constructor".equals(name)) {
+                throw new ParserException("#constructor is a reserved private name");
+            }
+            if (names == null) {
+                names = new HashSet<>(4);
+                kinds = new HashMap<>(4);
+            }
+            Integer prior = kinds.put(name, kind);
+            // a get/set pair at the same placement is the sole legal duplicate
+            boolean accessorPair = prior != null && (prior & 8) == (kind & 8)
+                    && (prior & 4) == 0 && (kind & 4) == 0 && ((prior & 3) | (kind & 3)) == 3;
+            if (prior != null && !accessorPair) {
+                throw new ParserException("duplicate private name " + name + " in class body");
+            }
+            names.add(name);
+        }
+        return names == null ? parent : new PrivateScope(parent, names);
+    }
+
+    /**
+     * An enclosing label. {@code iteration} records whether the labelled statement is an
+     * iteration statement, which is what separates a legal {@code continue} target from a
+     * legal {@code break} target (§14.13.1). An immutable cons cell so {@link #earlyErrors}
+     * can thread the chain down without copying.
+     */
+    private record Label(String name, boolean iteration, Label next) {
+        static boolean contains(Label chain, String name, boolean iterationOnly) {
+            for (Label l = chain; l != null; l = l.next) {
+                if (l.name.equals(name) && (!iterationOnly || l.iteration)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
+    /**
+     * §14.13.1 label early errors at a single node (no recursion — {@link #earlyErrors}
+     * drives the traversal): a label may not be nested inside a statement already carrying
+     * it, {@code break} / {@code continue} may only name an enclosing label, and
+     * {@code continue} additionally needs that label to name an iteration statement.
+     * Returns the label chain visible to this node's children — nested function bodies see
+     * none of them, since labels do not cross a function boundary.
+     */
+    private Label labelNodeChecks(Node node, Label labels) {
+        switch (node.type) {
+            case LABELLED_STMT -> {
+                String name = node.getFirst().getText();
+                if (Label.contains(labels, name, false)) {
+                    throw new ParserException("label already in scope: " + name);
+                }
+                return new Label(name, labelsIterationStatement(node), labels);
+            }
+            // §15.7.1 makes a static initialization block a boundary of the same kind
+            // as a function body: nothing inside it may name a label outside it.
+            case FN_EXPR, FN_ARROW_EXPR, CLASS_STATIC_BLOCK -> {
+                return null;
+            }
+            case BREAK_STMT -> {
+                String target = labelReference(node);
+                if (target != null && !Label.contains(labels, target, false)) {
+                    throw new ParserException("break references an undefined label: " + target);
+                }
+            }
+            case CONTINUE_STMT -> {
+                String target = labelReference(node);
+                if (target != null) {
+                    if (!Label.contains(labels, target, false)) {
+                        throw new ParserException("continue references an undefined label: " + target);
+                    }
+                    if (!Label.contains(labels, target, true)) {
+                        throw new ParserException("continue label does not name a loop: " + target);
+                    }
+                }
+            }
+            default -> {
+            }
+        }
+        return labels;
+    }
+
+    /** The label named by a {@code break} / {@code continue}, or null when it has none —
+     *  children are [keyword] or [keyword, label]. */
+    private static String labelReference(Node node) {
+        return node.size() > 1 ? node.get(1).getText() : null;
+    }
+
+    /** True if the labelled item — after peeling any stacked labels, since {@code a: b: for}
+     *  makes both names loop labels — is an iteration statement. */
+    private static boolean labelsIterationStatement(Node labelled) {
+        Node item = labelledItem(labelled);
+        while (item != null && item.type == NodeType.LABELLED_STMT) {
+            item = labelledItem(item);
+        }
+        return item != null && (item.type == NodeType.FOR_STMT
+                || item.type == NodeType.WHILE_STMT
+                || item.type == NodeType.DO_WHILE_STMT);
+    }
+
+    /** The statement a LABELLED_STMT labels, unwrapped from its STATEMENT container. */
+    private static Node labelledItem(Node labelled) {
+        if (labelled.size() < 3) {
+            return null;
+        }
+        Node statement = labelled.get(2);
+        for (int i = 0, n = statement.size(); i < n; i++) {
+            Node inner = statement.get(i);
+            if (!inner.isToken()) {
+                return inner;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Mode-independent spec early errors checked at a single node (no recursion —
+     * {@link #earlyErrors} drives the traversal):
+     * <ul>
+     *   <li>IsValidSimpleAssignmentTarget: the LHS of {@code =} / compound assignment
+     *       and the operand of {@code ++}/{@code --} must be a simple reference
+     *       (identifier, member access) or a destructuring pattern. Patterns like
+     *       {@code (a + b) = 1}, {@code () => {} = 1}, {@code 1 = 1}, {@code ++f()},
+     *       {@code (x = y) = 1} are SyntaxErrors at parse phase.</li>
+     *   <li>Optional-chain restrictions: an OptionalExpression cannot be an
+     *       assignment target, the operand of {@code ++}/{@code --}, or the head of
+     *       a tagged template literal.</li>
+     * </ul>
+     * Throws {@link ParserException} so the test262 runner classifies the failure as
+     * {@code phase: parse}.
+     */
+    private void earlyErrorNodeChecks(Node node) {
+        switch (node.type) {
+            case ASSIGN_EXPR -> {
+                if (node.size() > 0) {
+                    Node lhs = node.getFirst();
+                    if (sawOptionalChain && subtreeContainsOptionalChain(lhs)) {
+                        throw new ParserException("optional chain is not a valid assignment target");
+                    }
+                    // Logical-assignment operators (||=, &&=, ??=) are ES2021 and have no
+                    // Annex B web-compat carve-out for CallExpression LHS — the SimpleAssignmentTarget
+                    // requirement is strict. Plain `=` and the older compound operators still allow
+                    // `f() = …` in non-strict mode.
+                    TokenType op = node.size() > 1 && node.get(1).isToken() ? node.get(1).token.type : null;
+                    boolean noCallCarveOut = op == PIPE_PIPE_EQ || op == AMP_AMP_EQ || op == QUES_QUES_EQ;
+                    checkSimpleAssignmentTarget(lhs, "assignment target", noCallCarveOut);
+                }
+            }
+            case MATH_EXP_EXPR -> {
+                // §13.6: the base of `**` must be an UpdateExpression — an
+                // unparenthesized unary (-x, !x, ~x, +x, void x, typeof x,
+                // delete x.y, await x) is a SyntaxError; ++x / --x are legal.
+                Node base = stripExprWrappers(node.size() > 0 ? node.getFirst() : null);
+                if (base != null) {
+                    boolean unaryBase = switch (base.type) {
+                        case DELETE_EXPR, TYPEOF_EXPR, UNARY_EXPR, AWAIT_EXPR -> true;
+                        case MATH_PRE_EXPR -> base.size() > 0 && base.getFirst().isToken()
+                                && (base.getFirst().token.type == PLUS || base.getFirst().token.type == MINUS);
+                        default -> false;
+                    };
+                    if (unaryBase) {
+                        throw new ParserException("unary expression cannot be the base of '**'; wrap it in parentheses");
+                    }
+                }
+            }
+            case MATH_POST_EXPR -> {
+                // children: [operand, ++/--]
+                if (node.size() > 0) {
+                    Node operand = node.getFirst();
+                    if (sawOptionalChain && subtreeContainsOptionalChain(operand)) {
+                        throw new ParserException("optional chain cannot be the operand of postfix ++/--");
+                    }
+                    checkSimpleAssignmentTarget(operand, "operand of postfix update", false);
+                }
+            }
+            case MATH_PRE_EXPR -> {
+                // children: [op, operand] — only ++/-- need a valid update target;
+                // unary +/- have no assignment side and parse the same shape.
+                if (node.size() > 1) {
+                    Node op = node.getFirst();
+                    if (op.isToken() && (op.token.type == PLUS_PLUS || op.token.type == MINUS_MINUS)) {
+                        Node operand = node.get(1);
+                        if (sawOptionalChain && subtreeContainsOptionalChain(operand)) {
+                            throw new ParserException("optional chain cannot be the operand of prefix ++/--");
+                        }
+                        checkSimpleAssignmentTarget(operand, "operand of prefix update", false);
+                    }
+                }
+            }
+            case FN_TAGGED_TEMPLATE_EXPR -> {
+                if (sawOptionalChain && node.size() > 0
+                        && subtreeContainsOptionalChain(node.getFirst())) {
+                    throw new ParserException("tagged template literal cannot follow an optional chain");
+                }
+            }
+            // A FunctionDeclaration is a StatementListItem, never a Statement, so it
+            // may not be the sole body of an iteration statement (§13.7). Unlike the
+            // `if` clause (Annex B.3.4) there is no web-compat carve-out, so this is an
+            // early error in BOTH sloppy and strict code — hence it lives here, not in
+            // the strict-gated walk. `for (…) { function f(){} }` stays legal: the body
+            // Statement wraps a BLOCK, so its direct child is BLOCK, not FN_EXPR.
+            // A LexicalDeclaration (let/const) and a ClassDeclaration are likewise
+            // Declarations, not Statements, and — unlike FunctionDeclaration — have no
+            // Annex B carve-out for ANY clause, so they are illegal as the body of an
+            // `if`/`else` clause too (§13.6/§14.x). The `for`-init `let` is a direct
+            // FOR_STMT child, not a STATEMENT, so it is correctly ignored.
+            case FOR_STMT, WHILE_STMT, DO_WHILE_STMT -> {
+                checkNoFunctionDeclarationBody(node, "a loop");
+                checkNoLexicalOrClassDeclarationBody(node, "a loop");
+            }
+            case IF_STMT -> checkNoLexicalOrClassDeclarationBody(node, "an `if`/`else` clause");
+            // CaseBlock has at most one DefaultClause (§14.12.1). The grammar accepts
+            // `default` anywhere among the cases, so the count is checked here.
+            case SWITCH_STMT -> {
+                boolean seen = false;
+                for (int i = 0, n = node.size(); i < n; i++) {
+                    Node child = node.get(i);
+                    if (!child.isToken() && child.type == NodeType.DEFAULT_BLOCK) {
+                        if (seen) {
+                            throw new ParserException("more than one `default` clause in a switch");
+                        }
+                        seen = true;
+                    }
+                }
+            }
+            // LabelledItem is a Statement or a FunctionDeclaration; the latter is a strict-mode
+            // early error with only an Annex B.3.1 sloppy carve-out. karate-js rejects it in both
+            // modes: the hoisting a bare `function f(){}` gets does not reach through the
+            // LABELLED_STMT wrapper, so accepting it would bind `f` later than the reader expects.
+            // let/const/class have no carve-out at all.
+            case LABELLED_STMT -> {
+                checkNoFunctionDeclarationBody(node, "a labelled statement");
+                checkNoLexicalOrClassDeclarationBody(node, "a labelled statement");
+            }
+            default -> {
+            }
+        }
+    }
+
+    private static final String PROTO_KEY = "__proto__";
+
+    /**
+     * True if an {@code OBJECT_ELEM} is the B.3.1 proto-setter form — a plain
+     * {@code __proto__} key (identifier or string literal) followed by {@code :}.
+     * Shorthand {@code {__proto__}}, computed {@code {['__proto__']: v}}, methods,
+     * accessors and spread all fail the shape and stay ordinary own properties.
+     * Shared with {@code Interpreter.evalLitObject} so the early error below and the
+     * evaluation agree on exactly one definition of the form.
+     */
+    public static boolean isProtoSetter(Node elem) {
+        if (elem.size() < 3 || !elem.get(1).isToken() || elem.get(1).token.type != COLON) {
+            return false;
+        }
+        Node key = elem.getFirst();
+        if (!key.isToken()) {
+            return false;
+        }
+        return isProtoKeyText(key.token.type, key.getText());
+    }
+
+    /** {@code __proto__} spelled as an identifier or a quoted string key — the two
+     *  spellings B.3.1 treats alike. Quotes are stripped the same way
+     *  {@code Terms.literalValue} strips them. */
+    private static boolean isProtoKeyText(TokenType type, String text) {
+        if (text == null) {
+            return false;
+        }
+        if (type == IDENT) {
+            return PROTO_KEY.equals(text);
+        }
+        if ((type != S_STRING && type != D_STRING) || text.length() < 2) {
+            return false;
+        }
+        // B.3.1 compares the StringValue, so escaped spellings
+        // ("__proto__") count — decode before comparing
+        return PROTO_KEY.equals(JsLexer.unescapeStringLiteral(text.substring(1, text.length() - 1)));
+    }
+
+    /** §13.2.5.1: at most one {@code __proto__: value} proto-setter per ObjectLiteral.
+     *  Duplicates are legal in a destructuring pattern (the cover grammar drops the
+     *  rule), so the caller gates on {@code !inPattern}. */
+    private static void checkNoDuplicateProtoSetter(Node litObject) {
+        boolean seen = false;
+        for (int i = 0, n = litObject.size(); i < n; i++) {
+            Node child = litObject.get(i);
+            if (child.isToken() || child.type != NodeType.OBJECT_ELEM || !isProtoSetter(child)) {
+                continue;
+            }
+            if (seen) {
+                throw new ParserException("duplicate __proto__ in an object literal");
+            }
+            seen = true;
+        }
+    }
+
+    // Descent state for checkStaticBlockBody.
+    private static final int SB_FN = 1;       // inside a nested function — its own return / break target
+    private static final int SB_LOOP = 2;     // inside an iteration statement of the block's own
+    private static final int SB_SWITCH = 4;   // inside a switch statement of the block's own
+    private static final int SB_AWAIT_OK = 8; // inside a nested function's body — `await` is a name again
+
+    /**
+     * §15.7.1 early errors a class static initialization block carries. Every rule
+     * stops at the block boundary, so this descends that block's subtree only — a
+     * per-node helper of {@link #earlyErrors}, not a second traversal of the tree.
+     * <ul>
+     *   <li>{@code return} has no target: the body is not a function body.</li>
+     *   <li>{@code break} / {@code continue} may not reach out of the block. The
+     *       labelled forms fall to the label chain ({@link #labelNodeChecks} resets it
+     *       at the block); the bare forms need the block's own loop / switch nesting,
+     *       which is what {@code SB_LOOP} / {@code SB_SWITCH} track.</li>
+     *   <li>{@code await} is reserved: ClassStaticBlockStatementList is {@code [+Await]},
+     *       and that grammar parameter reaches a nested function's NAME and an arrow's
+     *       PARAMETERS but neither one's body. {@code await} lexes as an IDENT, so the
+     *       check is on the token — skipping the positions where it is a property name
+     *       rather than a reference.</li>
+     * </ul>
+     * {@code arguments} is equally illegal per spec but is not rejected here: telling a
+     * reference from the many legal {@code x.arguments} / {@code {arguments: …}} spellings
+     * costs more than the rule is worth.
+     */
+    private void checkStaticBlockBody(Node node, int flags) {
+        boolean keepAwait = (flags & SB_AWAIT_OK) == 0 && !isPropertyNameHolder(node);
+        int last = node.size() - 1;
+        TokenType prev = null;
+        for (int i = 0; i <= last; i++) {
+            Node child = node.get(i);
+            if (child.isToken()) {
+                TokenType type = child.token.type;
+                // `x.await` / `x?.await` name a member, they do not reference one
+                if (keepAwait && type == IDENT && prev != DOT && prev != QUES_DOT
+                        && isIdentText(child.token, "await")) {
+                    throw new ParserException("'await' is a reserved word in a class static initialization block");
+                }
+                prev = type;
+                continue;
+            }
+            prev = null;
+            int childFlags = flags;
+            switch (child.type) {
+                case RETURN_STMT -> {
+                    if ((flags & SB_FN) == 0) {
+                        throw new ParserException("'return' is not allowed in a class static initialization block");
+                    }
+                }
+                case BREAK_STMT -> {
+                    if ((flags & (SB_FN | SB_LOOP | SB_SWITCH)) == 0 && child.size() == 1) {
+                        throw new ParserException("'break' may not cross a class static initialization block");
+                    }
+                }
+                case CONTINUE_STMT -> {
+                    if ((flags & (SB_FN | SB_LOOP)) == 0 && child.size() == 1) {
+                        throw new ParserException("'continue' may not cross a class static initialization block");
+                    }
+                }
+                case FOR_STMT, WHILE_STMT, DO_WHILE_STMT -> childFlags |= SB_LOOP;
+                case SWITCH_STMT -> childFlags |= SB_SWITCH;
+                case FN_EXPR, FN_ARROW_EXPR -> childFlags |= SB_FN;
+                default -> {
+                }
+            }
+            // A function's parameters are [~Await] along with its body; an arrow's are
+            // not — only the body (always its last child) leaves the reserved region.
+            if (node.type == NodeType.FN_EXPR
+                    || (node.type == NodeType.FN_ARROW_EXPR && i == last)) {
+                childFlags |= SB_AWAIT_OK;
+            }
+            checkStaticBlockBody(child, childFlags);
+        }
+    }
+
+    /** True where this node's own token children are property / member names rather than
+     *  references — {@code {await: 1}}, {@code {await() {}}}, {@code class { await = 1 }}.
+     *  The shorthand {@code {await}} has neither a colon nor a value child and is a
+     *  reference, which is why an all-token object element does not qualify. */
+    private static boolean isPropertyNameHolder(Node node) {
+        if (node.type == NodeType.CLASS_METHOD) {
+            return true;
+        }
+        if (node.type != NodeType.OBJECT_ELEM) {
+            return false;
+        }
+        for (int i = 0, n = node.size(); i < n; i++) {
+            Node child = node.get(i);
+            if (!child.isToken() || child.token.type == COLON) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Throws if any direct {@code STATEMENT} child of {@code node} is itself a
+     *  function declaration (its first non-token child is an {@code FN_EXPR}) — the
+     *  body of `if` / loop / labelled clauses is a Statement, and FunctionDeclaration
+     *  is a StatementListItem only. A braced body (BLOCK) is fine. */
+    private static void checkNoFunctionDeclarationBody(Node node, String where) {
+        for (int i = 0, n = node.size(); i < n; i++) {
+            Node child = node.get(i);
+            if (child.isToken() || child.type != NodeType.STATEMENT) {
+                continue;
+            }
+            for (int j = 0, m = child.size(); j < m; j++) {
+                Node inner = child.get(j);
+                if (!inner.isToken()) {
+                    if (inner.type == NodeType.FN_EXPR) {
+                        throw new ParserException(
+                                "a function declaration may not be the body of " + where);
+                    }
+                    break; // first non-token child decides
+                }
+            }
+        }
+    }
+
+    /** Throws if any direct {@code STATEMENT} child of {@code node} is itself a
+     *  LexicalDeclaration ({@code let}/{@code const}) or a ClassDeclaration — the body
+     *  of an `if`/`else`/loop clause is a Statement, and both are Declarations, not
+     *  Statements (§13.6/§14.x). A {@code var} declaration hoists and stays legal; a
+     *  braced body (BLOCK) is fine. Mode-independent — there is no Annex B carve-out
+     *  for these the way there is for FunctionDeclaration in an `if` clause. */
+    private static void checkNoLexicalOrClassDeclarationBody(Node node, String where) {
+        for (int i = 0, n = node.size(); i < n; i++) {
+            Node child = node.get(i);
+            if (child.isToken() || child.type != NodeType.STATEMENT) {
+                continue;
+            }
+            for (int j = 0, m = child.size(); j < m; j++) {
+                Node inner = child.get(j);
+                if (!inner.isToken()) {
+                    if (inner.type == NodeType.CLASS_EXPR) {
+                        throw new ParserException(
+                                "a class declaration may not be the body of " + where);
+                    }
+                    if (inner.type == NodeType.VAR_STMT && isLexicalVarStmt(inner)) {
+                        throw new ParserException(
+                                "a lexical declaration may not be the body of " + where);
+                    }
+                    break; // first non-token child decides
+                }
+            }
+        }
+    }
+
+    /** True if a {@code VAR_STMT}'s leading keyword token is {@code let} / {@code const}
+     *  (a LexicalDeclaration) rather than {@code var}. The keyword distinction lives on
+     *  VAR_STMT, not on the VAR_DECL children.
+     *  <p>One sloppy-mode subtlety: {@code let} is not a reserved word, so as the body of
+     *  an `if`/loop clause {@code let} followed by a LineTerminator is the identifier
+     *  {@code let} as an ExpressionStatement with ASI inserted before the next line
+     *  (`if (x) let\n y = 1` is two statements: `let; y = 1`). The only `let`-form the
+     *  ExpressionStatement lookahead forbids is `let [`. So a LineTerminator immediately
+     *  after a {@code let} keyword means it is NOT a lexical declaration here. {@code const}
+     *  is a reserved word and has no such escape. */
+    private static boolean isLexicalVarStmt(Node varStmt) {
+        for (int i = 0, n = varStmt.size(); i < n; i++) {
+            Node child = varStmt.get(i);
+            if (child.isToken()) {
+                TokenType tt = child.token.type;
+                if (tt == CONST) {
+                    return true;
+                }
+                return tt == LET && !lineTerminatorFollows(child.token);
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Spec strict-mode early errors. Strictness is lexical and computed top-down:
+     * the program is strict iff it opens with a {@code "use strict"} directive
+     * prologue; a function adds strictness if its own body carries the prologue;
+     * a class body is always strict (§15.7). The test262 runner prepends a strict
+     * directive for {@code flags:[onlyStrict]} tests, so this same walk covers them.
+     * When strict, the following are SyntaxErrors at parse phase:
+     * <ul>
+     *   <li>Legacy octal ({@code 0755}) / NonOctalDecimal ({@code 08}/{@code 09})
+     *       integer literals (§12.9.3.1).</li>
+     *   <li>Assigning to / updating {@code eval} or {@code arguments} (§13.15.1).</li>
+     *   <li>Binding {@code eval} / {@code arguments} as a function name, formal
+     *       parameter, or var/let/const declaration name (BoundNames, §various).</li>
+     *   <li>Duplicate formal parameter names (§15.x).</li>
+     * </ul>
+     * Every check is strict-gated, so a correct strictness determination is the one
+     * invariant that keeps this from disturbing sloppy ({@code noStrict}) code.
+     * Throws {@link ParserException} so the runner classifies it as {@code phase: parse}.
+     * <p>
+     * Runs the strict-mode checks for a single node (no recursion — {@link #earlyErrors}
+     * drives the traversal) and returns the strictness to propagate to that node's
+     * children (a {@code "use strict"} prologue or a class body raises it).
+     */
+    private boolean strictNodeChecks(Node node, boolean strict) {
+        boolean childStrict = strict;
+        switch (node.type) {
+            case PROGRAM -> {
+                childStrict = strict || hasUseStrictPrologue(node);
+                // Script top level: function declarations are var-scoped, not lexical.
+                checkScopeRedeclaration(directStatements(node), true, childStrict);
+            }
+            case FN_EXPR, FN_ARROW_EXPR -> {
+                childStrict = strict || fnBodyHasUseStrict(node);
+                if (childStrict) {
+                    checkFunctionName(node);
+                }
+                // Parameter early errors gate themselves: duplicate BoundNames fire
+                // for arrows / non-simple parameter lists even in sloppy code, and for
+                // any strict function; eval/arguments only under strict.
+                checkFormalParameters(node, childStrict, node.type == NodeType.FN_ARROW_EXPR);
+            }
+            // A Block / CaseBlock / Script / function body each forms a scope whose
+            // LexicallyDeclaredNames must have no duplicates and must not intersect its
+            // VarDeclaredNames (§14.2.1, §14.12.1, §16.1.1). The check is strict-aware:
+            // the sole Annex B.3.3 sloppy carve-out is that duplicate names bound ONLY
+            // by FunctionDeclarations are legal (so `function f(){} function f(){}` in a
+            // block is sloppy-legal but a strict early error). The lexical∩var clash has
+            // no carve-out. A standalone Block's function declarations are lexical; a
+            // function body's / Script's top-level ones are var-scoped — hence the
+            // topLevel flag, derived for a BLOCK from whether its parent is a function.
+            case BLOCK -> {
+                Node p = node.getParent();
+                boolean fnBody = p != null
+                        && (p.type == NodeType.FN_EXPR || p.type == NodeType.FN_ARROW_EXPR);
+                checkScopeRedeclaration(directStatements(node), fnBody, strict);
+            }
+            case SWITCH_STMT -> checkSwitchCaseBlockRedeclaration(node, strict);
+            // Duplicate BoundNames in a catch parameter are an early error always
+            // (not strict-gated); eval/arguments only under strict. TRY does not
+            // change lexical strictness, so childStrict stays = strict.
+            case TRY_STMT -> checkCatchParameter(node, strict);
+            // Class bodies — and every FN_EXPR (constructor / method) nested inside
+            // — are always strict regardless of any enclosing directive (§15.7).
+            case CLASS_EXPR -> childStrict = true;
+            default -> {
+            }
+        }
+        if (childStrict) {
+            switch (node.type) {
+                case LIT_EXPR -> checkLegacyOctalLiteral(node);
+                case ASSIGN_EXPR, MATH_POST_EXPR ->
+                        checkAssignTargetBinding(node.size() > 0 ? node.getFirst() : null);
+                case MATH_PRE_EXPR -> {
+                    if (node.size() > 1 && node.getFirst().isToken()
+                            && (node.getFirst().token.type == PLUS_PLUS
+                                || node.getFirst().token.type == MINUS_MINUS)) {
+                        checkAssignTargetBinding(node.get(1));
+                    }
+                }
+                case VAR_DECL -> checkVarDeclName(node);
+                // Annex B.3.4 lets a FunctionDeclaration be an `if`/`else` clause body in
+                // sloppy code, but that extension is NOT honored in strict mode — there it
+                // is an early error (§13.6). The always-illegal loop bodies are handled
+                // mode-independently in earlyErrorNodeChecks.
+                case IF_STMT -> checkNoFunctionDeclarationBody(node, "an `if` statement in strict mode");
+                default -> {
+                }
+            }
+        }
+        return childStrict;
+    }
+
+    private static boolean isEvalOrArguments(String s) {
+        return "eval".equals(s) || "arguments".equals(s);
+    }
+
+    /** Scans a {@code PROGRAM} / {@code BLOCK}'s leading directive prologue for an
+     *  unescaped {@code "use strict"} / {@code 'use strict'}. Mirrors the eval-time
+     *  scan in {@code Interpreter.hasUseStrictDirective}, kept parser-local so the
+     *  parser carries no dependency on the interpreter package. */
+    private static boolean hasUseStrictPrologue(Node body) {
+        for (int i = 0, n = body.size(); i < n; i++) {
+            Node child = body.get(i);
+            if (child.isToken()) {
+                continue; // structural L_CURLY / R_CURLY / EOF — keep scanning
+            }
+            if (child.type != NodeType.STATEMENT) {
+                return false;
+            }
+            String dir = directiveString(child);
+            if (dir == null) {
+                return false; // first non-directive statement ends the prologue
+            }
+            if ("\"use strict\"".equals(dir) || "'use strict'".equals(dir)) {
+                return true;
+            }
+            // a different directive (e.g. "use asm") — keep scanning the prologue
+        }
+        return false;
+    }
+
+    /** If {@code stmt} is an expression statement consisting of exactly one string
+     *  literal, returns its raw token text (quotes included); else {@code null}.
+     *  Shape: {@code STATEMENT > EXPR_LIST(1) > EXPR(1) > LIT_EXPR(1) > TOKEN}. A
+     *  parenthesized string ({@code ("use strict")}) is a PAREN_EXPR, not LIT_EXPR,
+     *  so it correctly does not count as a directive. */
+    private static String directiveString(Node stmt) {
+        if (stmt.size() == 0) {
+            return null;
+        }
+        Node exprList = stmt.getFirst();
+        if (exprList.type != NodeType.EXPR_LIST || exprList.size() != 1) {
+            return null;
+        }
+        Node expr = exprList.getFirst();
+        if (expr.type != NodeType.EXPR || expr.size() != 1) {
+            return null;
+        }
+        Node lit = expr.getFirst();
+        if (lit.type != NodeType.LIT_EXPR || lit.size() != 1) {
+            return null;
+        }
+        Node tok = lit.getFirst();
+        if (!tok.isToken()) {
+            return null;
+        }
+        TokenType tt = tok.token.type;
+        return (tt == S_STRING || tt == D_STRING) ? tok.getText() : null;
+    }
+
+    /** True if the function's own body block opens with a {@code "use strict"}
+     *  prologue. Arrow functions with a concise (expression) body have no BLOCK and
+     *  therefore can never introduce strictness on their own. */
+    private static boolean fnBodyHasUseStrict(Node fn) {
+        for (int i = 0, n = fn.size(); i < n; i++) {
+            Node child = fn.get(i);
+            if (!child.isToken() && child.type == NodeType.BLOCK) {
+                return hasUseStrictPrologue(child);
+            }
+        }
+        return false;
+    }
+
+    /** A strict function may not be named {@code eval} / {@code arguments}. The name
+     *  is the single IDENT token between {@code function} and the parameter list;
+     *  arrows and anonymous expressions reach FN_DECL_ARGS first and return. */
+    private static void checkFunctionName(Node fn) {
+        // an `async function` puts the contextual `async` IDENT before the keyword
+        for (int i = fn.async ? 1 : 0, n = fn.size(); i < n; i++) {
+            Node child = fn.get(i);
+            if (child.isToken()) {
+                if (child.token.type == IDENT) {
+                    if (isEvalOrArguments(child.getText())) {
+                        throw new ParserException(
+                                "'" + child.getText() + "' is not a valid function name in strict mode");
+                    }
+                    return;
+                }
+            } else if (child.type == NodeType.FN_DECL_ARGS) {
+                return; // reached the parameter list — function was anonymous
+            }
+        }
+    }
+
+    /**
+     * Formal-parameter early errors over the full BoundNames of the parameter list:
+     * <ul>
+     *   <li>Duplicate bound names are a SyntaxError when the list is non-simple (any
+     *       destructuring pattern, default, or rest element), when the function is an
+     *       arrow (UniqueFormalParameters), or when the function is strict. Plain
+     *       duplicate simple params in a sloppy non-arrow function stay legal.</li>
+     *   <li>Under strict, no bound name may be {@code eval} / {@code arguments}.</li>
+     * </ul>
+     * BoundNames mirror the binding structure, so {@code ({a: x = y}) => …} binds
+     * only {@code x} — not the key {@code a} or the default {@code y}.
+     */
+    private static void checkFormalParameters(Node fn, boolean strict, boolean isArrow) {
+        Node args = null;
+        for (int i = 0, n = fn.size(); i < n; i++) {
+            Node child = fn.get(i);
+            if (!child.isToken() && child.type == NodeType.FN_DECL_ARGS) {
+                args = child;
+                break;
+            }
+        }
+        if (args == null) {
+            return;
+        }
+        // Hot-path guard: a sloppy non-arrow function with a simple parameter list
+        // can't have any of these early errors, so skip the BoundNames allocation
+        // entirely (the common case — every `.map(function(x){…})` callback). The
+        // nonSimple scan is allocation-free.
+        boolean nonSimple = false;
+        for (int i = 0, n = args.size(); i < n; i++) {
+            Node arg = args.get(i);
+            if (!arg.isToken() && arg.type == NodeType.FN_DECL_ARG && isNonSimpleParam(arg)) {
+                nonSimple = true;
+                break;
+            }
+        }
+        if (!strict && !isArrow && !nonSimple) {
+            return;
+        }
+        List<String> names = new ArrayList<>();
+        for (int i = 0, n = args.size(); i < n; i++) {
+            Node arg = args.get(i);
+            if (arg.isToken() || arg.type != NodeType.FN_DECL_ARG) {
+                continue;
+            }
+            collectBindingBoundNames(arg, names);
+        }
+        if (strict) {
+            for (String name : names) {
+                if (isEvalOrArguments(name)) {
+                    throw new ParserException(
+                            "'" + name + "' is not a valid parameter name in strict mode");
+                }
+            }
+        }
+        if (strict || isArrow || nonSimple) {
+            String dup = firstDuplicate(names);
+            if (dup != null) {
+                throw new ParserException(
+                        "duplicate parameter name '" + dup + "' is not allowed here");
+            }
+        }
+    }
+
+    /** A FormalParameter is non-simple if it is a destructuring pattern, carries a
+     *  default initializer, or is a rest element — any of which makes the whole
+     *  parameter list non-simple, so duplicate bound names become an early error. */
+    private static boolean isNonSimpleParam(Node arg) {
+        for (int i = 0, n = arg.size(); i < n; i++) {
+            Node ch = arg.get(i);
+            if (ch.isToken()) {
+                if (ch.token.type == EQ || ch.token.type == DOT_DOT_DOT) {
+                    return true;
+                }
+            } else if (ch.type == NodeType.LIT_ARRAY || ch.type == NodeType.LIT_OBJECT) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Catch-clause early errors: duplicate BoundNames of the catch parameter are a
+     *  SyntaxError always (not strict-gated); under strict, {@code eval}/{@code arguments}
+     *  may not be bound. A simple {@code catch (e)} can't collide — the duplicate rule
+     *  only bites for a destructuring catch param ({@code catch ([x, x])}). */
+    private static void checkCatchParameter(Node tryStmt, boolean strict) {
+        // TRY_STMT: ... CATCH L_PAREN <binding> R_PAREN BLOCK ...  The binding is the
+        // first node/ident between the post-CATCH L_PAREN and the matching R_PAREN.
+        int catchIdx = -1;
+        for (int i = 0, n = tryStmt.size(); i < n; i++) {
+            Node ch = tryStmt.get(i);
+            if (ch.isToken() && ch.token.type == CATCH) {
+                catchIdx = i;
+                break;
+            }
+        }
+        if (catchIdx < 0) {
+            return;
+        }
+        Node binding = null;
+        for (int i = catchIdx + 1, n = tryStmt.size(); i < n; i++) {
+            Node ch = tryStmt.get(i);
+            if (ch.isToken()) {
+                if (ch.token.type == R_PAREN) {
+                    break;
+                }
+                if (ch.token.type == IDENT) {
+                    binding = ch; // simple catch binding — no duplicate possible
+                    break;
+                }
+                // skip the L_PAREN
+            } else {
+                binding = ch; // LIT_ARRAY / LIT_OBJECT pattern
+                break;
+            }
+        }
+        if (binding == null) {
+            return;
+        }
+        List<String> names = new ArrayList<>();
+        collectBoundNames(binding, names);
+        String dup = firstDuplicate(names);
+        if (dup != null) {
+            throw new ParserException(
+                    "duplicate binding name '" + dup + "' is not allowed in a catch parameter");
+        }
+        if (strict) {
+            for (String name : names) {
+                if (isEvalOrArguments(name)) {
+                    throw new ParserException(
+                            "'" + name + "' is not a valid binding name in strict mode");
+                }
+            }
+        }
+    }
+
+    /** A strict var/let/const declaration may not bind {@code eval} / {@code arguments}
+     *  — including inside a destructuring pattern. (Lexical duplicate-BoundNames for
+     *  let/const patterns is a distinct rule, deferred — VAR_DECL doesn't carry the
+     *  let-vs-var distinction.) */
+    private static void checkVarDeclName(Node varDecl) {
+        List<String> names = new ArrayList<>();
+        collectBindingBoundNames(varDecl, names);
+        for (String name : names) {
+            if (isEvalOrArguments(name)) {
+                throw new ParserException(
+                        "'" + name + "' is not a valid binding name in strict mode");
+            }
+        }
+    }
+
+    /** The direct {@code STATEMENT} children of a {@code PROGRAM} / {@code BLOCK}
+     *  (its StatementList), skipping structural braces / EOF. */
+    private static List<Node> directStatements(Node scope) {
+        List<Node> out = new ArrayList<>();
+        for (int i = 0, n = scope.size(); i < n; i++) {
+            Node ch = scope.get(i);
+            if (!ch.isToken() && ch.type == NodeType.STATEMENT) {
+                out.add(ch);
+            }
+        }
+        return out;
+    }
+
+    /** The first non-token child of a node, or {@code null}. A {@code STATEMENT} wraps
+     *  exactly one inner statement / declaration, so this unwraps it. */
+    private static Node firstNonToken(Node node) {
+        for (int i = 0, n = node.size(); i < n; i++) {
+            Node ch = node.get(i);
+            if (!ch.isToken()) {
+                return ch;
+            }
+        }
+        return null;
+    }
+
+    /** The bound name of a {@code FN_EXPR} / {@code CLASS_EXPR} declaration — the IDENT
+     *  between the {@code function}/{@code class} keyword and the parameter list /
+     *  heritage / body. {@code null} for an anonymous form (no statement-position
+     *  binding). */
+    private static String declarationName(Node decl) {
+        // an `async function` puts the contextual `async` IDENT before the keyword
+        for (int i = decl.async ? 1 : 0, n = decl.size(); i < n; i++) {
+            Node ch = decl.get(i);
+            if (ch.isToken()) {
+                TokenType tt = ch.token.type;
+                if (tt == IDENT) {
+                    return ch.getText();
+                }
+                if (tt == EXTENDS || tt == L_CURLY || tt == L_PAREN) {
+                    return null; // reached heritage / body / params — anonymous
+                }
+            } else {
+                return null; // reached FN_DECL_ARGS / class body subtree — anonymous
+            }
+        }
+        return null;
+    }
+
+    /** All case/default clauses of a {@code switch} share ONE lexical scope (the
+     *  CaseBlock), so the redeclaration check spans every clause's StatementList. */
+    private void checkSwitchCaseBlockRedeclaration(Node switchStmt, boolean strict) {
+        List<Node> statements = new ArrayList<>();
+        for (int i = 0, n = switchStmt.size(); i < n; i++) {
+            Node ch = switchStmt.get(i);
+            if (!ch.isToken()
+                    && (ch.type == NodeType.CASE_BLOCK || ch.type == NodeType.DEFAULT_BLOCK)) {
+                statements.addAll(directStatements(ch));
+            }
+        }
+        checkScopeRedeclaration(statements, false, strict);
+    }
+
+    /**
+     * Enforces the per-scope redeclaration early errors over a StatementList:
+     * its LexicallyDeclaredNames must have no duplicate entries and must not also
+     * occur in its VarDeclaredNames. {@code let}/{@code const}/{@code class} always
+     * contribute lexical names; a FunctionDeclaration contributes a lexical name in a
+     * Block/CaseBlock but a var name at Script / function-body top level
+     * ({@code topLevel}). The only Annex B.3.3 sloppy relaxation is that a duplicate
+     * bound SOLELY by FunctionDeclarations is legal (still a strict early error); the
+     * lexical∩var clash has no relaxation.
+     */
+    private void checkScopeRedeclaration(List<Node> statements, boolean topLevel, boolean strict) {
+        List<String> lexNames = new ArrayList<>();   // LexicallyDeclaredNames, with repeats
+        Set<String> lexNonFn = new HashSet<>();      // those NOT bound by a FunctionDeclaration
+        for (Node stmt : statements) {
+            Node d = firstNonToken(stmt);
+            if (d == null) {
+                continue;
+            }
+            if (d.type == NodeType.VAR_STMT && isLexicalVarStmt(d)) {
+                List<String> tmp = new ArrayList<>();
+                for (int i = 0, n = d.size(); i < n; i++) {
+                    Node ch = d.get(i);
+                    if (!ch.isToken() && ch.type == NodeType.VAR_DECL) {
+                        collectBindingBoundNames(ch, tmp);
+                    }
+                }
+                lexNames.addAll(tmp);
+                lexNonFn.addAll(tmp);
+            } else if (d.type == NodeType.CLASS_EXPR) {
+                String name = declarationName(d);
+                if (name != null) {
+                    lexNames.add(name);
+                    lexNonFn.add(name);
+                }
+            } else if (d.type == NodeType.FN_EXPR && !topLevel) {
+                String name = declarationName(d);
+                if (name != null) {
+                    lexNames.add(name); // function-bound — deliberately not in lexNonFn
+                }
+            }
+        }
+        if (lexNames.isEmpty()) {
+            return; // no lexical declarations → no duplicate and no clash possible
+        }
+        // Duplicate LexicallyDeclaredNames. Annex B.3.3: a sloppy duplicate bound only
+        // by FunctionDeclarations is allowed; everything else (and all of strict) errors.
+        Set<String> seen = new HashSet<>();
+        for (String name : lexNames) {
+            if (!seen.add(name)) {
+                boolean onlyFunctions = !lexNonFn.contains(name);
+                if (strict || !onlyFunctions) {
+                    throw new ParserException(
+                            "identifier '" + name + "' has already been declared");
+                }
+            }
+        }
+        // Lexical names may not also be var-declared anywhere in the scope (vars hoist
+        // through nested blocks; at top level a FunctionDeclaration is itself var-scoped).
+        List<String> varNames = new ArrayList<>();
+        for (Node stmt : statements) {
+            collectVarNames(stmt, varNames);
+            if (topLevel) {
+                Node d = firstNonToken(stmt);
+                if (d != null && d.type == NodeType.FN_EXPR) {
+                    String name = declarationName(d);
+                    if (name != null) {
+                        varNames.add(name);
+                    }
+                }
+            }
+        }
+        if (varNames.isEmpty()) {
+            return;
+        }
+        Set<String> varSet = new HashSet<>(varNames);
+        for (String name : lexNames) {
+            if (varSet.contains(name)) {
+                throw new ParserException(
+                        "identifier '" + name + "' has already been declared");
+            }
+        }
+    }
+
+    /** VarDeclaredNames within a scope's StatementList — {@code var} bindings reachable
+     *  without crossing a nested function or class boundary (vars hoist through plain
+     *  blocks and control structures, so the traversal descends into them but stops at
+     *  {@code FN_EXPR}/{@code FN_ARROW_EXPR}/{@code CLASS_EXPR}). */
+    private static void collectVarNames(Node node, List<String> out) {
+        if (node == null || node.isToken()) {
+            return;
+        }
+        switch (node.type) {
+            case FN_EXPR, FN_ARROW_EXPR, CLASS_EXPR -> {
+                return; // nested function / class scope — its vars belong to it
+            }
+            case VAR_STMT -> {
+                if (!isLexicalVarStmt(node)) { // a `var` statement
+                    for (int i = 0, n = node.size(); i < n; i++) {
+                        Node ch = node.get(i);
+                        if (!ch.isToken() && ch.type == NodeType.VAR_DECL) {
+                            collectBindingBoundNames(ch, out);
+                        }
+                    }
+                }
+                return;
+            }
+            default -> {
+            }
+        }
+        for (int i = 0, n = node.size(); i < n; i++) {
+            collectVarNames(node.get(i), out);
+        }
+    }
+
+    /** Bound names of one {@code FN_DECL_ARG} / {@code VAR_DECL} — the binding target
+     *  before any {@code = default} initializer (the default expression binds nothing).
+     *  Handles simple idents, rest ({@code ...r}), and destructuring patterns. */
+    private static void collectBindingBoundNames(Node binding, List<String> out) {
+        for (int i = 0, n = binding.size(); i < n; i++) {
+            Node ch = binding.get(i);
+            if (ch.isToken()) {
+                if (ch.token.type == EQ) {
+                    return; // default initializer follows — target already collected
+                }
+                if (ch.token.type == IDENT) {
+                    out.add(ch.getText()); // simple binding, or the ...rest ident
+                }
+                // DOT_DOT_DOT, COMMA: structural — skip
+            } else {
+                collectBoundNames(ch, out); // LIT_ARRAY / LIT_OBJECT pattern
+            }
+        }
+    }
+
+    /** BoundNames of a binding target, mirroring the binding structure so a default
+     *  value or property key contributes nothing. Handles bare/REF identifiers,
+     *  default targets ({@code x = y} → {@code x}), array patterns, object patterns. */
+    private static void collectBoundNames(Node n, List<String> out) {
+        if (n == null) {
+            return;
+        }
+        if (n.isToken()) {
+            if (n.token.type == IDENT) {
+                out.add(n.getText());
+            }
+            return;
+        }
+        switch (n.type) {
+            case EXPR, EXPR_LIST, LIT_EXPR, PAREN_EXPR -> {
+                for (int i = 0, c = n.size(); i < c; i++) {
+                    collectBoundNames(n.get(i), out);
+                }
+            }
+            case REF_EXPR -> {
+                Node f = n.getFirst();
+                if (f != null && f.isToken() && f.token.type == IDENT) {
+                    out.add(f.getText());
+                }
+            }
+            // A destructuring default `target = value`: only the target binds.
+            case ASSIGN_EXPR -> {
+                if (n.size() > 0) {
+                    collectBoundNames(n.getFirst(), out);
+                }
+            }
+            case LIT_OBJECT -> {
+                for (int i = 0, c = n.size(); i < c; i++) {
+                    Node ch = n.get(i);
+                    if (!ch.isToken() && ch.type == NodeType.OBJECT_ELEM) {
+                        collectObjectElemBoundNames(ch, out);
+                    }
+                }
+            }
+            case LIT_ARRAY -> {
+                for (int i = 0, c = n.size(); i < c; i++) {
+                    Node ch = n.get(i);
+                    if (ch.isToken() || ch.type != NodeType.ARRAY_ELEM) {
+                        continue;
+                    }
+                    // Array element: skip the leading `...` / trailing `,`, recurse
+                    // into the target (a hole has no target and binds nothing).
+                    for (int j = 0, e = ch.size(); j < e; j++) {
+                        Node sub = ch.get(j);
+                        if (!sub.isToken()) {
+                            collectBoundNames(sub, out);
+                        }
+                    }
+                }
+            }
+            default -> {
+            }
+        }
+    }
+
+    /** BoundNames of one object-pattern property: {@code {a}} / {@code {a = d}} bind
+     *  {@code a}; {@code {k: target}} binds BoundNames(target); {@code {...r}} binds
+     *  {@code r}. The key and any default initializer contribute nothing. A property
+     *  that is really a method/accessor (carries an FN_EXPR) is not a binding. */
+    private static void collectObjectElemBoundNames(Node elem, List<String> out) {
+        int colonIdx = -1;
+        int restIdx = -1;
+        for (int i = 0, n = elem.size(); i < n; i++) {
+            Node ch = elem.get(i);
+            if (ch.isToken()) {
+                if (ch.token.type == COLON) {
+                    colonIdx = i;
+                } else if (ch.token.type == DOT_DOT_DOT) {
+                    restIdx = i;
+                }
+            } else if (ch.type == NodeType.FN_EXPR) {
+                return; // method / accessor — not a binding element
+            }
+        }
+        if (colonIdx >= 0 || restIdx >= 0) {
+            // `key: target` or `...rest` — bind the first node after the marker.
+            for (int i = (colonIdx >= 0 ? colonIdx : restIdx) + 1, n = elem.size(); i < n; i++) {
+                Node ch = elem.get(i);
+                if (!ch.isToken()) {
+                    collectBoundNames(ch, out);
+                    return;
+                }
+            }
+            return;
+        }
+        // Shorthand `{a}` or `{a = default}`: the first IDENT token is the bound name.
+        for (int i = 0, n = elem.size(); i < n; i++) {
+            Node ch = elem.get(i);
+            if (ch.isToken() && ch.token.type == IDENT) {
+                out.add(ch.getText());
+                return;
+            }
+        }
+    }
+
+    /** First duplicate element in {@code names}, or {@code null} if all are distinct. */
+    private static String firstDuplicate(List<String> names) {
+        Set<String> seen = new HashSet<>(Math.max(4, names.size() * 2));
+        for (String name : names) {
+            if (!seen.add(name)) {
+                return name;
+            }
+        }
+        return null;
+    }
+
+    /** A strict assignment / update may not target {@code eval} / {@code arguments}.
+     *  Only a bare identifier reference is an early error; member targets
+     *  ({@code arguments[0] = …}) are fine. */
+    private void checkAssignTargetBinding(Node lhs) {
+        if (lhs == null) {
+            return;
+        }
+        Node n = stripExprWrappers(lhs);
+        if (n != null && n.type == NodeType.REF_EXPR && n.size() == 1
+                && n.getFirst().isToken() && n.getFirst().token.type == IDENT
+                && isEvalOrArguments(n.getFirst().getText())) {
+            throw new ParserException(
+                    "invalid assignment to '" + n.getFirst().getText() + "' in strict mode");
+        }
+    }
+
+    /** Strict-mode early error for a legacy octal ({@code 0755}) or NonOctalDecimal
+     *  ({@code 08} / {@code 09}) integer literal — any NUMBER whose text starts with
+     *  {@code 0} immediately followed by a decimal digit. {@code 0x…} / {@code 0b…} /
+     *  {@code 0o…} / {@code 0.…} / {@code 0e…} have a non-digit second char and a plain
+     *  {@code 0} is length 1, so all are correctly excluded. */
+    private static void checkLegacyOctalLiteral(Node litExpr) {
+        if (litExpr.size() != 1) {
+            return;
+        }
+        Node tok = litExpr.getFirst();
+        if (!tok.isToken() || tok.token.type != NUMBER) {
+            return;
+        }
+        String text = tok.getText();
+        if (text.length() >= 2 && text.charAt(0) == '0') {
+            char c = text.charAt(1);
+            if (c >= '0' && c <= '9') {
+                throw new ParserException("octal literals are not allowed in strict mode");
+            }
+        }
+    }
+
+    // CoverInitializedName early error (§12.2.6.1): a shorthand-with-default
+    // (`IDENT = AssignmentExpression`) inside object-literal braces is only legal
+    // when the surrounding `{...}` is refined as an ObjectAssignmentPattern /
+    // ObjectBindingPattern; in a plain object literal it is a SyntaxError. The
+    // parser accepts the cover form unconditionally in `object_elem()` (at parse
+    // time it can't yet tell whether `{...}` is an assignment LHS / binding / arrow
+    // param), so `earlyErrors` rejects it where pattern context never materializes.
+    // That check and the pattern-context rest-element rules below are applied inline
+    // by `earlyErrors`, which threads `inPattern` via `childInPatternContext`.
+
+    /**
+     * Spec early errors for {@code BindingRestElement} / {@code AssignmentRestElement}
+     * inside an {@code ArrayBindingPattern} / {@code ArrayAssignmentPattern}:
+     * <ul>
+     *   <li>Rest element must be the last binding element — {@code [...x, y]} is
+     *       invalid (§13.3.3).</li>
+     *   <li>Rest element cannot carry a default initializer — {@code [...x = 1]}
+     *       is invalid (rest target is a DestructuringAssignmentTarget, not an
+     *       AssignmentExpression).</li>
+     * </ul>
+     * Called only when the surrounding {@code LIT_ARRAY} is in pattern context;
+     * a spread {@code [...arr, b]} in a regular array literal stays valid.
+     */
+    private static void validateRestElementRules(Node litArray) {
+        int lastArrayElemIdx = -1;
+        for (int i = 0, n = litArray.size(); i < n; i++) {
+            Node ch = litArray.get(i);
+            if (!ch.isToken() && ch.type == NodeType.ARRAY_ELEM) {
+                lastArrayElemIdx = i;
+            }
+        }
+        for (int i = 0, n = litArray.size(); i < n; i++) {
+            Node ch = litArray.get(i);
+            if (ch.isToken() || ch.type != NodeType.ARRAY_ELEM) continue;
+            if (!hasRestPrefix(ch)) continue;
+            if (i != lastArrayElemIdx) {
+                throw new ParserException("invalid destructuring: rest element must be the last binding element");
+            }
+            if (restHasInitializer(ch)) {
+                throw new ParserException("invalid destructuring: rest element cannot have an initializer");
+            }
+        }
+    }
+
+    private static boolean hasRestPrefix(Node arrayElem) {
+        if (arrayElem.size() == 0) return false;
+        Node first = arrayElem.getFirst();
+        return first.isToken() && first.token.type == DOT_DOT_DOT;
+    }
+
+    /**
+     * For an ARRAY_ELEM that starts with {@code ...}, returns true iff the target
+     * expression after the DOT_DOT_DOT carries a top-level assignment — i.e. the
+     * rest target is being given a default value, which is invalid.
+     */
+    private static boolean restHasInitializer(Node arrayElem) {
+        boolean sawDot = false;
+        for (int i = 0, n = arrayElem.size(); i < n; i++) {
+            Node ch = arrayElem.get(i);
+            if (ch.isToken()) {
+                if (ch.token.type == DOT_DOT_DOT) sawDot = true;
+                continue;
+            }
+            if (!sawDot) continue;
+            Node inner = ch;
+            while (inner != null && inner.size() == 1
+                    && (inner.type == NodeType.EXPR
+                        || inner.type == NodeType.EXPR_LIST
+                        || inner.type == NodeType.LIT_EXPR)) {
+                Node next = inner.getFirst();
+                if (next.isToken()) break;
+                inner = next;
+            }
+            if (inner != null && inner.type == NodeType.ASSIGN_EXPR) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Pattern-context propagation rules. Top-down: a {@code LIT_OBJECT} (or
+     * {@code LIT_ARRAY}) that's a destructuring target distributes pattern context
+     * to its element values via {@code OBJECT_ELEM} / {@code ARRAY_ELEM}; the
+     * default-initializer expression after {@code =} in a CoverInitializedName is
+     * expression context, not pattern. Parens reset to expression — a
+     * parenthesized destructuring pattern is invalid per spec.
+     */
+    private static boolean childInPatternContext(Node parent, int i, boolean inPattern) {
+        switch (parent.type) {
+            case ASSIGN_EXPR, VAR_DECL -> {
+                // LHS / binding position is at index 0.
+                return i == 0;
+            }
+            case FN_DECL_ARG -> {
+                // Index 0, or index 1 for a rest parameter (`...[a, b]`).
+                Node first = parent.getFirst();
+                return i == (first.isToken() && first.token.type == DOT_DOT_DOT ? 1 : 0);
+            }
+            case FOR_STMT -> {
+                // for-of / for-in LHS — the non-token child immediately preceding
+                // the OF / IN token. for-loops with semicolons stay false.
+                for (int j = 0; j < parent.size(); j++) {
+                    Node sib = parent.get(j);
+                    if (sib.isToken() && (sib.token.type == OF || sib.token.type == IN)) {
+                        return i == j - 1;
+                    }
+                }
+                return false;
+            }
+            case TRY_STMT -> {
+                // CatchParameter — the child between the CATCH-introduced L_PAREN
+                // and its R_PAREN is a BindingPattern, so cover-init shorthand
+                // (`catch ({a = 1})`) is legal there. The try/finally blocks stay false.
+                for (int j = 1; j < parent.size(); j++) {
+                    Node sib = parent.get(j);
+                    if (sib.isToken() && sib.token.type == L_PAREN
+                            && parent.get(j - 1).isToken() && parent.get(j - 1).token.type == CATCH) {
+                        return i == j + 1;
+                    }
+                }
+                return false;
+            }
+            case OBJECT_ELEM -> {
+                // OBJECT_ELEM children: [key-bits..., (COLON | EQ), value/init].
+                // Only propagate pattern context through the value of a colon form;
+                // the initializer after `=` is always expression context.
+                if (!inPattern) return false;
+                return !hasCoverInitForm(parent);
+            }
+            case ARRAY_ELEM, LIT_OBJECT, LIT_ARRAY, LIT_EXPR, EXPR, EXPR_LIST -> {
+                return inPattern;
+            }
+            default -> {
+                return false;
+            }
+        }
+    }
+
+    /**
+     * Detect the CoverInitializedName shape inside an {@code OBJECT_ELEM}:
+     * an {@code EQ} token appearing at the top of the element, not after a
+     * {@code COLON} (which would make it a regular {@code key: value = expr}
+     * where the inner {@code =} belongs to an AssignmentExpression value).
+     */
+    private static boolean hasCoverInitForm(Node objElem) {
+        for (int i = 0, n = objElem.size(); i < n; i++) {
+            Node ch = objElem.get(i);
+            if (!ch.isToken()) continue;
+            TokenType t = ch.token.type;
+            if (t == EQ) return true;
+            if (t == COLON) return false;
+        }
+        return false;
+    }
+
+    /**
+     * Per spec ({@code IsValidSimpleAssignmentTarget} / {@code AssignmentTargetType}),
+     * the LHS of an assignment or update expression must be either:
+     * <ul>
+     *   <li>An IdentifierReference (bare identifier),</li>
+     *   <li>A MemberExpression of the form {@code x.y} or {@code x[k]} (including over
+     *       a CallExpression head, e.g. {@code f().x = 1}),</li>
+     *   <li>An ObjectLiteral or ArrayLiteral at the top of the LHS — refined into a
+     *       destructuring AssignmentPattern.</li>
+     * </ul>
+     * Anything else (binary expressions, unary operators, literals, function/arrow
+     * expressions, comma expressions, parenthesized destructuring patterns, nested
+     * assignment expressions, etc.) is a SyntaxError at parse phase.
+     * <p>
+     * {@code f() = 1} is the one notable exception: the spec's web-compat carve-out
+     * allows it in non-strict mode (returns {@code ~web-compat~}, not {@code invalid}).
+     * The engine has no separate strict mode so non-strict is permanent; the
+     * corresponding test262 cases are flagged {@code onlyStrict} and skipped by the
+     * harness.
+     */
+    private static void checkSimpleAssignmentTarget(Node lhs, String siteName, boolean noCallCarveOut) {
+        Node n = stripExprWrappers(lhs);
+        if (n == null) {
+            // Defensive — empty LHS only happens in error-recovery edge cases.
+            return;
+        }
+        // Top-level Object/Array literal refines into a destructuring pattern.
+        if (n.type == NodeType.LIT_EXPR && n.size() >= 1) {
+            NodeType lit = n.getFirst().type;
+            if (lit == NodeType.LIT_ARRAY || lit == NodeType.LIT_OBJECT) {
+                return;
+            }
+        }
+        // Peel any layers of parens. Per spec, a ParenthesizedExpression around an
+        // ObjectLiteral or ArrayLiteral does NOT refine to a destructuring pattern,
+        // so it becomes invalid; everything else falls through to the simple check.
+        while (n.type == NodeType.PAREN_EXPR) {
+            // PAREN_EXPR shape: [(, body, )]
+            Node body = n.size() >= 2 ? n.get(1) : null;
+            if (body == null) {
+                throw new ParserException("invalid " + siteName);
+            }
+            if (body.type == NodeType.EXPR_LIST && body.size() != 1) {
+                throw new ParserException("invalid " + siteName + ": comma expression");
+            }
+            Node inner = stripExprWrappers(body);
+            if (inner == null) {
+                throw new ParserException("invalid " + siteName);
+            }
+            if (inner.type == NodeType.LIT_EXPR && inner.size() >= 1) {
+                NodeType lit = inner.getFirst().type;
+                if (lit == NodeType.LIT_ARRAY || lit == NodeType.LIT_OBJECT) {
+                    throw new ParserException("invalid " + siteName + ": parenthesized destructuring pattern");
+                }
+            }
+            n = inner;
+        }
+        switch (n.type) {
+            case REF_EXPR -> {
+                // REF_EXPR is single-arg arrow `x => ...` when its first child is an
+                // FN_ARROW_EXPR rather than the IDENT token; that form is invalid.
+                if (n.size() >= 1 && !n.getFirst().isToken()
+                        && n.getFirst().type == NodeType.FN_ARROW_EXPR) {
+                    throw new ParserException("invalid " + siteName + ": arrow function");
+                }
+                // `this` lexes as IDENT (see JsLexer.keywordOrIdent) but per spec
+                // the ThisExpression has AssignmentTargetType=invalid.
+                if (n.size() >= 1 && n.getFirst().isToken()
+                        && n.getFirst().token.type == IDENT
+                        && "this".equals(n.getFirst().getText())) {
+                    throw new ParserException("invalid " + siteName + ": this");
+                }
+            }
+            case REF_DOT_EXPR, REF_BRACKET_EXPR -> {
+                // Plain member access; a `?.` would have been caught earlier by
+                // the optional-chain branch above with a more specific message.
+                // `import.meta` is a meta-property whose AssignmentTargetType is
+                // invalid; `import` is not a reserved word in our lexer so it
+                // parses as a normal REF_DOT_EXPR — flag the literal shape here.
+                if (n.type == NodeType.REF_DOT_EXPR && isImportMeta(n)) {
+                    throw new ParserException("invalid " + siteName + ": import.meta");
+                }
+            }
+            case FN_CALL_EXPR -> {
+                // Web-compat carve-out (Annex B B.3.5): allow `f() = 1` in non-strict mode.
+                // Logical-assignment operators (||=, &&=, ??=) are ES2021 and the carve-out
+                // does NOT apply to them; the caller passes noCallCarveOut=true in that case.
+                if (noCallCarveOut) {
+                    throw new ParserException("invalid " + siteName + ": call expression");
+                }
+            }
+            default ->
+                    throw new ParserException("invalid " + siteName + ": "
+                            + n.type.name() + " is not a valid assignment target");
+        }
+    }
+
+    /**
+     * Strip thin {@code EXPR} / {@code EXPR_LIST} single-child wrappers introduced
+     * by the parser so that callers can inspect the underlying expression shape.
+     * Returns the node unchanged once the wrappers run out or the node has more
+     * than one child.
+     */
+    private static Node stripExprWrappers(Node n) {
+        while (n != null && n.size() == 1
+                && (n.type == NodeType.EXPR || n.type == NodeType.EXPR_LIST)) {
+            n = n.get(0);
+        }
+        return n;
+    }
+
+    /**
+     * True iff {@code node} is the literal shape {@code import.meta}: a
+     * {@code REF_DOT_EXPR} whose head is a bare {@code REF_EXPR(IDENT('import'))}
+     * and whose property is the IDENT {@code meta}.
+     */
+    private static boolean isImportMeta(Node node) {
+        if (node.type != NodeType.REF_DOT_EXPR || node.size() < 3) {
+            return false;
+        }
+        Node head = node.getFirst();
+        if (head.type != NodeType.REF_EXPR || head.size() != 1) {
+            return false;
+        }
+        Node headIdent = head.getFirst();
+        if (!headIdent.isToken() || headIdent.token.type != IDENT
+                || !"import".equals(headIdent.getText())) {
+            return false;
+        }
+        Node prop = node.get(2);
+        return prop.isToken() && prop.token.type == IDENT && "meta".equals(prop.getText());
+    }
+
+    /**
+     * True if {@code node}'s chain subtree contains any {@code ?.} marker. Walks
+     * down through chain types only — PAREN_EXPR or any non-chain node ends the
+     * walk, since parens reset the optional-chain scope per spec.
+     */
+    private static boolean subtreeContainsOptionalChain(Node node) {
+        Node cur = node;
+        // Skip thin wrappers — EXPR / EXPR_LIST single-child / PAREN_EXPR — to reach
+        // the actual chain head. Parens reset the chain scope per spec for execution,
+        // but `(a?.b) = 1` and `--(a?.b)` are still parse errors because the cover
+        // OptionalExpression is not a valid simple-assignment target.
+        while (cur != null && (cur.type == NodeType.EXPR || cur.type == NodeType.EXPR_LIST
+                || cur.type == NodeType.PAREN_EXPR)) {
+            if (cur.size() == 0) return false;
+            // PAREN_EXPR has shape [(, body, )]; EXPR/EXPR_LIST wrap their content as the first child.
+            cur = cur.type == NodeType.PAREN_EXPR ? cur.get(1) : cur.getFirst();
+        }
+        while (cur != null) {
+            if (cur.type == NodeType.REF_DOT_EXPR) {
+                Node second = cur.size() > 1 ? cur.get(1) : null;
+                if (second != null) {
+                    if (second.isToken() && second.token.type == QUES_DOT) return true;
+                    if (!second.isToken() && second.size() > 0) {
+                        Node firstOfSecond = second.getFirst();
+                        if (firstOfSecond.isToken() && firstOfSecond.token.type == QUES_DOT) return true;
+                    }
+                }
+                cur = cur.size() > 0 ? cur.getFirst() : null;
+            } else if (cur.type == NodeType.REF_BRACKET_EXPR
+                    || cur.type == NodeType.FN_CALL_EXPR
+                    || cur.type == NodeType.FN_TAGGED_TEMPLATE_EXPR) {
+                cur = cur.size() > 0 ? cur.getFirst() : null;
+            } else {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    // Recovery points for statements
+    private static final TokenType[] STMT_RECOVERY = {
+            IF, FOR, WHILE, DO, SWITCH, TRY, RETURN, THROW, BREAK, CONTINUE,
+            VAR, LET, CONST, FUNCTION, L_CURLY, R_CURLY, SEMI, EOF
+    };
+
+    private void recoverToStatement() {
+        recoverTo(STMT_RECOVERY);
+    }
+
+    private boolean statement(boolean mandatory) {
+        enter(NodeType.STATEMENT);
+        boolean result = if_stmt()
+                || (var_stmt(false) && eos())
+                || (return_stmt() && eos())
+                || (throw_stmt() && eos())
+                || try_stmt()
+                || for_stmt()
+                || while_stmt()
+                || do_while_stmt()
+                || switch_stmt()
+                || (break_stmt() && eos())
+                || (continue_stmt() && eos())
+                || labelled_stmt()
+                || fn_decl() // function declarations don't need eos (ASI)
+                || class_expr() // class declarations don't need eos (ASI), like function decls
+                || block(false) // block before expr_list: per JS spec, { } at statement position is a block
+                || (expr_list(false) && eos())
+                || consumeIf(SEMI); // empty statement
+        // In error recovery mode, accept incomplete statements if we consumed any tokens
+        if (!result && errorRecoveryEnabled && !markerNode().isEmpty()) {
+            return exitSoft();
+        }
+        return exit(result, mandatory);
+    }
+
+    private boolean eos() {
+        if (enter(NodeType.EOS, SEMI)) {
+            return exit();
+        }
+        TokenType next = peek();
+        // ASI also fires at `}` and end of input, with no LineTerminator needed.
+        if (next == R_CURLY || next == EOF || !noLineTerminatorBefore()) {
+            return true;
+        }
+        // The statement's tokens are already consumed, so a false here would let the next
+        // alternative in statement() parse the rest of the line as part of this statement.
+        error(SEMI);
+        return true;
+    }
+
+    private boolean expr_list(boolean mandatory) {
+        // Fast lookahead: skip if current token can't start an expression
+        if (!mandatory && !peekAnyOf(T_EXPR_START)) {
+            return false;
+        }
+        enter(NodeType.EXPR_LIST);
+        boolean atLeastOne = false;
+        while (true) {
+            if (expr(-1, false)) {
+                atLeastOne = true;
+            } else {
+                break;
+            }
+            if (!consumeIf(COMMA)) {
+                break;
+            }
+        }
+        return exit(atLeastOne, mandatory);
+    }
+
+    private boolean if_stmt() {
+        if (!enter(NodeType.IF_STMT, IF)) {
+            return false;
+        }
+        consumeSoft(L_PAREN);
+        expr_list(true);
+        consumeSoft(R_PAREN);
+        statement(true);
+        if (consumeIf(ELSE)) {
+            statement(true);
+        }
+        return exit();
+    }
+
+    private boolean var_stmt(boolean forLoop) {
+        if (!enter(NodeType.VAR_STMT, T_VAR_STMT)) {
+            return false;
+        }
+        boolean requireInit = lastConsumed() == CONST && !forLoop;
+        if (!var_decl(requireInit)) {
+            error(NodeType.VAR_DECL);
+        }
+        while (consumeIf(COMMA)) {
+            if (!var_decl(requireInit)) {
+                error(NodeType.VAR_DECL);
+            }
+        }
+        return exit();
+    }
+
+    private boolean var_decl(boolean requireInit) {
+        enter(NodeType.VAR_DECL);
+        boolean hasBinding = lit_array() || lit_object() || consumeIdentifier();
+        if (!hasBinding) {
+            return exit(false, false);
+        }
+        if (consumeIf(EQ)) {
+            expr(-1, true);
+        } else if (requireInit) {
+            error(EQ);
+        }
+        return exit();
+    }
+
+    private boolean return_stmt() {
+        if (!enter(NodeType.RETURN_STMT, RETURN)) {
+            return false;
+        }
+        // `return` is a RESTRICTED PRODUCTION: a line terminator after it ends the statement, so
+        // `if (x) return` followed by `foo()` on the next line is `return; foo()` and NOT `return foo()`.
+        // Getting this wrong is silent — the second form parses, runs, and returns something else.
+        if (!noLineTerminatorBefore()) {
+            return exit();
+        }
+        expr_list(false);
+        return exit();
+    }
+
+    private boolean throw_stmt() {
+        if (!enter(NodeType.THROW_STMT, THROW)) {
+            return false;
+        }
+        // `throw` is a restricted production too, and unlike `return` the spec makes a line terminator after
+        // it an early SyntaxError rather than a silent ASI — there is no such thing as throwing nothing. So
+        // this reports rather than inventing an operand; `throw\n'boom'` used to throw 'boom'.
+        if (!noLineTerminatorBefore()) {
+            error("a line terminator after 'throw' is not allowed — put the expression on the same line");
+        }
+        expr_list(true);
+        return exit();
+    }
+
+    private boolean try_stmt() {
+        if (!enter(NodeType.TRY_STMT, TRY)) {
+            return false;
+        }
+        block(true);
+        boolean hasCatch = consumeIf(CATCH);
+        if (hasCatch) {
+            // CatchParameter is optional (ES2019); when present it is a
+            // BindingIdentifier or BindingPattern — reuse the same binding-target trio
+            // as var_decl so `catch ([a,b])` / `catch ({e})` parse through the
+            // destructuring cover-grammar, not just bare idents.
+            if (consumeIf(L_PAREN)) {
+                if (!(lit_array() || lit_object() || consumeIdentifier())) {
+                    error(IDENT, L_BRACKET, L_CURLY);
+                }
+                consumeSoft(R_PAREN);
+            }
+            block(true);
+        }
+        if (consumeIf(FINALLY)) {
+            block(true);
+        } else if (!hasCatch) {
+            error("expected " + CATCH + " or " + FINALLY);
+        }
+        return exit();
+    }
+
+    private boolean for_stmt() {
+        if (!enter(NodeType.FOR_STMT, FOR)) {
+            return false;
+        }
+        // `for await (x of asyncIterable)` needs async iteration, which the engine does
+        // not have — say so rather than failing on the unexpected identifier.
+        Token token = peekToken();
+        if (token.type == IDENT && token.length == 5 && isIdentText(token, "await")) {
+            error("`for await` (async iteration) is not supported yet");
+            consumeNext(); // error-recovery mode only — otherwise error() already threw
+        }
+        consumeSoft(L_PAREN);
+        boolean prevNoIn = noIn;
+        noIn = true;
+        try {
+            if (!(peekIf(SEMI) || var_stmt(true) || expr_list(false))) {
+                error(NodeType.VAR_STMT, NodeType.EXPR);
+            }
+        } finally {
+            noIn = prevNoIn;
+        }
+        if (consumeIf(SEMI)) {
+            if (peekIf(SEMI) || expr_list(false)) {
+                if (consumeIf(SEMI)) {
+                    if (!(peekIf(R_PAREN) || expr_list(false))) {
+                        error(NodeType.EXPR);
+                    }
+                } else {
+                    error(SEMI);
+                }
+            } else {
+                error(NodeType.EXPR);
+            }
+        } else if (anyOf(T_FOR_IN_OF)) {
+            expr(-1, true);
+        } else {
+            error(SEMI, IN, OF);
+        }
+        consumeSoft(R_PAREN);
+        if (!peekIf(EOF)) {
+            statement(true);
+        } else {
+            error(NodeType.STATEMENT);
+        }
+        return exit();
+    }
+
+    private boolean while_stmt() {
+        if (!enter(NodeType.WHILE_STMT, WHILE)) {
+            return false;
+        }
+        consumeSoft(L_PAREN);
+        expr_list(true);
+        consumeSoft(R_PAREN);
+        statement(true);
+        return exit();
+    }
+
+    private boolean do_while_stmt() {
+        if (!enter(NodeType.DO_WHILE_STMT, DO)) {
+            return false;
+        }
+        statement(true);
+        consumeSoft(WHILE);
+        consumeSoft(L_PAREN);
+        expr_list(true);
+        consumeSoft(R_PAREN);
+        return exit();
+    }
+
+    private boolean switch_stmt() {
+        if (!enter(NodeType.SWITCH_STMT, SWITCH)) {
+            return false;
+        }
+        consumeSoft(L_PAREN);
+        expr_list(true);
+        consumeSoft(R_PAREN);
+        consumeSoft(L_CURLY);
+        // CaseClauses and the DefaultClause interleave freely — `default` need not be
+        // last. At-most-one `default` is an early error, not a grammar restriction.
+        while (true) {
+            if (peekIf(R_CURLY) || peekIf(EOF)) {
+                break;
+            }
+            if (!case_block() && !default_block()) {
+                if (errorRecoveryEnabled) {
+                    error("invalid case block");
+                    recoverTo(R_CURLY, CASE, DEFAULT, EOF);
+                    continue;
+                }
+                break;
+            }
+        }
+        consumeSoft(R_CURLY);
+        return exit();
+    }
+
+    private boolean case_block() {
+        if (!enter(NodeType.CASE_BLOCK, CASE)) {
+            return false;
+        }
+        expr(-1, true);
+        consumeSoft(COLON);
+        while (true) {
+            if (peekIf(CASE) || peekIf(DEFAULT) || peekIf(R_CURLY) || peekIf(EOF)) {
+                break;
+            }
+            if (!statement(false)) {
+                if (errorRecoveryEnabled) {
+                    error("cannot parse statement in case block");
+                    recoverTo(CASE, DEFAULT, R_CURLY, SEMI, EOF);
+                    continue;
+                }
+                break;
+            }
+        }
+        return exit();
+    }
+
+    private boolean default_block() {
+        if (!enter(NodeType.DEFAULT_BLOCK, DEFAULT)) {
+            return false;
+        }
+        consumeSoft(COLON);
+        while (true) {
+            if (peekIf(CASE) || peekIf(DEFAULT) || peekIf(R_CURLY) || peekIf(EOF)) {
+                break;
+            }
+            if (!statement(false)) {
+                if (errorRecoveryEnabled) {
+                    error("cannot parse statement in default block");
+                    recoverTo(CASE, DEFAULT, R_CURLY, SEMI, EOF);
+                    continue;
+                }
+                break;
+            }
+        }
+        return exit();
+    }
+
+    private boolean break_stmt() {
+        if (!enter(NodeType.BREAK_STMT, BREAK)) {
+            return false;
+        }
+        label_ref();
+        return exit();
+    }
+
+    private boolean continue_stmt() {
+        if (!enter(NodeType.CONTINUE_STMT, CONTINUE)) {
+            return false;
+        }
+        label_ref();
+        return exit();
+    }
+
+    /** The optional label of a {@code break} / {@code continue}. A restricted production:
+     *  a LineTerminator before the identifier ends the statement, so {@code break\nfoo} is
+     *  {@code break; foo;} and not a labelled break. */
+    private void label_ref() {
+        if (peekIf(IDENT) && noLineTerminatorBefore()) {
+            consumeNext();
+            checkIdentifier(lastConsumedToken());
+            sawLabel = true;
+        }
+    }
+
+    /** {@code LabelIdentifier : Statement} (§14.13). Recognised only at statement position and
+     *  only on the two-token {@code IDENT :} shape, so object literals, ternaries and
+     *  {@code case x:} are untouched. */
+    private boolean labelled_stmt() {
+        if (peek() != IDENT || peekAhead(1).type != COLON) {
+            return false;
+        }
+        enter(NodeType.LABELLED_STMT, IDENT);
+        checkIdentifier(lastConsumedToken());
+        sawLabel = true;
+        consumeSoft(COLON);
+        statement(true);
+        return exit();
+    }
+
+    private boolean delete_expr() {
+        if (!enter(NodeType.DELETE_EXPR, DELETE)) {
+            return false;
+        }
+        expr(13, true);
+        return exit();
+    }
+
+    private boolean block(boolean mandatory) {
+        if (!enter(NodeType.BLOCK, L_CURLY)) {
+            if (mandatory) {
+                // In recovery mode, create empty block node
+                if (errorRecoveryEnabled) {
+                    enter(NodeType.BLOCK);
+                    error(L_CURLY);
+                    return exitSoft();
+                }
+                error(NodeType.BLOCK);
+            }
+            return false;
+        }
+        while (true) {
+            if (peekIf(R_CURLY) || peekIf(EOF)) {
+                break;
+            }
+            if (!statement(false)) {
+                // In recovery mode, skip unparseable content
+                if (errorRecoveryEnabled) {
+                    error("cannot parse statement in block");
+                    recoverTo(R_CURLY, SEMI, EOF);
+                    if (peekIf(SEMI)) {
+                        consumeNext();
+                    }
+                    continue;
+                }
+                break;
+            }
+        }
+        consumeSoft(R_CURLY);
+        return exit();
+    }
+
+    //==================================================================================================================
+    //
+    private boolean expr(int priority, boolean mandatory) {
+        // Fast lookahead: skip if current token can't start an expression
+        if (!mandatory && !peekAnyOf(T_EXPR_START)) {
+            return false;
+        }
+        enter(NodeType.EXPR);
+        boolean result = contextual_expr() // `async` function / arrow, `await` — both lex as IDENT
+                || ref_expr() // also handles single-arg arrow functions without parentheses
+                || lit_expr()
+                || fn_expr()
+                || class_expr()
+                || super_expr()
+                || fn_arrow_expr()
+                || paren_expr()
+                || unary_expr()
+                || math_pre_expr()
+                || new_expr()
+                || typeof_expr()
+                || delete_expr()
+                || private_name_expr(); // last: nothing above can start with `#`
+        // a YieldExpression is a whole AssignmentExpression — no operator may follow it (ES 15.5)
+        if (result && markerNode().getLast().type != NodeType.YIELD_EXPR) {
+            expr_rhs(priority);
+        }
+        if (!result && mandatory && errorRecoveryEnabled) {
+            // In recovery mode, create ERROR node for missing expression
+            enter(NodeType.ERROR);
+            error(NodeType.EXPR);
+            exit();
+            return exit(true, false); // Return true to continue parsing
+        }
+        return exit(result, mandatory);
+    }
+
+    private void expr_rhs(int priority) {
+        while (true) {
+            if (priority < 0 && enter(NodeType.ASSIGN_EXPR, T_ASSIGN_EXPR)) {
+                expr(-1, true);
+                exit(Shift.RIGHT);
+            } else if (priority < 1 && enter(NodeType.LOGIC_TERN_EXPR, QUES)) {
+                expr(-1, true);
+                consumeSoft(COLON);
+                expr(-1, true);
+                exit(Shift.RIGHT);
+            } else if (priority < 2 && enter(NodeType.LOGIC_AND_EXPR, PIPE_PIPE)) {
+                expr(2, true);
+                exit(Shift.LEFT);
+            } else if (priority < 2 && enter(NodeType.LOGIC_NULLISH_EXPR, QUES_QUES)) {
+                expr(2, true);
+                exit(Shift.LEFT);
+            } else if (priority < 3 && enter(NodeType.LOGIC_AND_EXPR, AMP_AMP)) {
+                expr(3, true);
+                exit(Shift.LEFT);
+            } else if (priority < 4 && enter(NodeType.LOGIC_BIT_EXPR, PIPE)) {
+                expr(4, true);
+                exit(Shift.LEFT);
+            } else if (priority < 5 && enter(NodeType.LOGIC_BIT_EXPR, CARET)) {
+                expr(5, true);
+                exit(Shift.LEFT);
+            } else if (priority < 6 && enter(NodeType.LOGIC_BIT_EXPR, AMP)) {
+                expr(6, true);
+                exit(Shift.LEFT);
+            } else if (priority < 7 && enter(NodeType.LOGIC_EXPR, T_LOGIC_EQ_EXPR)) {
+                expr(7, true);
+                exit(Shift.LEFT);
+            } else if (priority < 8 && enter(NodeType.LOGIC_EXPR, T_LOGIC_CMP_EXPR)) {
+                expr(8, true);
+                exit(Shift.LEFT);
+            } else if (priority < 9 && enter(NodeType.LOGIC_BIT_EXPR, T_LOGIC_SHIFT_EXPR)) {
+                expr(9, true);
+                exit(Shift.LEFT);
+            } else if (priority < 10 && enter(NodeType.MATH_ADD_EXPR, T_MATH_ADD_EXPR)) {
+                expr(10, true);
+                exit(Shift.LEFT);
+            } else if (priority < 11 && enter(NodeType.MATH_MUL_EXPR, T_MATH_MUL_EXPR)) {
+                expr(11, true);
+                exit(Shift.LEFT);
+            } else if (priority < 12 && peekIf(STAR_STAR)) {
+                do {
+                    enter(NodeType.MATH_EXP_EXPR);
+                    consumeNext();
+                    expr(12, true);
+                    exit(Shift.RIGHT);
+                } while (peekIf(STAR_STAR));
+            } else if (enter(NodeType.FN_CALL_EXPR, L_PAREN)) {
+                fn_call_args();
+                consumeSoft(R_PAREN);
+                exit(Shift.LEFT);
+                // new binds to the first call expression only
+                // new Foo().bar() should parse as (new Foo()).bar(), not new (Foo().bar())
+                if (isCallerType(NodeType.NEW_EXPR)) {
+                    break;
+                }
+            } else if (peekIf(BACKTICK)) {
+                // tagged template: prior postfix expression applied to the template literal
+                // shape: FN_TAGGED_TEMPLATE_EXPR -> [<callable>, LIT_TEMPLATE]
+                enter(NodeType.FN_TAGGED_TEMPLATE_EXPR);
+                lit_template();
+                exit(Shift.LEFT);
+            } else if (enter(NodeType.REF_DOT_EXPR, T_REF_DOT_EXPR)) {
+                TokenType dotType = lastConsumed();
+                if (dotType == QUES_DOT) {
+                    sawOptionalChain = true;
+                }
+                // allow reserved words as property accessors
+                TokenType dotNext = peek();
+                if (dotNext == IDENT || dotNext.keyword) {
+                    consumeNext();
+                } else if (dotNext == PRIVATE_NAME) {
+                    sawPrivateName = true;
+                    consumeNext();
+                } else if (dotType == QUES_DOT) {
+                    // Parse only the immediate `?.[expr]` or `?.(args)` step. Subsequent
+                    // postfix ops (`.x`, `[k]`, `(args)`) chain at the outer expr_rhs
+                    // level, producing a flat left-recursive AST. Recursing into
+                    // expr_rhs(12) here would nest the rest of the chain inside this
+                    // REF_DOT_EXPR — confusing the interpreter's chain-step traversal.
+                    if (dotNext == L_BRACKET) {
+                        enter(NodeType.REF_BRACKET_EXPR, L_BRACKET);
+                        expr(-1, true);
+                        consumeSoft(R_BRACKET);
+                        exit(Shift.LEFT);
+                    } else if (dotNext == L_PAREN) {
+                        enter(NodeType.FN_CALL_EXPR, L_PAREN);
+                        fn_call_args();
+                        consumeSoft(R_PAREN);
+                        exit(Shift.LEFT);
+                    } else {
+                        error(L_BRACKET, L_PAREN);
+                    }
+                } else {
+                    error(IDENT);
+                }
+                exit(Shift.LEFT);
+            } else if (enter(NodeType.REF_BRACKET_EXPR, L_BRACKET)) {
+                expr(-1, true);
+                consumeSoft(R_BRACKET);
+                exit(Shift.LEFT);
+            } else if (peekAnyOf(T_MATH_POST_EXPR)) {
+                // ES 13.4: no LineTerminator before a postfix `++`/`--` — after one, ASI makes it
+                // the prefix operator of the next statement
+                if (!noLineTerminatorBefore()) {
+                    break;
+                }
+                enter(NodeType.MATH_POST_EXPR, T_MATH_POST_EXPR);
+                exit(Shift.LEFT);
+            } else if (priority < 8 && enter(NodeType.INSTANCEOF_EXPR, INSTANCEOF)) {
+                expr(8, true);
+                exit(Shift.LEFT);
+            } else if (priority < 8 && !noIn && enter(NodeType.IN_EXPR, IN)) {
+                // ECMA relational `key in obj` — true iff `obj` (or its
+                // prototype chain) has a property named `key`. Same precedence
+                // as `instanceof`. The for-stmt parser checks T_FOR_IN_OF
+                // before entering expression land for `for (var x in y)`
+                // (no `=` initializer), so consuming IN here doesn't affect
+                // that path. The pathological `for (var x = a in b; ...)`
+                // form parses `(a in b)` as the initializer and then fails at
+                // the missing `;`.
+                expr(8, true);
+                exit(Shift.LEFT);
+            } else {
+                break;
+            }
+        }
+    }
+
+    /**
+     * The {@code async} / {@code await} contextual keywords. Both lex as plain
+     * {@code IDENT} (so {@code var async = 1}, <code>{async: 1}</code>, {@code a.async},
+     * {@code function f(async)} and {@code var await = 5} all keep working), which means
+     * their expression forms have to be recognized here — before {@link #ref_expr()}
+     * claims the identifier. Rejecting is a token-type test plus a length test for
+     * everything that is not a five-character identifier starting with {@code a}, so the
+     * check in front of every expression stays cheap.
+     */
+    private boolean contextual_expr() {
+        Token token = peekToken();
+        if (token.type != IDENT || token.length != 5) {
+            return false;
+        }
+        char c0 = source.charAt(token.pos);
+        if (c0 == 'y') {
+            // `yield` is unconditionally an operator inside a generator body —
+            // it is a reserved word there, so no expression-start lookahead.
+            return inGenerator && isIdentText(token, "yield") && yield_expr();
+        }
+        if (c0 != 'a') {
+            return false;
+        }
+        if (inAsync && isIdentText(token, "await")) {
+            return await_expr();
+        }
+        // fn_expr() also carries the `async function` form, so that a declaration keeps
+        // reaching it from statement position (hoisting, no ASI requirement)
+        return isIdentText(token, "async") && (async_arrow_expr() || fn_expr());
+    }
+
+    /**
+     * {@code yield AssignmentExpression?} / {@code yield* AssignmentExpression} — reached
+     * only where {@link #inGenerator} holds. ASI: a LineTerminator after {@code yield}
+     * ends the expression (operand-less yield), and per spec no LineTerminator may come
+     * between {@code yield} and {@code *} — the line check therefore precedes the STAR
+     * consumption. The operand parses at assignment-expression level, so
+     * {@code yield a, b} is {@code (yield a), b}.
+     */
+    private boolean yield_expr() {
+        enter(NodeType.YIELD_EXPR);
+        Token yieldToken = peekToken();
+        consumeNext(); // the `yield` identifier token
+        if (!lineTerminatorFollows(yieldToken)) {
+            if (consumeIf(STAR)) {
+                expr(-1, true); // yield* requires an operand
+            } else if (peekAnyOf(T_EXPR_START)) {
+                expr(-1, true);
+            }
+        }
+        return exit();
+    }
+
+    /**
+     * {@code await UnaryExpression} — a prefix operator at the same precedence as the
+     * other unary operators, so {@code await a + b} is {@code (await a) + b}. Reached only
+     * where {@link #inAsync} holds. It stays an identifier when what follows cannot start
+     * an expression, which is what keeps {@code await = 1}, {@code await.x}, {@code f(await)}
+     * and {@code var await = 5; await;} parsing in sloppy top-level code.
+     */
+    private boolean await_expr() {
+        if (!T_EXPR_START.contains(peekAhead(1).type)) {
+            return false;
+        }
+        enter(NodeType.AWAIT_EXPR);
+        consumeNext(); // the `await` identifier token
+        expr(13, true);
+        return exit();
+    }
+
+    /**
+     * {@code async (a, b) => …} and {@code async x => …}. Per spec no LineTerminator may
+     * come between {@code async} and the parameters, so {@code async}<br>{@code x => x} is
+     * the identifier {@code async} instead. The single-parameter form gets a synthetic
+     * {@code FN_DECL_ARGS}/{@code FN_DECL_ARG} wrapper so every async arrow has the same
+     * parameter shape as a parenthesized one — the bare-IDENT parameter shape of
+     * {@code x => …} is only readable when that identifier is the node's first child.
+     */
+    private boolean async_arrow_expr() {
+        Token asyncToken = peekToken();
+        Token next = peekAhead(1);
+        boolean parens = next.type == L_PAREN && looksLikeArrowFunction(getPosition() + 1);
+        boolean single = next.type == IDENT && peekAhead(2).type == EQ_GT;
+        if ((!parens && !single) || lineTerminatorFollows(asyncToken)) {
+            return false;
+        }
+        enter(NodeType.FN_ARROW_EXPR);
+        markerNode().async = true;
+        consumeNext(); // `async`
+        if (parens) {
+            if (!fn_decl_args()) {
+                error(NodeType.FN_DECL_ARGS);
+                return exit(false, false);
+            }
+        } else {
+            enter(NodeType.FN_DECL_ARGS);
+            enter(NodeType.FN_DECL_ARG);
+            consumeNext(); // the single parameter
+            exit();
+            exit();
+        }
+        lineTerminatorBeforeArrowIsAnError();
+        consumeSoft(EQ_GT);
+        if (!fn_body_or_expr(true)) {
+            error(NodeType.BLOCK, NodeType.EXPR);
+        }
+        return exit();
+    }
+
+    /** True if {@code token} is an {@code IDENT} spelling exactly {@code text}. Compares
+     *  against the source directly: this sits on the per-expression path for the contextual
+     *  keywords, and {@link Token#getText()} would allocate the memoized-text array for
+     *  identifiers nothing else asks about. Callers check the token type. */
+    /** consumeIf(IDENT) at a BindingIdentifier / LabelIdentifier / IdentifierReference. */
+    private boolean consumeIdentifier() {
+        if (!consumeIf(IDENT)) {
+            return false;
+        }
+        checkIdentifier(lastConsumedToken());
+        return true;
+    }
+
+    /** §13.1.1: an identifier is never a ReservedWord spelled with escapes, nor {@code yield} / {@code await} where they are operators. */
+    private void checkIdentifier(Token token) {
+        // the common case, no escape: compare the raw spelling and extract no text
+        String name = token.buffer.escapedIdentifiers && hasEscape(token) ? token.getText() : null;
+        if (name != null && JsLexer.RESERVED_WORDS.contains(name)) {
+            error("keyword '" + name + "' must not contain escape sequences");
+        }
+        if (inGenerator && spells(token, name, "yield") || inAsyncBody && spells(token, name, "await")) {
+            error("'" + token.getText() + "' is a reserved word here");
+        }
+        char first = name == null ? source.charAt(token.pos) : name.charAt(0);
+        if (first != 'i' && first != 'l' && first != 'p' && first != 's' && first != 'y') {
+            return;
+        }
+        for (String word : STRICT_RESERVED) {
+            if (spells(token, name, word)) {
+                if (strictReservedIdents == null) {
+                    strictReservedIdents = new HashSet<>();
+                }
+                strictReservedIdents.add(token);
+                return;
+            }
+        }
+    }
+
+    private boolean hasEscape(Token token) {
+        for (int i = token.pos, end = token.pos + token.length; i < end; i++) {
+            if (source.charAt(i) == '\\') {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** {@code name} is the decoded text of an escaped token, null when the raw spelling is the name. */
+    private boolean spells(Token token, String name, String word) {
+        return name == null ? isIdentText(token, word) : name.equals(word);
+    }
+
+    private static final String[] STRICT_RESERVED = {
+            "implements", "interface", "let", "package", "private", "protected", "public", "static", "yield"};
+
+    private Token lastConsumedToken() {
+        return markerNode().getLast().token;
+    }
+
+    /** The token just consumed is an IDENT spelled exactly {@code text} — a contextual keyword has no escaped form. */
+    private boolean lastConsumedIs(String text) {
+        Token token = lastConsumedToken();
+        return token.type == IDENT && isIdentText(token, text);
+    }
+
+    private boolean isIdentText(Token token, String text) {
+        if (token.length != text.length()) {
+            return false;
+        }
+        for (int i = 0, n = text.length(); i < n; i++) {
+            if (source.charAt(token.pos + i) != text.charAt(i)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** The primary token {@code offset} positions ahead of the cursor; {@link Token#EMPTY}
+     *  (an EOF) past the end. */
+    private Token peekAhead(int offset) {
+        int index = getPosition() + offset;
+        return index < tokens.size() ? tokens.get(index) : Token.EMPTY;
+    }
+
+    /** A function / method body, parsed with {@code await} enabled or disabled to match the
+     *  function's own async-ness — an ordinary function nested inside an async one must go
+     *  back to treating {@code await} as an identifier. */
+    private boolean fn_body(boolean async) {
+        return fn_body(async, false);
+    }
+
+    private boolean fn_body(boolean async, boolean generator) {
+        boolean prevAsync = inAsync;
+        boolean prevGenerator = inGenerator;
+        boolean prevAsyncBody = inAsyncBody;
+        inAsync = inAsyncBody = async;
+        inGenerator = generator;
+        try {
+            return block(true);
+        } finally {
+            inAsync = prevAsync;
+            inGenerator = prevGenerator;
+            inAsyncBody = prevAsyncBody;
+        }
+    }
+
+    /** An arrow-function body — a block or a concise expression — with the same
+     *  await-scoping rule as {@link #fn_body(boolean)}. Arrows do not inherit the enclosing
+     *  function's async-ness: only an async arrow may contain {@code await}. */
+    private boolean fn_body_or_expr(boolean async) {
+        boolean prevAsync = inAsync;
+        boolean prevGenerator = inGenerator;
+        boolean prevAsyncBody = inAsyncBody;
+        inAsync = inAsyncBody = async;
+        inGenerator = false; // arrows are never generators — `yield` reverts to identifier
+        try {
+            return block(false) || expr(-1, false);
+        } finally {
+            inAsync = prevAsync;
+            inGenerator = prevGenerator;
+            inAsyncBody = prevAsyncBody;
+        }
+    }
+
+    private boolean fn_arrow_expr() {
+        // Fast lookahead: skip if this can't be an arrow function
+        // Avoids creating nodes that will be discarded on backtrack
+        if (!looksLikeArrowFunction(getPosition())) {
+            return false;
+        }
+        enter(NodeType.FN_ARROW_EXPR);
+        // what started out looking like arrow function args may not be
+        // e.g: "(function(){})", so fn_decl_args() will re-wind
+        // and paren_expr() is next in line in expr() to handle
+        if (fn_decl_args()) {
+            lineTerminatorBeforeArrowIsAnError();
+            if (consumeIf(EQ_GT)) {
+                if (fn_body_or_expr(false)) {
+                    return exit();
+                }
+                error(NodeType.BLOCK, NodeType.EXPR);
+            }
+        }
+        return exit(false, false);
+    }
+
+    /** ES 15.3: {@code ArrowParameters [no LineTerminator here] =>} — no ASI can repair it. */
+    private void lineTerminatorBeforeArrowIsAnError() {
+        if (peekIf(EQ_GT) && !noLineTerminatorBefore()) {
+            error("a line terminator before '=>' is not allowed — put '=>' on the same line as the parameters");
+        }
+    }
+
+    // Lookahead to detect arrow function: (...) => — from `start`, which is the cursor
+    // except for `async (…) =>`, where the parameter list begins one token later.
+    private boolean looksLikeArrowFunction(int start) {
+        if (start >= tokens.size() || tokens.get(start).type != L_PAREN) {
+            return false;
+        }
+        // Track both () and {} depth so destructured object params (`({a}) =>`) and
+        // default expressions containing braces don't trip the early bail.
+        // A top-level SEMI is still a hard bail — arrow-param lists can't span statements.
+        int parenDepth = 0;
+        int curlyDepth = 0;
+        int size = tokens.size();
+        for (int i = start; i < size; i++) {
+            TokenType t = tokens.get(i).type;
+            if (t == L_PAREN) {
+                parenDepth++;
+            } else if (t == R_PAREN) {
+                if (--parenDepth == 0 && curlyDepth == 0) {
+                    return i + 1 < size && tokens.get(i + 1).type == EQ_GT;
+                }
+            } else if (t == L_CURLY) {
+                curlyDepth++;
+            } else if (t == R_CURLY) {
+                curlyDepth--;
+            } else if (t == EOF) {
+                return false;
+            } else if (t == SEMI && curlyDepth == 0) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    // ES 15.2: a FunctionDeclaration needs a BindingIdentifier; only `export default`
+    // (modules, which karate-js does not parse) may omit it.
+    private boolean fn_decl() {
+        TokenType t = peek();
+        int i = t == FUNCTION ? 0 : t == IDENT && isIdentText(peekToken(), "async") ? 1 : -1;
+        if (i < 0 || peekAhead(i).type != FUNCTION) {
+            return false;
+        }
+        if (peekAhead(i + 1).type == STAR) {
+            i++;
+        }
+        if (peekAhead(i + 1).type == L_PAREN) {
+            if (leadingFunctionExpression && getPosition() == 0) {
+                return false; // the statement() fallthrough parses it as an expression
+            }
+            error("a function declaration requires a name");
+        }
+        return fn_expr(true);
+    }
+
+    private boolean fn_expr() {
+        return fn_expr(false);
+    }
+
+    private boolean fn_expr(boolean declaration) {
+        if (enter(NodeType.FN_EXPR, FUNCTION)) {
+            return fn_expr_tail(false, declaration);
+        }
+        // `async function …`, declaration or expression. `async` is a contextual keyword
+        // and only a modifier when `function` follows it on the same line — with a
+        // LineTerminator between them it is the identifier `async` (an expression
+        // statement) followed by a separate function declaration.
+        Token token = peekToken();
+        if (token.type != IDENT || token.length != 5 || peekAhead(1).type != FUNCTION
+                || !isIdentText(token, "async") || lineTerminatorFollows(token)) {
+            return false;
+        }
+        enter(NodeType.FN_EXPR);
+        markerNode().async = true;
+        consumeNext(); // `async`
+        consumeNext(); // `function`
+        return fn_expr_tail(true, declaration);
+    }
+
+    // Everything after the `function` keyword: optional name, parameters, body.
+    private boolean fn_expr_tail(boolean async, boolean declaration) {
+        boolean generator = consumeIf(STAR);
+        if (generator) {
+            if (async) {
+                error("async generators are not supported");
+            }
+            markerNode().generator = true;
+        }
+        if (declaration) {
+            consumeIdentifier();
+        } else { // a function expression binds its name in its own scope
+            boolean prevGenerator = inGenerator;
+            boolean prevAsyncBody = inAsyncBody;
+            inGenerator = generator;
+            inAsyncBody = async;
+            consumeIdentifier();
+            inGenerator = prevGenerator;
+            inAsyncBody = prevAsyncBody;
+        }
+        fn_decl_args();
+        fn_body(async, generator);
+        return exit();
+    }
+
+    private boolean fn_decl_args() {
+        if (!enter(NodeType.FN_DECL_ARGS, L_PAREN)) {
+            return false;
+        }
+        boolean hasParams = false;
+        while (true) {
+            if (peekIf(R_PAREN) || peekIf(EOF)) {
+                break;
+            }
+            if (!fn_decl_arg()) {
+                if (errorRecoveryEnabled && hasParams) {
+                    // Only error/recover if we've parsed at least one param
+                    // If first param fails, this might be a paren expr, not arrow fn args
+                    error("invalid function parameter");
+                    recoverTo(R_PAREN, COMMA, EOF);
+                    continue;
+                }
+                break;
+            }
+            hasParams = true;
+        }
+        return exit(consumeIf(R_PAREN), false);
+    }
+
+    private boolean fn_decl_arg() {
+        enter(NodeType.FN_DECL_ARG);
+        if (consumeIf(DOT_DOT_DOT)) {
+            // BindingRestElement → BindingIdentifier | BindingPattern (`...[a, b]`)
+            if (!(consumeIdentifier() || lit_array() || lit_object())) {
+                error(IDENT, L_BRACKET, L_CURLY);
+            }
+            if (!peekIf(R_PAREN)) {
+                error(R_PAREN);
+            }
+            return exit();
+        }
+        boolean result = consumeIdentifier() || lit_array() || lit_object();
+        if (result && consumeIf(EQ)) {
+            expr(-1, true);
+        }
+        result = result && (consumeIf(COMMA) || peekIf(R_PAREN));
+        return exit(result, false);
+    }
+
+    private void fn_call_args() {
+        enter(NodeType.FN_CALL_ARGS);
+        while (true) {
+            if (peekIf(R_PAREN) || peekIf(EOF)) {
+                break;
+            }
+            if (!fn_call_arg()) {
+                if (errorRecoveryEnabled) {
+                    error("invalid function argument");
+                    recoverTo(R_PAREN, COMMA, EOF);
+                    continue;
+                }
+                break;
+            }
+        }
+        exit();
+    }
+
+    private boolean fn_call_arg() {
+        enter(NodeType.FN_CALL_ARG);
+        consumeIf(DOT_DOT_DOT);
+        boolean result = expr(-1, false);
+        result = result && (consumeIf(COMMA) || peekIf(R_PAREN));
+        return exit(result, false);
+    }
+
+    private boolean new_expr() {
+        if (!enter(NodeType.NEW_EXPR, NEW)) {
+            return false;
+        }
+        expr(13, true);
+        return exit();
+    }
+
+    // `super` primary — yields a bare SUPER_EXPR. The trailing `(args)`
+    // (super-call) or `.x` / `[expr]` (super-property) is chained on top by
+    // expr_rhs, producing FN_CALL_EXPR / REF_DOT_EXPR / REF_BRACKET_EXPR with
+    // SUPER_EXPR as the base — the interpreter recognizes that base for the
+    // home-object dispatch.
+    private boolean super_expr() {
+        if (!enter(NodeType.SUPER_EXPR, SUPER)) {
+            return false;
+        }
+        return exit();
+    }
+
+    // Tokens that can begin a (non-computed) class member name. `get`/`set`/
+    // `static`/`constructor` all lex as IDENT and are disambiguated in
+    // class_element by whether another key token follows.
+    private static final EnumSet<TokenType> T_CLASS_KEY_NAME =
+            EnumSet.of(IDENT, S_STRING, D_STRING, NUMBER, PRIVATE_NAME);
+
+    // ES6 class declaration / expression. Phase 1: constructor + methods +
+    // static methods + get/set accessors + computed keys. No `extends` / `super`
+    // / fields yet (those parse-fail and are skip-listed). The CLASS token and
+    // optional name (IDENT) become the leading children; member definitions
+    // follow as CLASS_METHOD nodes; brace/semicolon tokens are interleaved and
+    // ignored at eval time.
+    private boolean class_expr() {
+        if (!enter(NodeType.CLASS_EXPR, CLASS)) {
+            return false;
+        }
+        consumeIdentifier(); // optional class name
+        if (consumeIf(EXTENDS)) { // heritage: `extends <LeftHandSideExpression>`
+            expr(13, true); // priority 13 = LHS level (same as `new` operand)
+        }
+        if (!consumeIf(L_CURLY)) {
+            error(L_CURLY);
+            return exit(false, false);
+        }
+        while (true) {
+            if (peekIf(R_CURLY) || peekIf(EOF)) {
+                break;
+            }
+            if (consumeIf(SEMI)) { // empty class element — allowed and ignored
+                continue;
+            }
+            if (!class_element()) {
+                if (errorRecoveryEnabled) {
+                    error("invalid class element");
+                    recoverTo(R_CURLY, SEMI, EOF);
+                    continue;
+                }
+                return exit(false, false);
+            }
+        }
+        return exit(consumeIf(R_CURLY), true);
+    }
+
+    // One class member (CLASS_METHOD node used for methods AND fields):
+    // [modifier-tokens...] <key> ( FN_EXPR | field-tail ). A leading
+    // `static`/`get`/`set` IDENT is a modifier only when another key token
+    // follows; otherwise it is the member name itself. The key is either a
+    // single name token or a computed `[expr]` (L_BRACKET, EXPR, R_BRACKET).
+    // A method body is a synthetic FN_EXPR (FN_DECL_ARGS + BLOCK), matching the
+    // object-literal shorthand-method shape so evalFnExpr handles it directly.
+    // A field has no FN_EXPR — an optional `= EXPR` initializer then ASI; eval
+    // distinguishes the two by the presence of the trailing FN_EXPR.
+    private boolean class_element() {
+        // ES2022 `static { ... }` — the only class element that is not a key +
+        // value. Two-token lookahead because `static` is a contextual keyword:
+        // `static = 1` and `static() {}` are still a field and a method.
+        if (peekIf(IDENT) && isIdentText(peekToken(), "static") && peekAhead(1).type == L_CURLY) {
+            return class_static_block();
+        }
+        enter(NodeType.CLASS_METHOD);
+        boolean async = false;
+        boolean generator = false;
+        while (true) {
+            // `*name() {}` / `static *name() {}` — the star is a modifier, the
+            // real key follows. `async *name()` is rejected below at the FN_EXPR.
+            if (!generator && consumeIf(STAR)) {
+                generator = true;
+                continue;
+            }
+            if (consumeIf(L_BRACKET)) { // computed key [expr] — always the final key
+                expr(-1, true);
+                if (!consumeIf(R_BRACKET)) {
+                    error(R_BRACKET);
+                    return exit(false, false);
+                }
+                break;
+            }
+            if (!peekAnyOf(T_CLASS_KEY_NAME)) {
+                error("class member name");
+                return exit(false, false);
+            }
+            consumeNext();
+            if (lastConsumed() == PRIVATE_NAME) {
+                sawPrivateName = true;
+            }
+            if (peekIf(L_PAREN)) {
+                break; // the just-consumed token is the method name (the key)
+            }
+            if ((lastConsumedIs("static") || lastConsumedIs("get") || lastConsumedIs("set"))
+                    && (peekAnyOf(T_CLASS_KEY_NAME) || peekIf(L_BRACKET) || peekIf(STAR))) {
+                continue; // it was a modifier — loop to consume the real key
+            }
+            // ES2017 `async name() {}` / `static async name() {}`. Modifier only when a
+            // key follows on the same line: `async` alone on its line stays a field name,
+            // per the spec's no-LineTerminator restriction. Until this existed the async
+            // was silently dropped — the member parsed as a field named `async` plus an
+            // ordinary (synchronous) method.
+            if (lastConsumedIs("async") && (peekAnyOf(T_CLASS_KEY_NAME) || peekIf(L_BRACKET) || peekIf(STAR))
+                    && !lineTerminatorFollows(markerNode().getLast().token)) {
+                async = true;
+                continue;
+            }
+            // Not followed by `(` and not a modifier — a class field (`x` / `x = expr`).
+            return class_field_tail();
+        }
+        if (!peekIf(L_PAREN)) {
+            return class_field_tail(); // computed-key field: `[k]` / `[k] = expr`
+        }
+        enter(NodeType.FN_EXPR);
+        markerNode().async = async;
+        if (generator) {
+            if (async) {
+                error("async generators are not supported");
+            }
+            markerNode().generator = true;
+        }
+        fn_decl_args();
+        fn_body(async, generator);
+        exit();
+        return exit();
+    }
+
+    // ES2022 static initialization block — the `static` token plus a BLOCK child.
+    // The body runs at class-definition time, interleaved with the static field
+    // initializers in source order (see Interpreter.runStaticBlock).
+    private boolean class_static_block() {
+        enter(NodeType.CLASS_STATIC_BLOCK);
+        consumeNext(); // `static`
+        return exit(block(true), false);
+    }
+
+    // Public class field tail: optional `= AssignmentExpression`, ended by `;`
+    // or ASI. No FN_EXPR child — that's how eval tells a field from a method.
+    private boolean class_field_tail() {
+        if (consumeIf(EQ)) {
+            expr(-1, true);
+        }
+        consumeIf(SEMI); // optional; ASI otherwise (next element / `}` / newline)
+        return exit();
+    }
+
+    private boolean typeof_expr() {
+        if (!enter(NodeType.TYPEOF_EXPR, TYPEOF)) {
+            return false;
+        }
+        expr(13, true);
+        return exit();
+    }
+
+    // A bare `#x` is a primary only to serve the `#x in obj` brand check; every
+    // other position is rejected by the early-error walk.
+    private boolean private_name_expr() {
+        if (!enter(NodeType.PRIVATE_NAME_EXPR, PRIVATE_NAME)) {
+            return false;
+        }
+        sawPrivateName = true;
+        return exit();
+    }
+
+    private boolean ref_expr() {
+        if (!enter(NodeType.REF_EXPR, IDENT)) {
+            return false;
+        }
+        checkIdentifier(lastConsumedToken());
+        lineTerminatorBeforeArrowIsAnError();
+        if (enter(NodeType.FN_ARROW_EXPR, EQ_GT)) {
+            if (fn_body_or_expr(false)) {
+                exit(Shift.LEFT); // change the node type
+            } else {
+                error(NodeType.BLOCK, NodeType.EXPR);
+            }
+        }
+        return exit();
+    }
+
+    private boolean lit_expr() {
+        // Fast lookahead: skip if current token can't start a literal
+        if (!peekAnyOf(T_LIT_EXPR_START)) {
+            return false;
+        }
+        enter(NodeType.LIT_EXPR);
+        boolean result = anyOf(T_LIT_EXPR)
+                || lit_object()
+                || lit_array()
+                || lit_template()
+                || lit_regex();
+        return exit(result, false);
+    }
+
+    private boolean lit_template() {
+        if (!enter(NodeType.LIT_TEMPLATE, BACKTICK)) {
+            return false;
+        }
+        while (true) {
+            if (peek() == EOF) { // unbalanced backticks
+                error(BACKTICK);
+                break;
+            }
+            if (consumeIf(BACKTICK)) {
+                break;
+            }
+            if (!consumeIf(T_STRING)) {
+                if (consumeIf(DOLLAR_L_CURLY)) {
+                    expr(-1, false);
+                    consumeSoft(R_CURLY);
+                }
+            }
+        }
+        return exit();
+    }
+
+    private boolean unary_expr() {
+        if (!enter(NodeType.UNARY_EXPR, T_UNARY_EXPR)) {
+            return false;
+        }
+        expr(13, true);
+        return exit();
+    }
+
+    private boolean math_pre_expr() {
+        if (!enter(NodeType.MATH_PRE_EXPR, T_MATH_PRE_EXPR)) {
+            return false;
+        }
+        if (!(expr(13, false) || consumeIf(NUMBER) || consumeIf(BIGINT))) {
+            error(NodeType.EXPR);
+        }
+        return exit();
+    }
+
+    private boolean lit_object() {
+        if (!enter(NodeType.LIT_OBJECT, L_CURLY)) {
+            return false;
+        }
+        // Same NoIn reset as paren_expr — `for (var x = {k: a in b}; ...)` and
+        // `for ([x = a in b] of ...)` should treat the nested `in` as relational.
+        boolean prevNoIn = noIn;
+        noIn = false;
+        try {
+            boolean hasElements = false;
+            while (true) {
+                if (peekIf(R_CURLY) || peekIf(EOF)) {
+                    break;
+                }
+                if (!object_elem()) {
+                    if (errorRecoveryEnabled && hasElements) {
+                        // Only error/recover if we've parsed at least one element
+                        // If first element fails, this might be a block, not an object
+                        error("invalid object element");
+                        recoverTo(R_CURLY, COMMA, EOF);
+                        continue;
+                    }
+                    break;
+                }
+                hasElements = true;
+            }
+            boolean result = consumeIf(R_CURLY);
+            return exit(result, false);
+        } finally {
+            noIn = prevNoIn;
+        }
+    }
+
+    private boolean object_elem() {
+        if (!enter(NodeType.OBJECT_ELEM, T_OBJECT_ELEM)) {
+            return false;
+        }
+        if (!sawProtoKey && isProtoKeyText(lastConsumed(), lastConsumedText())) {
+            sawProtoKey = true; // coarse gate; isProtoSetter decides the exact form later
+        }
+        // ES6 generator shorthand method: `*name(args) { ... }`. The STAR was
+        // consumed by enter; the property name follows.
+        if (lastConsumed() == STAR) {
+            return object_method_elem(false, true);
+        }
+        // ES6 getter/setter: `get name() { ... }` or `set name(v) { ... }`.
+        // `get`/`set` was consumed by enter as an IDENT. It is an accessor keyword
+        // only when followed by a property-name token; otherwise fall through so
+        // {get}, {get: 1}, {get() {}} etc. continue to work as regular entries.
+        if ((lastConsumedIs("get") || lastConsumedIs("set"))
+                && peekAnyOf(T_ACCESSOR_KEY_START)) {
+            return object_method_elem(false);
+        }
+        // ES2017 async method: `async name(args) { ... }`. Same modifier rule as get/set —
+        // `async` counts as one only when a property name follows on the same line, so
+        // {async: 1}, {async} and {async() {}} (a method actually named `async`) are
+        // untouched. The async-ness is recorded on the synthetic FN_EXPR.
+        if (lastConsumedIs("async")
+                && peekAnyOf(T_ACCESSOR_KEY_START)
+                && !lineTerminatorFollows(markerNode().getLast().token)) {
+            return object_method_elem(true);
+        }
+        // ES6 computed key: `[expr]: value` or `[expr](args) { body }`.
+        // The L_BRACKET was consumed by enter; parse the key expression and R_BRACKET here,
+        // then fall through to the colon/shorthand-method branches below.
+        if (lastConsumed() == L_BRACKET) {
+            expr(-1, true);
+            if (!consumeIf(R_BRACKET)) {
+                error(R_BRACKET);
+                return exit(false, false);
+            }
+        }
+        if (consumeIf(EQ)) { // var / assigment destructuring
+            expr(-1, true);
+        }
+        // ES6 shorthand method: `foo(args) { body }` inside an object literal.
+        // Detected after the key token is consumed, before the comma/brace
+        // shortcut for {foo, bar} shorthand properties.
+        if (peekIf(L_PAREN)) {
+            enter(NodeType.FN_EXPR);
+            fn_decl_args();
+            fn_body(false);
+            exit();
+            if (!(consumeIf(COMMA) || peekIf(R_CURLY))) {
+                error(COMMA, R_CURLY);
+            }
+            return exit();
+        }
+        if (consumeIf(COMMA) || peekIf(R_CURLY)) { // es6 enhanced object literals
+            Token key = markerNode().getFirst().token;
+            if (key != null && key.type == IDENT) {
+                checkIdentifier(key); // shorthand: the key is also an IdentifierReference
+            }
+            return exit();
+        }
+        boolean spread = false;
+        if (!consumeIf(COLON)) {
+            if (lastConsumed() == DOT_DOT_DOT) { // spread operator: {...AssignmentExpression}
+                spread = true;
+                expr(-1, true); // any expression — {...fn()}, {...obj.m()}, {...{x:1}}, not just a bare ident
+            } else {
+                return exit(false, false); // could be block
+            }
+        }
+        if (!spread) {
+            expr(-1, true);
+        }
+        if (!(consumeIf(COMMA) || peekIf(R_CURLY))) {
+            error(COMMA, R_CURLY);
+        }
+        return exit();
+    }
+
+    /** The tail of an object-literal member that carries a leading modifier token
+     *  ({@code get} / {@code set} / {@code async}): the property name — a single name token
+     *  or a computed {@code [expr]} — then the method body as a synthetic {@code FN_EXPR},
+     *  then the element separator. The OBJECT_ELEM node is on the stack with the modifier
+     *  token already consumed. */
+    private boolean object_method_elem(boolean async) {
+        return object_method_elem(async, false);
+    }
+
+    private boolean object_method_elem(boolean async, boolean generator) {
+        if (consumeIf(L_BRACKET)) {
+            expr(-1, true);
+            if (!consumeIf(R_BRACKET)) {
+                error(R_BRACKET);
+                return exit(false, false);
+            }
+        } else if (!anyOf(T_ACCESSOR_KEY_START)) {
+            error(IDENT, S_STRING);
+            return exit(false, false);
+        }
+        enter(NodeType.FN_EXPR);
+        markerNode().async = async;
+        markerNode().generator = generator;
+        fn_decl_args();
+        fn_body(async, generator);
+        exit();
+        if (!(consumeIf(COMMA) || peekIf(R_CURLY))) {
+            error(COMMA, R_CURLY);
+        }
+        return exit();
+    }
+
+    private boolean lit_array() {
+        if (!enter(NodeType.LIT_ARRAY, L_BRACKET)) {
+            return false;
+        }
+        boolean prevNoIn = noIn;
+        noIn = false;
+        try {
+            while (true) {
+                if (peekIf(R_BRACKET) || peekIf(EOF)) {
+                    break;
+                }
+                if (!array_elem()) {
+                    if (errorRecoveryEnabled) {
+                        error("invalid array element");
+                        recoverTo(R_BRACKET, COMMA, EOF);
+                        continue;
+                    }
+                    break;
+                }
+            }
+            consumeSoft(R_BRACKET);
+            return exit();
+        } finally {
+            noIn = prevNoIn;
+        }
+    }
+
+    private boolean array_elem() {
+        enter(NodeType.ARRAY_ELEM);
+        consumeIf(DOT_DOT_DOT); // spread operator
+        expr(-1, false); // optional for sparse array
+        if (!(consumeIf(COMMA) || peekIf(R_BRACKET) || peekIf(EOF))) {
+            error(COMMA, R_BRACKET);
+        }
+        return exit();
+    }
+
+    private boolean lit_regex() {
+        if (!enter(NodeType.LIT_REGEX, REGEX)) {
+            return false;
+        }
+        return exit();
+    }
+
+    private boolean paren_expr() {
+        if (!enter(NodeType.PAREN_EXPR, L_PAREN)) {
+            return false;
+        }
+        // Parens reset the no-in restriction — `for (var x = (a in b); ...)`
+        // works as a relational `in` because the parens reopen IN_EXPR.
+        boolean prevNoIn = noIn;
+        noIn = false;
+        try {
+            expr_list(true);
+        } finally {
+            noIn = prevNoIn;
+        }
+        consumeSoft(R_PAREN);
+        return exit();
+    }
+
+}

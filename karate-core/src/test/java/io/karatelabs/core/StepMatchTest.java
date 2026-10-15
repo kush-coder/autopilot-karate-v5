@@ -1,0 +1,1254 @@
+/*
+ * The MIT License
+ *
+ * Copyright 2025 Karate Labs Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package io.karatelabs.core;
+
+import org.junit.jupiter.api.Test;
+
+import static io.karatelabs.core.TestUtils.*;
+
+/**
+ * Tests for match keyword.
+ */
+class StepMatchTest {
+
+    // ========== Basic Equality ==========
+
+    @Test
+    void testMatchEquals() {
+        ScenarioRuntime sr = run("""
+            * def foo = { name: 'bar' }
+            * match foo == { name: 'bar' }
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchEqualsFailure() {
+        ScenarioRuntime sr = run("""
+            * def foo = { name: 'bar' }
+            * match foo == { name: 'baz' }
+            """);
+        assertFailed(sr);
+    }
+
+    @Test
+    void testMatchNotEquals() {
+        ScenarioRuntime sr = run("""
+            * def foo = { name: 'bar' }
+            * match foo != { name: 'baz' }
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchNotEqualsFailure() {
+        ScenarioRuntime sr = run("""
+            * def foo = { name: 'bar' }
+            * match foo != { name: 'bar' }
+            """);
+        assertFailed(sr);
+    }
+
+    // ========== Match with Variable Reference ==========
+
+    @Test
+    void testMatchWithVariableReference() {
+        ScenarioRuntime sr = run("""
+            * def expected = { name: 'test' }
+            * def actual = { name: 'test' }
+            * match actual == expected
+            """);
+        assertPassed(sr);
+    }
+
+    // ========== Match Primitives ==========
+
+    @Test
+    void testMatchNumber() {
+        ScenarioRuntime sr = run("""
+            * def x = 42
+            * match x == 42
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchString() {
+        ScenarioRuntime sr = run("""
+            * def s = 'hello'
+            * match s == 'hello'
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchBoolean() {
+        ScenarioRuntime sr = run("""
+            * def b = true
+            * match b == true
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchNull() {
+        ScenarioRuntime sr = run("""
+            * def n = null
+            * match n == null
+            """);
+        assertPassed(sr);
+    }
+
+    // ========== Match with Path ==========
+
+    @Test
+    void testMatchWithPath() {
+        ScenarioRuntime sr = run("""
+            * def data = { user: { name: 'john' } }
+            * match data.user.name == 'john'
+            """);
+        assertPassed(sr);
+    }
+
+    // ========== Match Arrays ==========
+
+    @Test
+    void testMatchArray() {
+        ScenarioRuntime sr = run("""
+            * def arr = [1, 2, 3]
+            * match arr == [1, 2, 3]
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchNestedJson() {
+        ScenarioRuntime sr = run("""
+            * def data = { items: [{ id: 1 }, { id: 2 }] }
+            * match data == { items: [{ id: 1 }, { id: 2 }] }
+            """);
+        assertPassed(sr);
+    }
+
+    // ========== Match with Expressions ==========
+
+    @Test
+    void testMatchWithExpression() {
+        ScenarioRuntime sr = run("""
+            * def x = 5
+            * def y = 10
+            * match x + y == 15
+            """);
+        assertPassed(sr);
+    }
+
+    // ========== Contains ==========
+
+    @Test
+    void testMatchContains() {
+        ScenarioRuntime sr = run("""
+            * def foo = { name: 'bar', age: 30 }
+            * match foo contains { name: 'bar' }
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchContainsFailure() {
+        ScenarioRuntime sr = run("""
+            * def foo = { name: 'bar' }
+            * match foo contains { name: 'baz' }
+            """);
+        assertFailed(sr);
+    }
+
+    @Test
+    void testMatchNotContains() {
+        ScenarioRuntime sr = run("""
+            * def foo = { name: 'bar' }
+            * match foo !contains { name: 'baz' }
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchNotContainsFailure() {
+        ScenarioRuntime sr = run("""
+            * def foo = { name: 'bar' }
+            * match foo !contains { name: 'bar' }
+            """);
+        assertFailed(sr);
+    }
+
+    @Test
+    void testMatchContainsArray() {
+        ScenarioRuntime sr = run("""
+            * def arr = [1, 2, 3]
+            * match arr contains 2
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchContainsOnly() {
+        ScenarioRuntime sr = run("""
+            * def arr = [1, 2, 3]
+            * match arr contains only [3, 2, 1]
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchLargeIntegerPrecision() {
+        // ids beyond 2^53 must not collapse onto the same double
+        ScenarioRuntime sr = run("""
+            * def response = { id: 9007199254740993 }
+            * match response == { id: 9007199254740992 }
+            """);
+        assertFailed(sr);
+    }
+
+    @Test
+    void testMatchLargeIntegerEqualPasses() {
+        ScenarioRuntime sr = run("""
+            * def response = { id: 9007199254740993 }
+            * match response == { id: 9007199254740993 }
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchContainsOnlyDeepMultiplicity() {
+        ScenarioRuntime sr = run("""
+            * def actual = [1, 1, 2]
+            * match actual contains only deep [1, 2, 2]
+            """);
+        assertFailed(sr);
+    }
+
+    @Test
+    void testMatchContainsOnlyDeepReorderedPasses() {
+        ScenarioRuntime sr = run("""
+            * def actual = [{ a: 1 }, { a: 1 }, { a: 2 }]
+            * match actual contains only deep [{ a: 2 }, { a: 1 }, { a: 1 }]
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchContainsAny() {
+        ScenarioRuntime sr = run("""
+            * def arr = [1, 2, 3]
+            * match arr contains any [5, 2, 7]
+            """);
+        assertPassed(sr);
+    }
+
+    // ========== Match Each ==========
+
+    @Test
+    void testMatchEach() {
+        ScenarioRuntime sr = run("""
+            * def arr = [{ id: 1 }, { id: 2 }]
+            * match each arr contains { id: '#number' }
+            """);
+        assertPassed(sr);
+    }
+
+    // ========== Within ==========
+
+    @Test
+    void testMatchWithinArray() {
+        ScenarioRuntime sr = run("""
+            * def subset = [1, 2]
+            * def superset = [1, 2, 3, 4, 5]
+            * match subset within superset
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchWithinArrayFailure() {
+        ScenarioRuntime sr = run("""
+            * def subset = [1, 6]
+            * def superset = [1, 2, 3, 4, 5]
+            * match subset within superset
+            """);
+        assertFailed(sr);
+    }
+
+    @Test
+    void testMatchWithinMap() {
+        ScenarioRuntime sr = run("""
+            * def subset = { name: 'bar' }
+            * def superset = { name: 'bar', age: 30, city: 'NYC' }
+            * match subset within superset
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchWithinMapFailure() {
+        ScenarioRuntime sr = run("""
+            * def subset = { name: 'baz' }
+            * def superset = { name: 'bar', age: 30 }
+            * match subset within superset
+            """);
+        assertFailed(sr);
+    }
+
+    @Test
+    void testMatchNotWithin() {
+        ScenarioRuntime sr = run("""
+            * def subset = [7, 8]
+            * def superset = [1, 2, 3]
+            * match subset !within superset
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchNotWithinFailure() {
+        ScenarioRuntime sr = run("""
+            * def subset = [1, 2]
+            * def superset = [1, 2, 3]
+            * match subset !within superset
+            """);
+        assertFailed(sr);
+    }
+
+    // ========== Match Each Empty Allowed ==========
+
+    @Test
+    void testMatchEachEmptyArrayFails() {
+        ScenarioRuntime sr = run("""
+            * def items = []
+            * match each items == '#string'
+            """);
+        assertFailed(sr);
+    }
+
+    @Test
+    void testMatchEachEmptyArrayPassesWithConfig() {
+        ScenarioRuntime sr = run("""
+            * configure matchEachEmptyAllowed = true
+            * def items = []
+            * match each items == '#string'
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchEachEmptyAllowedWithSchema() {
+        ScenarioRuntime sr = run("""
+            * configure matchEachEmptyAllowed = true
+            * def schema = { id: '#number' }
+            * def response = []
+            * match each response == schema
+            """);
+        assertPassed(sr);
+    }
+
+    // Schema-like pattern tests from V1 compatibility
+
+    @Test
+    void testMatchContainsPartialMacro() {
+        // #(^part) - array contains element that contains part
+        ScenarioRuntime sr = run("""
+            * def actual = [{ a: 1, b: 'x' }, { a: 2, b: 'y' }]
+            * def part = { a: 1 }
+            * match actual contains '#(^part)'
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchContainsAnyMacro() {
+        // #(^*mix) - array contains element that contains any of mix
+        ScenarioRuntime sr = run("""
+            * def actual = [{ a: 1, b: 'x' }, { a: 2, b: 'y' }]
+            * def mix = { b: 'y', c: true }
+            * match actual contains '#(^*mix)'
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchContainsDeepMacro() {
+        // #(^+part) - array contains element that contains deep part
+        ScenarioRuntime sr = run("""
+            * def actual = [{ a: 1, b: 'x' }, { a: 2, b: 'y' }]
+            * def part = { a: 1 }
+            * match actual contains '#(^+part)'
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchNotContainsPartialMacro() {
+        // #(!^part) is the negation of #(^part) - when an array element is a superset
+        // of part, the positive form passes so the negation has to fail
+        ScenarioRuntime sr = run("""
+            * def part = { a: 1 }
+            * def actual = [{ a: 1, b: 2 }, { c: 9 }]
+            * match actual contains '#(^part)'
+            """);
+        assertPassed(sr);
+        sr = run("""
+            * def part = { a: 1 }
+            * def actual = [{ a: 1, b: 2 }, { c: 9 }]
+            * match actual contains '#(!^part)'
+            """);
+        assertFailed(sr);
+    }
+
+    @Test
+    void testMatchNotContainsPartialMacroSingleElement() {
+        // single element removes any exists / for-all ambiguity, the two are strict negations
+        ScenarioRuntime sr = run("""
+            * def part = { a: 1 }
+            * def actual = [{ a: 1, b: 2 }]
+            * match actual contains '#(!^part)'
+            """);
+        assertFailed(sr);
+    }
+
+    @Test
+    void testMatchNotContainsPartialMacroPassesWhenNoElementContains() {
+        // control - no element contains part, so the negation holds
+        ScenarioRuntime sr = run("""
+            * def part = { a: 99 }
+            * def actual = [{ a: 1, b: 2 }, { c: 9 }]
+            * match actual contains '#(!^part)'
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchNotContainsPartialMacroOnMap() {
+        // control - a plain map actual (not a list) already negates correctly
+        ScenarioRuntime sr = run("""
+            * def part = { a: 1 }
+            * def actual = { a: 1, b: 2 }
+            * match actual == '#(!^part)'
+            """);
+        assertFailed(sr);
+    }
+
+    @Test
+    void testMatchContainsOnlyMacro() {
+        // #(^^shuffled) - array contains only shuffled elements
+        ScenarioRuntime sr = run("""
+            * def actual = [{ a: 1, b: 'x' }, { a: 2, b: 'y' }]
+            * def shuffled = [{ a: 2, b: 'y' }, { b: 'x', a: 1 }]
+            * match actual == '#(^^shuffled)'
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchSchemaValidation() {
+        // Full schema validation like schema-like.feature
+        ScenarioRuntime sr = run("""
+            * def actual = [{ a: 1, b: 'x' }, { a: 2, b: 'y' }]
+            * def schema = { a: '#number', b: '#string' }
+            * def partSchema = { a: '#number' }
+            * match actual[0] == schema
+            * match actual[0] == '#(schema)'
+            * match actual[0] contains partSchema
+            * match actual[0] == '#(^partSchema)'
+            * match each actual == schema
+            * match actual == '#[] schema'
+            * match each actual contains partSchema
+            * match actual == '#[] ^partSchema'
+            """);
+        assertPassed(sr);
+    }
+
+    // ========== JsonPath Deep Scan (..) ==========
+
+    @Test
+    void testMatchDeepScanSimple() {
+        // var..property deep-scan pattern (V1 compatibility)
+        ScenarioRuntime sr = run("""
+            * def data = { user: { name: 'john' } }
+            * match data..name contains 'john'
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchDeepScanNested() {
+        // Deep scan finds values at any depth
+        ScenarioRuntime sr = run("""
+            * def data = { level1: { level2: { username: 'alice' } } }
+            * match data..username contains 'alice'
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchDeepScanMultipleResults() {
+        // Deep scan returns all matching values
+        ScenarioRuntime sr = run("""
+            * def data = { users: [{ name: 'alice' }, { name: 'bob' }] }
+            * match data..name == ['alice', 'bob']
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchDeepScanContains() {
+        // Deep scan with contains assertion
+        ScenarioRuntime sr = run("""
+            * def response = { data: { user: { username: 'Bret' } } }
+            * match response..username contains 'Bret'
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchDeepScanWithArrayWildcard() {
+        // deep scan combined with [*] wildcard
+        ScenarioRuntime sr = run("""
+            * def response = { data: { items: [{ type: 'admin' }, { type: 'user' }] } }
+            * match response..items[*].type contains 'admin'
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchEachDeepScanWithArrayWildcard() {
+        // match each with deep scan + [*] wildcard
+        ScenarioRuntime sr = run("""
+            * def response = { data: { items: [{ type: 'admin' }, { type: 'user' }, { type: 'user' }] } }
+            * match each response..items[*].type == '#string'
+            """);
+        assertPassed(sr);
+    }
+
+    // ========== Comment as Assertion Label ==========
+
+    @Test
+    void testMatchFailureIncludesCommentLabel() {
+        // Comment on the line before a match should appear in failure message
+        ScenarioRuntime sr = run("""
+            * def foo = { name: 'bar' }
+            # user name should be baz
+            * match foo.name == 'baz'
+            """);
+        assertFailedWith(sr, "user name should be baz");
+    }
+
+    @Test
+    void testMatchFailureWithMultipleComments() {
+        // Only the last comment (closest to step) should be used as label
+        ScenarioRuntime sr = run("""
+            * def foo = { status: 'pending' }
+            # first comment
+            # status must be active
+            * match foo.status == 'active'
+            """);
+        assertFailedWith(sr, "status must be active");
+    }
+
+    @Test
+    void testMatchPassWithCommentNoEffect() {
+        // Comments should not affect passing matches
+        ScenarioRuntime sr = run("""
+            * def foo = { name: 'bar' }
+            # this is a label
+            * match foo.name == 'bar'
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchFailureWithoutComment() {
+        // Without comment, error message should still work normally
+        ScenarioRuntime sr = run("""
+            * def foo = { name: 'bar' }
+            * match foo.name == 'baz'
+            """);
+        assertFailed(sr);
+        // Should contain the match error but not any label prefix
+        assertFailedWith(sr, "not equal");
+    }
+
+    // ========== Non-JSON field access ==========
+
+    @Test
+    void testNonJsonResponseFieldMatchShouldFail() {
+        // Accessing fields on a non-JSON (string) value should fail, not silently pass
+        ScenarioRuntime sr = run("""
+            * def response = ''
+            * match response.id == '#null'
+            """);
+        assertFailed(sr);
+    }
+
+    @Test
+    void testNonJsonResponseFuzzyMatchShouldFail() {
+        // #present on a field of a non-JSON value should fail
+        ScenarioRuntime sr = run("""
+            * def response = ''
+            * match response.time == '#present'
+            """);
+        assertFailed(sr);
+    }
+
+    @Test
+    void testJsonObjectFieldMatchWorksCorrectly() {
+        // JSON object field access should work normally (control case)
+        ScenarioRuntime sr = run("""
+            * def response = { id: 42 }
+            * match response.id == 42
+            """);
+        assertPassed(sr);
+    }
+
+    // ========== Real null vs missing key ==========
+
+    @Test
+    void testMatchRealNullField() {
+        // When a JSON property exists with the value null, `match x.y == null`
+        // should pass — the path exists, the value is null.
+        ScenarioRuntime sr = run("""
+            * def response = { status: 'ERROR_CREATING', user: null, settings: null }
+            * match response.status == 'ERROR_CREATING'
+            * match response.user == null
+            * match response.settings == null
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchMissingFieldStillNotPresent() {
+        // The complement: a key that genuinely doesn't exist must still surface
+        // as #notpresent so `== '#notpresent'` continues to pass and `== null` fails.
+        ScenarioRuntime sr = run("""
+            * def response = { foo: 'bar' }
+            * match response.missing == '#notpresent'
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchMissingFieldNotEqualNull() {
+        ScenarioRuntime sr = run("""
+            * def response = { foo: 'bar' }
+            * match response.missing == null
+            """);
+        assertFailed(sr);
+    }
+
+    @Test
+    void testMatchDollarMissingFieldIsNotPresent() {
+        // $ JSONPath on a missing key must surface as #notpresent — matching the
+        // dot-notation path above — instead of throwing "No results for path".
+        ScenarioRuntime sr = run("""
+            * def response = { method: 'POST' }
+            * match $.method == 'POST'
+            * match $.errors == '#notpresent'
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchDollarVarMissingFieldIsNotPresent() {
+        // Same, but via $varname.path JSONPath on a named variable.
+        ScenarioRuntime sr = run("""
+            * def foo = { name: 'bar' }
+            * match $foo.missing == '#notpresent'
+            """);
+        assertPassed(sr);
+    }
+
+    // ========== #notpresent through an undefined/null intermediate path ==========
+    // A dot-notation chain like `a.b.c.d` is JS-evaluated. When a leaf is missing
+    // the result is null and the key-presence check degrades to #notpresent. But
+    // when an INTERMEDIATE segment is undefined or null, the JS eval throws a
+    // TypeError (property access on undefined/null) before that check — which used
+    // to surface as a match failure. v1 resolved the whole chain to #notpresent.
+
+    @Test
+    void testMatchNotPresentLeafMissing() {
+        // Control: leaf field missing — already worked.
+        ScenarioRuntime sr = run("""
+            * def response = { data: { parent: { name: 'test' } } }
+            * match response.data.parent.missing == '#notpresent'
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchNotPresentThroughUndefinedIntermediate() {
+        // 'missingChild' does not exist, so '.success' accesses a prop on undefined.
+        ScenarioRuntime sr = run("""
+            * def response = { data: { parent: { existingChild: null } } }
+            * match response.data.parent.missingChild.success == '#notpresent'
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchNotPresentThroughNullIntermediate() {
+        // 'child' exists but is null; accessing '.success' on null.
+        ScenarioRuntime sr = run("""
+            * def response = { data: { parent: { child: null } } }
+            * match response.data.parent.child.success == '#notpresent'
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchNotPresentThroughMultipleMissingIntermediates() {
+        // 'deeply' doesn't exist, so '.nested.field' is chained on undefined.
+        ScenarioRuntime sr = run("""
+            * def response = { data: { name: 'test' } }
+            * match response.data.deeply.nested.field == '#notpresent'
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchNotPresentNotShadowedByVariableInScope() {
+        // A variable in scope with the same name as the trailing path segment must NOT be
+        // resolved when an intermediate is null. `nullNode.id` degrades to #notpresent even
+        // though `id` is defined — so matching it against the value of `id` must FAIL.
+        // (Scenario-Outline Examples columns bind such variables; see OutlineTest.)
+        ScenarioRuntime sr = run("""
+            * def response = { data: { a: { nullNode: null } } }
+            * def id = 'ABC-123'
+            * match response.data.a.nullNode.id == 'ABC-123'
+            """);
+        assertFailed(sr);
+    }
+
+    @Test
+    void testMatchNotPresentThroughNullIntermediateWithShadowVarPasses() {
+        // The complement: the same path correctly matches #notpresent even with `id` in scope.
+        ScenarioRuntime sr = run("""
+            * def response = { data: { a: { nullNode: null } } }
+            * def id = 'ABC-123'
+            * match response.data.a.nullNode.id == '#notpresent'
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchUndefinedRootStillErrors() {
+        // Boundary: degrading to #notpresent applies only when the chain's ROOT
+        // variable is defined. A genuinely undefined root (e.g. a typo'd variable)
+        // must still surface as an error, not silently pass as #notpresent.
+        ScenarioRuntime sr = run("""
+            * def response = { data: { name: 'test' } }
+            * match respose.data.name == '#notpresent'
+            """);
+        assertFailed(sr);
+    }
+
+    // ========== Embedded variables on the RHS of match ==========
+    // V2 evaluates the RHS as JS, so the v1 trick of writing { id: #(id) } is a
+    // syntax error. The same alternatives that work for `def` also work here.
+
+    @Test
+    void testMatchRhsWithQuotedEmbeddedExpression() {
+        // Quoted embedded expression — closest to v1, still works
+        ScenarioRuntime sr = run("""
+            * def id = 123
+            * def payload = { id: 123, name: 'sample' }
+            * match payload == { id: '#(id)', name: 'sample' }
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchRhsWithShorthandProperty() {
+        // ES6 shorthand — { id, name } expands to { id: id, name: name }
+        ScenarioRuntime sr = run("""
+            * def id = 123
+            * def name = 'sample'
+            * def payload = { id: 123, name: 'sample' }
+            * match payload == { id, name }
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchRhsExplicitVariableReferenceIsTreatedAsString() {
+        // GOTCHA: unlike `def`, the match RHS goes through Karate's relaxed JSON
+        // parser when it starts with `{`. A bare token `id` on the value side is
+        // treated as the string literal "id", not a variable reference.
+        // Use `'#(id)'`, ES6 shorthand `{ id }`, or wrap the whole RHS in parens
+        // to force JS evaluation: `({ id: id, ... })`
+        ScenarioRuntime sr = run("""
+            * def id = 123
+            * def payload = { id: 123, name: 'sample' }
+            * match payload == { id: id, name: 'sample' }
+            """);
+        assertFailed(sr);
+    }
+
+    @Test
+    void testMatchRhsWithJsParenWrappedExplicitReference() {
+        // Workaround for the gotcha above — wrap in () to force JS evaluation
+        ScenarioRuntime sr = run("""
+            * def id = 123
+            * def payload = { id: 123, name: 'sample' }
+            * match payload == ({ id: id, name: 'sample' })
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchRhsDocStringWithShorthandProperty() {
+        // Same shorthand inside a match doc-string
+        ScenarioRuntime sr = run("""
+            * def id = 123
+            * def name = 'sample'
+            * def payload = { id: 123, name: 'sample' }
+            * match payload ==
+            \"\"\"
+            { id, name }
+            \"\"\"
+            """);
+        assertPassed(sr);
+    }
+
+    // ========== Schema-as-template — deferred #(...) at match time ==========
+    // V1 parity: a `#(varName)` placeholder embedded in a JSON literal at `def`
+    // time is preserved when `varName` is undefined. The match engine resolves
+    // it later via Operation.macroEqualsExpected. See StepDataTypesTest for the
+    // def-time storage shape; tests here cover the match-time resolution.
+
+    @Test
+    void testMatchSchemaTemplateWithDeferredEmbeddedExpr() {
+        // Define schema with undefined `#(idCheck)`, then define the variable,
+        // then use the schema as a match RHS — placeholder resolves at match.
+        ScenarioRuntime sr = run("""
+            * def MySchema =
+            \"\"\"
+            {
+              id: '#(idCheck)',
+              name: '#string'
+            }
+            \"\"\"
+            * def idCheck = '#number'
+            * def actual = { id: 42, name: 'sample' }
+            * match actual == MySchema
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testMatchSchemaTemplateFailsCleanlyIfStillUndefinedAtMatchTime() {
+        // If the variable is STILL undefined when the schema is used in a match,
+        // the failure surfaces at match time (not at def time) with a meaningful
+        // error. This is the contract: defer the error, do not swallow it.
+        ScenarioRuntime sr = run("""
+            * def MySchema =
+            \"\"\"
+            {
+              id: '#(idCheck)',
+              name: '#string'
+            }
+            \"\"\"
+            * def actual = { id: 42, name: 'sample' }
+            * match actual == MySchema
+            """);
+        assertFailed(sr);
+    }
+
+    @Test
+    void testMatchSchemaTemplateAcrossCallBoundary() {
+        // Mirrors the reproduction shape: schema feature is loaded
+        // before the variable is defined in the caller. Here we simulate the
+        // call boundary by defining the schema first, then the variable, then
+        // matching — the placeholder must survive intervening steps.
+        ScenarioRuntime sr = run("""
+            * def MySchema =
+            \"\"\"
+            {
+              id: '#(idCheck)',
+              name: '#string'
+            }
+            \"\"\"
+            * def someOtherVar = 'unrelated'
+            * def yetAnother = 42
+            * def idCheck = '#number'
+            * def actual = { id: 7, name: 'x' }
+            * match actual == MySchema
+            """);
+        assertPassed(sr);
+    }
+
+    // ========== Array-marker + schema-reference shortcut ('#[] schema') ==========
+    // The documented v1 shortcut is the BARE reference: '#[] schema' — after the
+    // array marker comes a raw expression (variable, property path, function call)
+    // that the match engine evaluates to the per-element schema. The '#(schema)'
+    // embedded-expression wrapper is a redundant synonym for the bare form.
+    //
+    // v1 never inline-interpolated embedded expressions (only whole-value #(...) /
+    // ##(...) strings were processed), so a marker like '#[] ##(schema)' survived
+    // verbatim to the match engine. v2 added inline interpolation, which used to
+    // stringify the resolved schema into the marker and corrupt it (parse error).
+    // processEmbeddedString now leaves any '#'-leading marker intact, restoring the
+    // behavior and keeping the marker well-formed for the match engine.
+
+    @Test
+    void testArrayMarkerBareSchemaReference() {
+        // Canonical / recommended form.
+        ScenarioRuntime sr = run("""
+            * def itemSchema = { id: '#number', name: '#string' }
+            * def response = { items: [ { id: 1, name: 'a' }, { id: 2, name: 'b' } ] }
+            * match response == { items: '#[] itemSchema' }
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testArrayMarkerEmbeddedSchemaReferenceIsSynonymOfBare() {
+        // '#[] #(schema)' behaves identically to '#[] schema' — the #(...) adds
+        // nothing here. Pinned so the embedded form no longer throws a parse error.
+        ScenarioRuntime sr = run("""
+            * def itemSchema = { id: '#number', name: '#string' }
+            * def response = { items: [ { id: 1, name: 'a' }, { id: 2, name: 'b' } ] }
+            * match response == { items: '#[] #(itemSchema)' }
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testOptionalArrayMarkerAllowsNullArray() {
+        // '##[]' makes the whole array optional — a null (or absent) value passes.
+        ScenarioRuntime sr = run("""
+            * def itemSchema = { id: '#number', name: '#string' }
+            * def response = { items: null }
+            * match response == { items: '##[] itemSchema' }
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testArrayMarkerRequiresPresentArray() {
+        // '#[]' (single hash) requires the array to be present — null fails.
+        ScenarioRuntime sr = run("""
+            * def itemSchema = { id: '#number', name: '#string' }
+            * def response = { items: null }
+            * match response == { items: '#[] itemSchema' }
+            """);
+        assertFailed(sr);
+    }
+
+    @Test
+    void testPerElementOptionalSchemaAllowsNullElement() {
+        // The only thing the embedded form can express that the bare form can't:
+        // a per-element '##(schema)' lets an individual array element be null.
+        ScenarioRuntime sr = run("""
+            * def itemSchema = { id: '#number', name: '#string' }
+            * def response = { items: [ { id: 1, name: 'a' }, null ] }
+            * match response == { items: '#[] ##(itemSchema)' }
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testPerElementRequiredSchemaRejectsNullElement() {
+        // Complement of the above: bare / '#(schema)' per-element does NOT allow nulls.
+        ScenarioRuntime sr = run("""
+            * def itemSchema = { id: '#number', name: '#string' }
+            * def response = { items: [ { id: 1, name: 'a' }, null ] }
+            * match response == { items: '#[] itemSchema' }
+            """);
+        assertFailed(sr);
+    }
+
+    // ========== Optional nested-schema reference — '##(schema)' ==========
+    // '##(expr)' has two jobs that pull in opposite directions:
+    //   - building data: evaluate expr, inline the value, drop the key if it is null
+    //   - asserting:     an OPTIONAL marker — the field may be null or absent
+    // Inlining is destructive for the second job: once '##(subSchema)' has been replaced by
+    // the map it resolves to, the '##' is gone and the field is plain required.
+    // So the placeholder is preserved (left as the literal string, for the match engine to
+    // resolve) in exactly the two places where the value is known to be headed for a match:
+    // the RHS of the `match` keyword, and a `def` whose JSON literal the user wrapped in
+    // round brackets. Everywhere else '##(chunk)' still inlines the chunk.
+    // Only chunks (map / list / XML node) are preserved — a scalar is always inlined.
+
+    @Test
+    void testOptionalPrimitiveMarkersAcceptNull() {
+        // Control — '##string' / '##number' have always accepted null.
+        ScenarioRuntime sr = run("""
+            * def response = { name: 'test', age: null, email: null }
+            * match response == { name: '#string', age: '##number', email: '##string' }
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testOptionalSchemaReferenceOnMatchRhsAcceptsNull() {
+        ScenarioRuntime sr = run("""
+            * def subSchema = { name: '#string', id: '#number' }
+            * def response = { status: 'active', details: null }
+            * match response == { status: '#string', details: '##(subSchema)' }
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testOptionalSchemaReferenceOnMatchRhsAcceptsMissingKey() {
+        ScenarioRuntime sr = run("""
+            * def subSchema = { name: '#string', id: '#number' }
+            * def response = { status: 'active' }
+            * match response == { status: '#string', details: '##(subSchema)' }
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testOptionalSchemaReferenceStillValidatesWhenPresent() {
+        // 'optional' is only about null / absent — a value that IS there must match.
+        ScenarioRuntime sr = run("""
+            * def subSchema = { name: '#string', id: '#number' }
+            * def response = { status: 'active', details: { name: 'x', id: 1 } }
+            * match response == { status: '#string', details: '##(subSchema)' }
+            """);
+        assertPassed(sr);
+        sr = run("""
+            * def subSchema = { name: '#string', id: '#number' }
+            * def response = { status: 'active', details: { name: 'x', id: 'not-a-number' } }
+            * match response == { status: '#string', details: '##(subSchema)' }
+            """);
+        assertFailed(sr);
+    }
+
+    @Test
+    void testOptionalSchemaReferenceInMatchDocString() {
+        ScenarioRuntime sr = run("""
+            * def subSchema = { name: '#string', id: '#number' }
+            * def response = { status: 'active', details: null }
+            * match response ==
+            \"\"\"
+            { status: '#string', details: '##(subSchema)' }
+            \"\"\"
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testOptionalSchemaReferenceInParenWrappedDef() {
+        // The re-usable-schema form: round brackets keep the placeholder alive past `def`.
+        ScenarioRuntime sr = run("""
+            * def subSchema = { name: '#string', id: '#number' }
+            * def mainSchema = ({ status: '#string', details: '##(subSchema)' })
+            * match { status: 'active', details: null } == mainSchema
+            * match { status: 'active' } == mainSchema
+            * match { status: 'active', details: { name: 'x', id: 1 } } == mainSchema
+            """);
+        assertPassed(sr);
+        sr = run("""
+            * def subSchema = { name: '#string', id: '#number' }
+            * def mainSchema = ({ status: '#string', details: '##(subSchema)' })
+            * match { status: 'active', details: { name: 'x' } } == mainSchema
+            """);
+        assertFailed(sr);
+    }
+
+    @Test
+    void testOptionalSchemaReferenceInPlainDefIsInlined() {
+        // GOTCHA: without the round brackets, `def` is building data, so '##(subSchema)'
+        // resolves and inlines at def time — the '##' is consumed and 'details' ends up
+        // plain required. Use the paren-wrapped form above, or inline on the match RHS.
+        ScenarioRuntime sr = run("""
+            * def subSchema = { name: '#string', id: '#number' }
+            * def mainSchema = { status: '#string', details: '##(subSchema)' }
+            * assert typeof mainSchema.details == 'object'
+            """);
+        assertPassed(sr);
+        sr = run("""
+            * def subSchema = { name: '#string', id: '#number' }
+            * def mainSchema = { status: '#string', details: '##(subSchema)' }
+            * match { status: 'active', details: null } == mainSchema
+            """);
+        assertFailed(sr);
+    }
+
+    @Test
+    void testOptionalChunkStillInlinedWhenBuildingAPayload() {
+        // The other half of the contract — for data, '##(chunk)' must still inline the chunk.
+        // Preserving the placeholder here would put the literal string on the wire.
+        ScenarioRuntime sr = run("""
+            * def chunk = { a: 1 }
+            * def req = { data: '##(chunk)' }
+            * match req == { data: { a: 1 } }
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testOptionalNullReferenceStillRemovesKeyOnMatchRhs() {
+        // Preserving is limited to chunks. A null expression still removes the key, so the
+        // RHS has no 'details' at all and the actual must not have one either.
+        ScenarioRuntime sr = run("""
+            * def subSchema = null
+            * def response = { status: 'active' }
+            * match response == { status: '#string', details: '##(subSchema)' }
+            """);
+        assertPassed(sr);
+        sr = run("""
+            * def subSchema = null
+            * def response = { status: 'active', details: { name: 'x' } }
+            * match response == { status: '#string', details: '##(subSchema)' }
+            """);
+        assertFailed(sr);
+    }
+
+    @Test
+    void testOptionalScalarReferenceIsInlinedNotPreserved() {
+        // A scalar is never a schema chunk, so '##(scalar)' inlines even on the match RHS —
+        // 'details' becomes a required 'x' and null fails.
+        ScenarioRuntime sr = run("""
+            * def scalar = 'x'
+            * def response = { status: 'active', details: null }
+            * match response == { status: '#string', details: '##(scalar)' }
+            """);
+        assertFailed(sr);
+    }
+
+    @Test
+    void testRequiredSchemaReferenceIsAlwaysInlined() {
+        // Control for the whole section: single-hash '#(subSchema)' has no optional
+        // semantics to preserve, so it inlines everywhere and null always fails.
+        ScenarioRuntime sr = run("""
+            * def subSchema = { name: '#string', id: '#number' }
+            * def response = { status: 'active', details: null }
+            * match response == { status: '#string', details: '#(subSchema)' }
+            """);
+        assertFailed(sr);
+    }
+
+    // ========== Optional nested-schema reference — schemas kept in JSON files ==========
+    // The round-bracket 'def' escape hatch only exists for a JSON literal typed at the step.
+    // For a schema kept in a re-usable .json file the equivalent is 'karate.readAsString()'
+    // piped through the 'json' keyword: readAsString hands back the raw text, and the 'json'
+    // keyword parses it without resolving embedded expressions, so a '##(subSchema)' survives
+    // to the match. This is the JSON twin of the 'text' then 'xml' idiom for XML schemas.
+
+    @Test
+    void testOptionalSchemaReferenceFromFileViaReadAsString() {
+        ScenarioRuntime sr = run("""
+            * def addressSchema = read('json/schema-address.json')
+            * json entitySchema = karate.readAsString('json/schema-entity.json')
+            * match { id: 'x', address: null } == entitySchema
+            * match { id: 'x' } == entitySchema
+            * match { id: 'x', address: { address1: 'a', city: 'c', postalCode: 'p' } } == entitySchema
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testOptionalSchemaReferenceFromFileIgnoresDefinitionOrder() {
+        // Because the reference survives to the match, the nested schema only has to be in
+        // scope when the match runs — not when the outer schema is loaded. Order of the two
+        // 'def' lines does not matter, and a Background can load them either way round.
+        ScenarioRuntime sr = runFeature("""
+            Feature:
+            Background:
+            * json entitySchema = karate.readAsString('json/schema-entity.json')
+            * def addressSchema = read('json/schema-address.json')
+            Scenario:
+            * match { id: 'x' } == entitySchema
+            * match { id: 'x', address: { address1: 'a', city: 'c', postalCode: 'p' } } == entitySchema
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testOptionalSchemaReferenceFromFileFailsLoudlyWhenNestedSchemaMissing() {
+        // The flip side of deferring: if the nested schema was never defined, the error
+        // surfaces at the match, naming the variable.
+        ScenarioRuntime sr = run("""
+            * json entitySchema = karate.readAsString('json/schema-entity.json')
+            * match { id: 'x', address: { address1: 'a', city: 'c', postalCode: 'p' } } == entitySchema
+            """);
+        assertFailedWith(sr, "addressSchema is not defined");
+    }
+
+    @Test
+    void testOptionalSchemaReferenceFromFileStillValidatesWhenPresent() {
+        // 'optional' is only about null / absent — a nested object that IS there must match,
+        // and the nested schema's own markers still apply.
+        ScenarioRuntime sr = run("""
+            * def addressSchema = read('json/schema-address.json')
+            * json entitySchema = karate.readAsString('json/schema-entity.json')
+            * match { id: 'x', address: { address1: 'a', city: 'c' } } == entitySchema
+            """);
+        // name the missing key, so this pins the nested schema doing the validating
+        assertFailedWith(sr, "postalCode");
+    }
+
+    @Test
+    void testOptionalSchemaReferenceFromFileViaPlainReadIsInlined() {
+        // GOTCHA: read() of a .json file is the data-building path — embedded expressions
+        // resolve, so '##(addressSchema)' inlines and 'address' ends up plain required.
+        ScenarioRuntime sr = run("""
+            * def addressSchema = read('json/schema-address.json')
+            * def entitySchema = read('json/schema-entity.json')
+            * match { id: 'x', address: null } == entitySchema
+            """);
+        assertFailed(sr);
+    }
+
+    @Test
+    void testJsonKeywordDoesNotResolveEmbeddedExpressionsInParsedText() {
+        // The general rule behind the idiom above: text the user typed at the step is a
+        // template, a string parsed into JSON is not.
+        ScenarioRuntime sr = run("""
+            * def myVar = 'hello'
+            * json fromLiteral = { field: '#(myVar)' }
+            * match fromLiteral == { field: 'hello' }
+            * json fromText = karate.readAsString('json/embedded.json')
+            * assert fromText.field == '#(myVar)'
+            * assert fromText.nested.value == '#(myVar)'
+            """);
+        assertPassed(sr);
+    }
+
+    @Test
+    void testJsonKeywordDocString() {
+        // A doc string is the RHS, same as for the other typed keywords — and being text
+        // typed at the step, its embedded expressions do resolve.
+        ScenarioRuntime sr = run("""
+            * def myVar = 'hello'
+            * json foo =
+            \"\"\"
+            { field: '#(myVar)' }
+            \"\"\"
+            * match foo == { field: 'hello' }
+            """);
+        assertPassed(sr);
+    }
+
+}

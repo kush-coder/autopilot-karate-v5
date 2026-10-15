@@ -1,0 +1,2008 @@
+package io.karatelabs.js;
+
+import org.junit.jupiter.api.Test;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+class EvalTest extends EvalBase {
+
+    @Test
+    void testDev() {
+        // single-line if/else with blocks (baseline - already worked)
+        assertEquals(true, eval("if (false) { false } else { true }"));
+        assertEquals(false, eval("if (false) { false } else { false }"));
+        // multi-line if/else - the fix for } else { on separate line
+        assertEquals(true, eval("if (false) {\n  false\n} else {\n  true\n}"));
+        assertEquals(false, eval("if (true) {\n  false\n} else {\n  true\n}"));
+        // multi-line try/catch
+        eval("var a\ntry {\n  throw 'err'\n} catch (e) {\n  a = e\n}");
+        assertEquals("err", get("a"));
+        // multi-line try/catch/finally
+        eval("var a, b\ntry {\n  throw 'err'\n} catch (e) {\n  a = e\n} finally {\n  b = 'done'\n}");
+        assertEquals("err", get("a"));
+        assertEquals("done", get("b"));
+    }
+
+    @Test
+    void testCatchDestructuring() {
+        // CatchParameter as a BindingPattern (array / object), not just a bare ident.
+        assertEquals(2, eval("try { throw [1,2,3] } catch ([x,y,z]) { y }"));
+        assertEquals(5, eval("try { throw {m:5} } catch ({m}) { m }"));
+        assertEquals(11, eval("try { throw {k:11} } catch ({k:v}) { v }"));
+        // rest element and nested pattern
+        assertEquals(3, eval("try { throw [1,2,3,4] } catch ([h,...t]) { t.length }"));
+        assertEquals(8, eval("try { throw {p:[9,8]} } catch ({p:[,second]}) { second }"));
+        // CoverInitializedName (shorthand-with-default) is legal in the binding pattern
+        assertEquals(7, eval("try { throw {} } catch ({a=7}) { a }"));
+        // still pairs with finally (normal finally completion is discarded per spec,
+        // so the catch block's value wins); optional-binding catch unaffected
+        assertEquals(3, eval("try { throw [1,2] } catch ([x,y]) { x+y } finally { 'fin' }"));
+        assertEquals(9, eval("try { throw 1 } catch { 9 }"));
+        // cover-init shorthand outside a pattern context is still a SyntaxError
+        assertThrows(RuntimeException.class, () -> eval("var o = {a=7}"));
+    }
+
+    @Test
+    void testIteratorCloseOnDestructuring() {
+        // Array destructuring that leaves the iterator un-exhausted must call
+        // IteratorClose (the iterator's `return` method) — spec 13.15.5.3 step 5.
+        String iter = "var rc=0; var it={next:function(){return{done:false,value:1}},"
+                + " return:function(){rc++;return{}}};"
+                + " var ib={}; ib['@@iterator']=function(){return it}; ";
+        assertEquals(1, eval(iter + "var [x]=ib; rc"));
+        // return() that throws on a normal completion propagates
+        assertThrows(RuntimeException.class, () -> eval(
+                "var it={next:function(){return{done:false,value:1}}, return:function(){throw 'boom'}};"
+                        + " var ib={}; ib['@@iterator']=function(){return it}; var [x]=ib"));
+        // return() that yields a non-object on a normal completion is a TypeError
+        assertThrows(RuntimeException.class, () -> eval(
+                "var it={next:function(){return{done:false,value:1}}, return:function(){return null}};"
+                        + " var ib={}; ib['@@iterator']=function(){return it}; var [x]=ib"));
+        // a rest element drives the iterator to done, so return() is NOT called
+        String restIter = "var rc=0; var n=0; var it={next:function(){return{done:++n>3,value:n}},"
+                + " return:function(){rc++;return{}}};"
+                + " var ib={}; ib['@@iterator']=function(){return it}; ";
+        assertEquals(0, eval(restIter + "var [...r]=ib; rc"));
+        // internal array iterator has no observable return — no spurious throw
+        assertEquals(3, eval("var [a,b]=[1,2,3]; a+b"));
+        // for-of with a destructuring LHS: IteratorClose runs as part of binding,
+        // BEFORE the loop body — a return() that throws must skip the body entirely.
+        assertEquals(0, eval(
+                "var counter=0, _;"
+                        + " var it={next:function(){return{done:false,value:1}}, return:function(){throw 'x'}};"
+                        + " var ib={}; ib['@@iterator']=function(){return it};"
+                        + " try { for ([_] of [ib]) { counter += 1 } } catch(e){} counter"));
+    }
+
+    @Test
+    void testForOfMemberExpressionLhs() {
+        // A non-binding member-expression LHS (`for (x.attr of ...)`) is a PutValue
+        // assignment target, not a var declaration: it actually assigns, and a
+        // throwing setter closes the iterator and forwards the error — it must NOT
+        // be treated as `var x, attr` (which would loop forever on a live iterator).
+        assertEquals(3, eval("var x={}; for (x.attr of [1,2,3]) {} x.attr"));
+        assertEquals(9, eval("var o={}, k='v'; for (o[k] of [7,8,9]) {} o.v"));
+        // setter throws -> error propagates, body never runs, iterator's return() once
+        assertEquals("threw=true iter=0 close=1", eval(
+                "var iter=0, close=0;"
+                        + " var x={set attr(v){ throw new Error('e') }};"
+                        + " var ib={}; ib['@@iterator']=function(){return{"
+                        + "   next:function(){return{done:false,value:0}}, return:function(){close+=1}}};"
+                        + " var threw=false;"
+                        + " try { for (x.attr of ib) { iter += 1 } } catch(e){ threw=true }"
+                        + " ('threw='+threw+' iter='+iter+' close='+close)"));
+        // for-of break closes a user iterator (return() invoked once)
+        assertEquals(1, eval(
+                "var close=0; var ib={}; ib['@@iterator']=function(){return{"
+                        + " next:function(){return{done:false,value:1}}, return:function(){close+=1;return{}}}};"
+                        + " for (var v of ib) { break } close"));
+        // arrays / strings have no observable return — break/return must not throw
+        assertEquals(1, eval("var s=0; for (var v of [1,2,3]){ if(v==2) break; s+=v } s"));
+    }
+
+    @Test
+    void testBoxedPrimitives() {
+        // Number() vs new Number()
+        assertEquals("number", eval("typeof Number(5)"));
+        assertEquals("object", eval("typeof new Number(5)"));
+        assertEquals(true, eval("new Number(5) == 5"));
+        assertEquals(false, eval("new Number(5) === 5"));
+        assertEquals(true, eval("new Number(5) instanceof Number"));
+        assertEquals(false, eval("(5) instanceof Number"));
+        assertEquals(6, eval("new Number(5) + 1"));
+        assertEquals(5, eval("new Number(5).valueOf()"));
+        // String() vs new String()
+        assertEquals("string", eval("typeof String('x')"));
+        assertEquals("object", eval("typeof new String('x')"));
+        assertEquals(true, eval("new String('hello') == 'hello'"));
+        assertEquals(false, eval("new String('hello') === 'hello'"));
+        assertEquals(true, eval("new String('x') instanceof String"));
+        assertEquals(false, eval("'x' instanceof String"));
+        // Boolean() vs new Boolean()
+        assertEquals("boolean", eval("typeof Boolean(true)"));
+        assertEquals("object", eval("typeof new Boolean(true)"));
+        assertEquals(true, eval("!!new Boolean(false)")); // truthy object!
+        assertEquals(true, eval("new Boolean(false) instanceof Boolean"));
+        assertEquals(false, eval("false instanceof Boolean"));
+    }
+
+    @Test
+    void testTypeofCallable() {
+        // JsInvokable-registered globals must report "function", not "object"
+        assertEquals("function", eval("typeof parseInt"));
+        assertEquals("function", eval("typeof parseFloat"));
+        assertEquals("function", eval("typeof isNaN"));
+        assertEquals("function", eval("typeof isFinite"));
+        assertEquals("function", eval("typeof eval"));
+        assertEquals("function", eval("typeof encodeURIComponent"));
+        assertEquals("function", eval("typeof decodeURIComponent"));
+        // JsFunction constructor singletons
+        assertEquals("function", eval("typeof String"));
+        assertEquals("function", eval("typeof Number"));
+        assertEquals("function", eval("typeof Object"));
+        assertEquals("function", eval("typeof Array"));
+        assertEquals("function", eval("typeof Date"));
+        // Namespace objects stay "object"
+        assertEquals("object", eval("typeof Math"));
+        assertEquals("object", eval("typeof JSON"));
+        // Math methods are JsInvokable
+        assertEquals("function", eval("typeof Math.max"));
+        assertEquals("function", eval("typeof Math.random"));
+        assertEquals("function", eval("typeof JSON.stringify"));
+        assertEquals("function", eval("typeof JSON.parse"));
+        // User functions
+        assertEquals("function", eval("typeof (function(){})"));
+        assertEquals("function", eval("var f = () => 1; typeof f"));
+        // Constructor singletons that extend JsObject (not JsFunction):
+        // Boolean/RegExp/Error/TypeError/... must still report "function".
+        assertEquals("function", eval("typeof Boolean"));
+        assertEquals("function", eval("typeof RegExp"));
+        assertEquals("function", eval("typeof Error"));
+        assertEquals("function", eval("typeof TypeError"));
+        assertEquals("function", eval("typeof RangeError"));
+        assertEquals("function", eval("typeof ReferenceError"));
+        assertEquals("function", eval("typeof SyntaxError"));
+        // Instances of those constructors are objects (not functions).
+        assertEquals("object", eval("typeof new Boolean(true)"));
+        assertEquals("object", eval("typeof new RegExp('x')"));
+        assertEquals("object", eval("typeof new Error('oops')"));
+        assertEquals("object", eval("typeof new TypeError('nope')"));
+        assertEquals("object", eval("typeof /foo/"));
+        // Prototype method refs — raw (JsCallable) this::method lambdas must
+        // still report "function", not "object".
+        assertEquals("function", eval("typeof [1,2,3].map"));
+        assertEquals("function", eval("typeof [1,2,3].filter"));
+        assertEquals("function", eval("typeof [1,2,3].slice"));
+        assertEquals("function", eval("typeof 'x'.charAt"));
+        assertEquals("function", eval("typeof 'x'.indexOf"));
+        assertEquals("function", eval("typeof 'x'.toUpperCase"));
+        assertEquals("function", eval("typeof ({}).hasOwnProperty"));
+        assertEquals("function", eval("typeof ({}).toString"));
+        assertEquals("function", eval("typeof (5).toFixed"));
+    }
+
+    @Test
+    void testFunctionNameInference() {
+        // ES6 name inference: anonymous function/arrow assigned to a binding picks up the key.
+        assertEquals("f", eval("var f = function() {}; f.name"));
+        assertEquals("g", eval("var g = () => {}; g.name"));
+        // Named function expression keeps its own name, not the binding key.
+        assertEquals("named", eval("var x = function named() {}; x.name"));
+        // Named function declaration: passing it as a parameter or via var must NOT rename it.
+        assertEquals("Foo", eval("function Foo() {} var x = Foo; x.name"));
+        assertEquals("Foo", eval("function Foo() {} function take(p) { return p.name; } take(Foo)"));
+        // Mutation guard: calling take(Foo) must not mutate Foo.name globally.
+        assertEquals("Foo", eval("function Foo() {} function take(p) { return p; } take(Foo); Foo.name"));
+        // instance.constructor.name chain via a parameter binding.
+        assertEquals("Test262Error",
+                eval("function Test262Error(m) { this.message = m; }" +
+                        " function rethrow(ctor) { throw new Test262Error('x'); }" +
+                        " try { rethrow(Test262Error); } catch (e) { e.constructor.name }"));
+    }
+
+    @Test
+    void testThrownErrorTypeFallsBackToConstructorName() {
+        // User-defined error classes that omit .name on the prototype must still
+        // surface a meaningful type to host callers via constructor.name lookup.
+        assertEquals("MyErr",
+                eval("function MyErr(m) { this.message = m; } try { throw new MyErr('oops'); } catch (e) { e.constructor.name }"));
+    }
+
+    @Test
+    void testNewExpressionChaining() {
+        // new binds to the first call expression only
+        // new Foo().bar() should parse as (new Foo()).bar()
+        assertEquals("hello", eval("new String('hello').valueOf()"));
+        assertEquals(5, eval("new Number(5).valueOf()"));
+        // Chained method calls on constructed object
+        assertEquals("HELLO", eval("new String('hello').toUpperCase()"));
+        assertEquals(5, eval("new String('hello').length"));
+    }
+
+    @Test
+    void testArrayOutOfBounds() {
+        // Empty array index access should return undefined/null (JS behavior)
+        assertNull(eval("var arr = []; arr[0]"));
+        assertNull(eval("var arr = []; arr[99]"));
+        assertNull(eval("var arr = [1]; arr[5]"));
+        assertNull(eval("var arr = [1, 2, 3]; arr[-1]"));
+        // String out of bounds
+        assertNull(eval("var s = ''; s[0]"));
+        assertNull(eval("var s = 'abc'; s[10]"));
+    }
+
+    @Test
+    void testIsNaNGlobal() {
+        assertEquals(true, eval("isNaN(NaN)"));
+        assertEquals(true, eval("isNaN('foo')"));
+        assertEquals(true, eval("isNaN(undefined)"));
+        assertEquals(true, eval("isNaN()"));
+        assertEquals(false, eval("isNaN(0)"));
+        assertEquals(false, eval("isNaN(42)"));
+        assertEquals(false, eval("isNaN('42')"));
+        assertEquals(false, eval("isNaN('3.14')"));
+        // The idiom from the D1 benchmark — parseFloat then isNaN
+        assertEquals(false, eval("isNaN(parseFloat('850.00'))"));
+        assertEquals(true, eval("isNaN(parseFloat('abc'))"));
+    }
+
+    @Test
+    void testIsFiniteGlobal() {
+        assertEquals(true, eval("isFinite(0)"));
+        assertEquals(true, eval("isFinite(42)"));
+        assertEquals(true, eval("isFinite('42')"));
+        assertEquals(false, eval("isFinite(NaN)"));
+        assertEquals(false, eval("isFinite(Infinity)"));
+        assertEquals(false, eval("isFinite(-Infinity)"));
+        assertEquals(false, eval("isFinite('foo')"));
+        assertEquals(false, eval("isFinite(undefined)"));
+    }
+
+    @Test
+    void testOptionalChainingBracket() {
+        // Optional chaining with bracket on null/undefined
+        assertNull(eval("var arr = null; arr?.[0]"));
+        assertNull(eval("var arr = undefined; arr?.[0]"));
+        assertEquals(1, eval("var arr = [1, 2, 3]; arr?.[0]"));
+    }
+
+    @Test
+    void testNullishCoalescing() {
+        // Nullish coalescing operator (??)
+        assertEquals("default", eval("var obj = null; obj ?? 'default'"));
+        assertEquals("default", eval("var obj = undefined; obj ?? 'default'"));
+        assertEquals("value", eval("var obj = 'value'; obj ?? 'default'"));
+        assertEquals(0, eval("var obj = 0; obj ?? 'default'")); // 0 is not nullish
+        assertEquals("", eval("var obj = ''; obj ?? 'default'")); // '' is not nullish
+        assertEquals(false, eval("var obj = false; obj ?? 'default'")); // false is not nullish
+        // Nullish coalescing with optional chaining
+        assertEquals("default", eval("var obj = null; obj?.foo ?? 'default'"));
+        assertEquals("default", eval("var obj = { foo: null }; obj?.foo ?? 'default'"));
+        assertEquals("value", eval("var obj = { foo: 'value' }; obj?.foo ?? 'default'"));
+    }
+
+    @Test
+    void testNumbers() {
+        assertEquals(1, eval("1"));
+        assertEquals(1, eval("1.0"));
+        assertEquals(0.5d, eval(".5"));
+        assertEquals(65280, eval("0x00FF00"));
+        assertEquals(2000001813346120L, eval("2.00000181334612E15"));
+    }
+
+    @Test
+    void testPost() {
+        assertEquals(1, eval("a = 1; a++"));
+        assertEquals(2, get("a"));
+        assertEquals(1, eval("a = 1; a--"));
+        assertEquals(0, get("a"));
+        assertEquals(1, eval("a = { b: 1 }; a.b++"));
+        NodeUtils.match(get("a"), "{ b: 2 }");
+    }
+
+    @Test
+    void testPre() {
+        assertEquals(2, eval("a = 1; ++a"));
+        assertEquals(2, get("a"));
+        assertEquals(0, eval("a = 1; --a"));
+        assertEquals(0, get("a"));
+        assertEquals(-5, eval("a = 5; -a"));
+        assertEquals(5, get("a"));
+        assertEquals(2, eval("a = 2; +a"));
+        assertEquals(2, get("a"));
+        assertEquals(3, eval("a = '3'; +a"));
+        assertEquals("3", get("a"));
+        assertEquals(2, eval("a = { b: 1 }; ++a.b"));
+        NodeUtils.match(get("a"), "{ b: 2 }");
+    }
+
+    @Test
+    void testLiterals() {
+        assertNull(eval("null"));
+        assertEquals(true, eval("true"));
+        assertEquals(false, eval("false"));
+        assertEquals("foo", eval("'foo'"));
+        assertEquals("bar", eval("\"bar\""));
+    }
+
+    @Test
+    void testExprList() {
+        assertEquals(3, eval("1, 2, 3"));
+    }
+
+    @Test
+    void testAssign() {
+        assertEquals(1, eval("a = 1"));
+        assertEquals(1, get("a"));
+        assertEquals(2, eval("a = 2; b = a"));
+        assertEquals(2, get("b"));
+        assertEquals(3, eval("a = 1 + 2"));
+        assertEquals(3, get("a"));
+        assertEquals(2, eval("a = 1; a += 1"));
+        assertEquals(2, get("a"));
+        assertEquals(2, eval("a = 3; a -= 1"));
+        assertEquals(2, get("a"));
+        assertEquals(6, eval("a = 2; a *= 3"));
+        assertEquals(6, get("a"));
+        assertEquals(3, eval("a = 6; a /= 2"));
+        assertEquals(3, get("a"));
+        assertEquals(1, eval("a = 3; a %= 2"));
+        assertEquals(1, get("a"));
+        assertEquals(9, eval("a = 3; a **= 2"));
+        assertEquals(9, get("a"));
+        // Bitwise / shift compound assignments — &=, |=, ^=, <<=, >>=, >>>=
+        assertEquals(1, eval("a = 5; a &= 3"));
+        assertEquals(1, get("a"));
+        assertEquals(7, eval("a = 5; a |= 3"));
+        assertEquals(7, get("a"));
+        assertEquals(6, eval("a = 5; a ^= 3"));
+        assertEquals(6, get("a"));
+        assertEquals(8, eval("a = 1; a <<= 3"));
+        assertEquals(8, get("a"));
+        assertEquals(2, eval("a = 16; a >>= 3"));
+        assertEquals(2, get("a"));
+        assertEquals(2, eval("a = 16; a >>>= 3"));
+        assertEquals(2, get("a"));
+        // ES2021 logical-assignment operators: ||=, &&=, ??= — short-circuit semantics
+        assertEquals(1, eval("a = 1; a ||= 2"));        // truthy: RHS skipped
+        assertEquals(1, get("a"));
+        assertEquals(2, eval("a = 0; a ||= 2"));        // falsy: RHS evaluated
+        assertEquals(2, get("a"));
+        assertEquals(2, eval("a = 1; a &&= 2"));        // truthy: RHS evaluated
+        assertEquals(2, get("a"));
+        assertEquals(0, eval("a = 0; a &&= 2"));        // falsy: RHS skipped
+        assertEquals(0, get("a"));
+        assertEquals(2, eval("a = null; a ??= 2"));     // nullish: RHS evaluated
+        assertEquals(2, get("a"));
+        assertEquals(0, eval("a = 0; a ??= 2"));        // defined: RHS skipped
+        assertEquals(0, get("a"));
+        // Short-circuit must skip RHS side effects
+        eval("var sideA = false; a = 1; a ||= (sideA = true);");
+        assertEquals(false, get("sideA"));
+        eval("var sideB = false; a = 0; a &&= (sideB = true);");
+        assertEquals(false, get("sideB"));
+        eval("var sideC = false; a = 1; a ??= (sideC = true);");
+        assertEquals(false, get("sideC"));
+        // Property-target forms: obj.x ??= …
+        assertEquals(7, eval("var o = {}; o.x ??= 7; o.x"));
+        assertEquals(3, eval("var o = {x: 3}; o.x ??= 7; o.x"));
+        // NamedEvaluation: anonymous function/arrow on RHS of identifier assignment
+        // inherits the identifier as its `.name`.
+        assertEquals("g", eval("var g; g = function(){}; g.name"));
+        assertEquals("h", eval("var h; h = () => 1; h.name"));
+        assertEquals("v", eval("var v = 0; v ||= function(){}; v.name"));
+        assertEquals("w", eval("var w = null; w ??= () => 1; w.name"));
+        // Reference assignment must NOT clobber an existing function name.
+        assertEquals("orig", eval("var orig = function(){}; var alias; alias = orig; alias.name"));
+        // Binary / octal numeric literals
+        assertEquals(2, eval("0b10"));
+        assertEquals(13, eval("0b1101"));
+        assertEquals(15, eval("0o17"));
+        assertEquals(63, eval("0O77"));
+        // Binary / octal literals as computed object keys
+        assertEquals("get string", eval("var o = { get [0b10]() { return 'get string'; } }; o['2']"));
+        assertEquals("v", eval("var o = { [0o17]: 'v' }; o['15']"));
+        // void unary operator
+        assertNull(eval("void 0"));
+        assertNull(eval("void 'anything'"));
+        eval("var sideEffect = false; void (sideEffect = true);");
+        assertEquals(true, get("sideEffect"));
+        // void with object literal at statement start (parser-disambiguation case)
+        assertNull(eval("void { a: 1, b: 2 }"));
+        eval("var a = { foo: 'bar' }");
+        match(get("a"), "{ foo: 'bar' }");
+        eval("var a = { 0: 'a', 1: 'b' }");
+        match(get("a"), "{ '0': 'a', '1': 'b' }");
+    }
+
+    @Test
+    void testVarStatement() {
+        assertNull(eval("var a"));
+        assertNull(get("a")); // undefined is converted to null by toJava()
+        assertEquals(1, eval("var a = 1"));
+        assertEquals(1, get("a"));
+        // Each declarator carries its own (optional) initializer per spec.
+        assertEquals(2, eval("var a, b = 2"));
+        assertNull(get("a"));
+        assertEquals(2, get("b"));
+        eval("var x = 1, y = 2, z = 3");
+        assertEquals(1, get("x"));
+        assertEquals(2, get("y"));
+        assertEquals(3, get("z"));
+    }
+
+    @Test
+    void testExp() {
+        assertEquals(512, eval("2 ** 3 ** 2"));
+        assertEquals(64, eval("(2 ** 3) ** 2"));
+    }
+
+    @Test
+    void testBitwise() {
+        assertEquals(3, eval("1 | 2"));
+        assertEquals(7, eval("3 | 2 | 4"));
+        assertEquals(20, eval("5 << 2"));
+        assertEquals(4294967295L, eval("var a = -1; a >>>= 0"));
+        assertEquals(1, eval("a = 5; a >>= 2"));
+        assertEquals(1073741822, eval("a = -5; a >>>= 2"));
+    }
+
+    @Test
+    void testLogic() {
+        assertEquals(true, eval("2 > 1"));
+        assertEquals(2, eval("2 || 1"));
+        assertEquals("b", eval("'a' && 'b'"));
+        assertEquals(true, eval("2 > 1 && 3 < 5"));
+        assertEquals(true, eval("2 == '2'"));
+        assertEquals(false, eval("2 === '2'"));
+    }
+
+    @Test
+    void testLogicNonNumbers() {
+        assertEquals(false, eval("'a' == 'b'"));
+        assertEquals(false, eval("'a' === 'b'"));
+        assertEquals(true, eval("'a' == 'a'"));
+        assertEquals(true, eval("'a' === 'a'"));
+        assertEquals(true, eval("'a' != 'b'"));
+        assertEquals(true, eval("'a' !== 'b'"));
+        assertEquals(false, eval("'a' != 'a'"));
+        assertEquals(false, eval("'a' !== 'a'"));
+    }
+
+    @Test
+    void testLogicSpecial() {
+        assertEquals(false, eval("a = undefined; b = 0; a < b"));
+        assertEquals(true, eval("a = ''; b = ''; a == b"));
+        assertEquals(true, eval("a = 0; b = -0; a == b"));
+        assertEquals(true, eval("a = 0; b = -0; a === b"));
+        assertEquals(false, eval("a = 0; b = -0; 1 / a === 1 / b"));
+        assertEquals(true, eval("a = Infinity; 1 / a === 0"));
+        assertEquals(true, eval("a = -Infinity; 1 / a === -0"));
+        assertEquals(true, eval("a = 0; 1 / a === Infinity"));
+        assertEquals(true, eval("a = 0; -1 / a === -Infinity"));
+        assertEquals(false, eval("a = {}; b = {}; a === b"));
+        assertEquals(false, eval("a = []; b = []; a === b"));
+        assertEquals(false, eval("a = {}; b = {}; a !== a && b !== b"));
+        assertEquals(false, eval("a = []; b = []; a !== a && b !== b"));
+        assertEquals(false, eval("!!null"));
+        assertEquals(false, eval("!!NaN"));
+        assertEquals(false, eval("!!undefined"));
+        assertEquals(false, eval("!!''"));
+        assertEquals(false, eval("!!0"));
+        assertEquals(true, eval("a = null; b = undefined; a == b"));
+        assertEquals(false, eval("a = null; b = undefined; a === b"));
+        assertEquals(true, eval("a = undefined; b = null; a == b"));
+        assertEquals(false, eval("a = undefined; b = null; a === b"));
+        assertEquals(true, eval("a = null; b = null; a == b"));
+        assertEquals(true, eval("a = null; b = null; a === b"));
+        assertEquals(true, eval("a = undefined; b = undefined; a == b"));
+        assertEquals(true, eval("a = undefined; b = undefined; a === b"));
+        assertEquals(true, eval("a = null; b = null; a == b"));
+        assertEquals(true, eval("a = null; b = undefined; a == b"));
+        assertEquals(false, eval("a = NaN; b = NaN; a == b"));
+        assertEquals(false, eval("a = NaN; b = NaN; a === b"));
+        assertEquals(true, eval("a = NaN; b = NaN; a != b"));
+        assertEquals(true, eval("a = NaN; b = NaN; a !== b"));
+        assertEquals(true, eval("a = NaN; b = NaN; a !== a && b !== b"));
+        assertEquals(false, eval("a = NaN; b = NaN; a < b"));
+        assertEquals(false, eval("a = NaN; b = NaN; a > b"));
+        assertEquals(false, eval("a = NaN; b = NaN; a <= b"));
+        assertEquals(false, eval("a = NaN; b = NaN; a >= b"));
+        // ES6: null/undefined are only loosely equal to each other, not to other falsy values
+        assertEquals(false, eval("0 == null"));
+        assertEquals(false, eval("null == 0"));
+        assertEquals(false, eval("0 == undefined"));
+        assertEquals(false, eval("undefined == 0"));
+        assertEquals(false, eval("'' == null"));
+        assertEquals(false, eval("null == ''"));
+        assertEquals(false, eval("'' == undefined"));
+        assertEquals(false, eval("undefined == ''"));
+        assertEquals(false, eval("false == null"));
+        assertEquals(false, eval("null == false"));
+        assertEquals(false, eval("false == undefined"));
+        assertEquals(false, eval("undefined == false"));
+    }
+
+    @Test
+    void testNaNInequality() {
+        // NaN != anything (including numbers) should be true
+        assertEquals(true, eval("NaN != 5"));
+        assertEquals(true, eval("NaN !== 5"));
+        assertEquals(true, eval("5 != NaN"));
+        assertEquals(true, eval("5 !== NaN"));
+        // NaN != NaN should also be true
+        assertEquals(true, eval("NaN != NaN"));
+        assertEquals(true, eval("NaN !== NaN"));
+    }
+
+    @Test
+    void testLogicShortCircuit() {
+        assertNull(eval("var a = {}; a.b && a.b.c"));
+        assertEquals(0, eval("var a = { b: 0 }; a && a.b"));
+        assertEquals(0, eval("var a = { b: 0 }; a.b && a.b.c"));
+        assertEquals(2, eval("var a = { b: 1, c: 2 }; a.b && a.c"));
+        assertEquals(1, eval("var a = { b: 1 }; a.b || a.x.y"));
+        assertEquals(2, eval("var a = { b: 0, c: 2 }; a.b || a.c"));
+        assertEquals(0, eval("var a = { b: undefined, c: 0 }; a.b || a.c"));
+        assertEquals(2, eval("var a = { b: undefined, c: 2 }; a.b || a.c"));
+    }
+
+    @Test
+    void testLogicAndOrPrecedence() {
+        // && has higher precedence than ||
+        assertEquals(true, eval("true || false && false"));
+        assertEquals(false, eval("false || false && true"));
+        assertEquals(true, eval("false && true || true"));
+        assertEquals(false, eval("false && true || false"));
+    }
+
+    @Test
+    void testRelationalEqualityPrecedence() {
+        // relational operators (<, >, <=, >=) have higher precedence than equality (==, ===)
+        // 2 < 3 == 1 should be (2 < 3) == 1 => true == 1 => true (not (2 < 3) == 1 parsed left-to-right as ((2 < 3) == 1))
+        // Actually in JS: true == 1 is true (coercion), so this won't catch the bug
+        // Better test: 5 > 3 == 2 should be (5 > 3) == 2 => true == 2 => false
+        // If parsed wrong as (5 > 3) == 2, it's still false
+        // Even better: 1 == 2 < 3 should be 1 == (2 < 3) => 1 == true => true
+        // If parsed wrong: (1 == 2) < 3 => false < 3 => true (same result!)
+        // Best test: 0 == 1 < 2 should be 0 == (1 < 2) => 0 == true => false
+        // If wrong: (0 == 1) < 2 => false < 2 => true (different!)
+        assertEquals(false, eval("0 == 1 < 2"));
+        assertEquals(true, eval("1 == 1 < 2"));
+    }
+
+    @Test
+    void testBitwisePrecedence() {
+        // In JS: & has higher precedence than ^, and ^ has higher precedence than |
+        // Also: bitwise operators have lower precedence than equality
+        // Test: 1 | 2 & 4 should be 1 | (2 & 4) => 1 | 0 => 1
+        // If wrong (left-to-right): (1 | 2) & 4 => 3 & 4 => 0
+        assertEquals(1, eval("1 | 2 & 4"));
+        // Test: 1 ^ 2 & 4 should be 1 ^ (2 & 4) => 1 ^ 0 => 1
+        // If wrong: (1 ^ 2) & 4 => 3 & 4 => 0
+        assertEquals(1, eval("1 ^ 2 & 4"));
+        // Test: 1 | 2 ^ 3 should be 1 | (2 ^ 3) => 1 | 1 => 1
+        // If wrong: (1 | 2) ^ 3 => 3 ^ 3 => 0
+        assertEquals(1, eval("1 | 2 ^ 3"));
+    }
+
+    @Test
+    void testInstanceofPrecedence() {
+        // instanceof has same precedence as relational operators, higher than equality
+        // Create a constructor function
+        String js = "function Foo() {}; var foo = new Foo(); ";
+        // First verify instanceof works
+        assertEquals(true, eval(js + "foo instanceof Foo"));
+        // Test precedence: foo instanceof Foo == true should be (foo instanceof Foo) == true => true == true => true
+        // If wrong precedence: foo instanceof (Foo == true) would fail or give wrong result
+        assertEquals(true, eval(js + "foo instanceof Foo == true"));
+        assertEquals(false, eval(js + "foo instanceof Foo == false"));
+    }
+
+    @Test
+    void testErrorInstanceOf() {
+        // same-type: an instance is instanceof its own constructor
+        assertEquals(true, eval("new Error() instanceof Error"));
+        assertEquals(true, eval("new TypeError() instanceof TypeError"));
+        assertEquals(true, eval("new RangeError() instanceof RangeError"));
+        assertEquals(true, eval("new ReferenceError() instanceof ReferenceError"));
+        assertEquals(true, eval("new SyntaxError() instanceof SyntaxError"));
+        // base-class: all NativeError types inherit from Error
+        assertEquals(true, eval("new TypeError() instanceof Error"));
+        assertEquals(true, eval("new RangeError() instanceof Error"));
+        assertEquals(true, eval("new ReferenceError() instanceof Error"));
+        assertEquals(true, eval("new SyntaxError() instanceof Error"));
+        assertEquals(true, eval("new URIError() instanceof Error"));
+        assertEquals(true, eval("new EvalError() instanceof Error"));
+        // cross-type: different NativeError types are NOT instanceof each other
+        assertEquals(false, eval("new RangeError() instanceof TypeError"));
+        assertEquals(false, eval("new TypeError() instanceof RangeError"));
+        assertEquals(false, eval("new SyntaxError() instanceof ReferenceError"));
+        // base-error is not an instanceof any NativeError subtype
+        assertEquals(false, eval("new Error() instanceof TypeError"));
+        assertEquals(false, eval("new Error() instanceof RangeError"));
+    }
+
+    @Test
+    void testErrorConstructor() {
+        // .constructor on a thrown/newed error points to the global constructor
+        assertEquals(true, eval("new Error().constructor === Error"));
+        assertEquals(true, eval("new TypeError().constructor === TypeError"));
+        assertEquals(true, eval("new RangeError().constructor === RangeError"));
+        assertEquals(true, eval("new ReferenceError().constructor === ReferenceError"));
+        // cross-type: constructor identity is strict, not name-based
+        assertEquals(false, eval("new RangeError().constructor === TypeError"));
+        assertEquals(false, eval("new TypeError().constructor === Error"));
+        // the test262 pattern: assert.throws(RangeError, fn) equivalent
+        assertEquals(true, eval(
+                "var caught; try { throw new RangeError('x') } catch(e) { caught = e }; " +
+                        "caught.constructor === RangeError"));
+        assertEquals(false, eval(
+                "var caught; try { throw new RangeError('x') } catch(e) { caught = e }; " +
+                        "caught.constructor === TypeError"));
+    }
+
+    @Test
+    void testUnary() {
+        assertEquals(true, eval("!false"));
+        assertEquals(-6, eval("~5"));
+        assertEquals(2, eval("~~(2.7)"));
+    }
+
+    @Test
+    void testUnaryPrecedence() {
+        assertEquals(true, eval("var foo = false; var bar = true; !foo || bar"));
+        assertEquals(false, eval("var foo = true; var bar = false; !foo || bar"));
+        assertEquals(true, eval("var foo = false; var bar = true; !foo && bar"));
+        assertEquals(false, eval("var foo = true; var bar = true; !foo && bar"));
+        assertEquals(-3, eval("~5 + 3"));
+        assertEquals(false, eval("var a = false; var b = false; !a == b"));
+    }
+
+    @Test
+    void testParseInt() {
+        assertEquals(42, eval("parseInt('42')"));
+        assertEquals(42, eval("parseInt('042')"));
+        assertEquals(42, eval("parseInt('42px')"));
+        assertEquals(3, eval("parseInt('3.14')"));
+        assertEquals(255, eval("parseInt('0xFF')"));
+        assertEquals(Double.NaN, eval("parseInt('abc')"));
+        // radix support
+        assertEquals(5, eval("parseInt('101', 2)"));
+        assertEquals(42, eval("parseInt('42', 10)"));
+        assertEquals(255, eval("parseInt('ff', 16)"));
+        assertEquals(255, eval("parseInt('FF', 16)"));
+        assertEquals(8, eval("parseInt('10', 8)"));
+        assertEquals(Double.NaN, eval("parseInt('', 10)"));
+        assertEquals(1, eval("parseInt('1z', 10)"));
+    }
+
+    @Test
+    void testParseFloat() {
+        assertEquals(3.14, eval("parseFloat('3.14')"));
+        assertEquals(42, eval("parseFloat('42')"));
+        assertEquals(42.99, eval("parseFloat('42.99px')"));
+        assertEquals(Double.NaN, eval("parseFloat('abc')"));
+        // assertEquals( 1000, eval("parseFloat('1e3')")); TODO
+    }
+
+    @Test
+    void testIfStatement() {
+        eval("if (true) a = 1");
+        assertEquals(1, get("a"));
+        eval("if (false) a = 1");
+        assertNull(get("a"));
+        eval("if (false) a = 1; else a = 2");
+        assertEquals(2, get("a"));
+        eval("a = 1; if (a) b = 2");
+        assertEquals(2, get("b"));
+        eval("a = 0; if (a) b = 2");
+        assertNull(get("b"));
+        eval("a = ''; if (a) b = 1; else b = 2");
+        assertEquals(2, get("b"));
+        assertEquals(true, eval("if (false) { false } else { true }"));
+        assertEquals(false, eval("if (false) { false } else { false }"));
+    }
+
+    @Test
+    void testForLoop() {
+        eval("var a = []; for (var i = 0; i < 3; i++) a.push(i)");
+        match(get("a"), "[0, 1, 2]");
+        eval("var a = []; for (var i = 0; i < 3; i++) { if (i == 1) break; a.push(i) }");
+        match(get("a"), "[0]");
+        eval("var a = []; for (var i = 0; i < 3; i++) { if (i == 1) continue; a.push(i) }");
+        match(get("a"), "[0, 2]");
+    }
+
+    @Test
+    void testBreakInForInsideIf() {
+        // break inside for loop nested in if block should only exit the for loop
+        eval("""
+                var items = [{id: 'a'}, {id: 'b'}, {id: 'c'}]
+                var target = 'b'
+                var found = -1
+                if (true) {
+                    for (var i = 0; i < items.length; i++) {
+                        if (items[i].id === target) {
+                            found = i
+                            break
+                        }
+                    }
+                    var afterLoop = 'reached'
+                }
+                """);
+        assertEquals(1, get("found"));
+        assertEquals("reached", get("afterLoop"));
+    }
+
+    @Test
+    void testBreakInForInInsideIf() {
+        // break in for-in loop nested in if block
+        eval("""
+                var obj = {a: 1, b: 2, c: 3}
+                var found = ''
+                if (true) {
+                    for (var k in obj) {
+                        if (k === 'b') break
+                    }
+                    found = 'reached'
+                }
+                """);
+        assertEquals("reached", get("found"));
+    }
+
+    @Test
+    void testBreakInForOfInsideIf() {
+        // break in for-of loop nested in if block
+        eval("""
+                var arr = [1, 2, 3]
+                var found = ''
+                var x
+                if (true) {
+                    for (x of arr) {
+                        if (x === 2) break
+                    }
+                    found = 'reached'
+                }
+                """);
+        assertEquals("reached", get("found"));
+    }
+
+    @Test
+    void testBreakInWhileInsideIf() {
+        // break in while loop nested in if block
+        eval("""
+                var i = 0
+                if (true) {
+                    while (i < 10) {
+                        if (i === 3) break
+                        i++
+                    }
+                    var afterWhile = 'reached'
+                }
+                """);
+        assertEquals(3, get("i"));
+        assertEquals("reached", get("afterWhile"));
+    }
+
+    @Test
+    void testBreakInDoWhileInsideIf() {
+        // break in do-while loop nested in if block
+        eval("""
+                var i = 0
+                if (true) {
+                    do {
+                        if (i === 3) break
+                        i++
+                    } while (i < 10)
+                    var afterDoWhile = 'reached'
+                }
+                """);
+        assertEquals(3, get("i"));
+        assertEquals("reached", get("afterDoWhile"));
+    }
+
+    @Test
+    void testReturnStillPropagatesFromLoop() {
+        // return inside a loop should still propagate out of the function
+        Object result = eval("""
+                function findIndex(items, target) {
+                    for (var i = 0; i < items.length; i++) {
+                        if (items[i] === target) {
+                            return i
+                        }
+                    }
+                    return -1
+                }
+                findIndex(['a', 'b', 'c'], 'b')
+                """);
+        assertEquals(1, result);
+    }
+
+    @Test
+    void testForInLoop() {
+        eval("var a = []; for (var x in {a: 1, b: 2, c: 3}) a.push(x)");
+        match(get("a"), "['a', 'b', 'c']");
+        eval("var a = []; for (var x in {a: 1, b: 2, c: 3}) { if (x == 'b') break; a.push(x) }");
+        match(get("a"), "['a']");
+        eval("var a = []; for (var x in {a: 1, b: 2, c: 3}) { if (x == 'b') continue; a.push(x) }");
+        match(get("a"), "['a', 'c']");
+        eval("var a = []; for (var x in [1, 2, 3]) a.push(x)");
+        match(get("a"), "['0', '1', '2']");
+        eval("var a = []; for (var x in [1, 2, 3]) { if (x == '1') break; a.push(x) }");
+        match(get("a"), "['0']");
+        eval("var a = []; for (var x in [1, 2, 3]) { if (x == '1') continue; a.push(x) }");
+        match(get("a"), "['0', '2']");
+    }
+
+    @Test
+    void testForOfLoop() {
+        // Per spec, for-of requires an iterable — plain objects without @@iterator
+        // throw TypeError. Use an array for value iteration; for-in is the right
+        // construct for enumerating object properties.
+        eval("var a = []; var x; for (x of [1, 2, 3]) a.push(x)");
+        match(get("a"), "[1, 2, 3]");
+        eval("var a = []; var x; for (x of [1, 2, 3]) { if (x == 2) break; a.push(x) }");
+        match(get("a"), "[1]");
+        eval("var a = []; var x; for (x of [1, 2, 3]) { if (x == 2) continue; a.push(x) }");
+        match(get("a"), "[1, 3]");
+        eval("var a = []; for (const x of [1, 2, 3]) a.push(x)");
+        match(get("a"), "[1, 2, 3]");
+        // String iteration yields code-unit chars per spec
+        eval("var a = []; for (const c of 'abc') a.push(c)");
+        match(get("a"), "['a', 'b', 'c']");
+    }
+
+    @Test
+    void testForOfNonIterableThrows() {
+        // for-of on null/undefined/plain-object/number must throw TypeError
+        // (ECMAScript 13.7.5.13 ForIn/OfHeadEvaluation step 6).
+        try {
+            eval("for (const x of null) {}");
+            throw new AssertionError("expected TypeError on for-of null");
+        } catch (RuntimeException expected) {
+            // ok
+        }
+        try {
+            eval("for (const x of undefined) {}");
+            throw new AssertionError("expected TypeError on for-of undefined");
+        } catch (RuntimeException expected) {
+            // ok
+        }
+        try {
+            eval("for (const x of {a: 1}) {}");
+            throw new AssertionError("expected TypeError on for-of plain object");
+        } catch (RuntimeException expected) {
+            // ok
+        }
+    }
+
+    @Test
+    void testWhileLoop() {
+        eval("var i = 0; var a = []; while (i < 3) { a.push(i); i++ }");
+        match(get("a"), "[0, 1, 2]");
+        eval("var i = 0; var a = []; while (i < 3) { if (i == 1) break; a.push(i); i++ }");
+        match(get("a"), "[0]");
+        eval("var i = 0; var a = []; while (i < 3) { if (i == 1) { i++; continue }; a.push(i); i++ }");
+        match(get("a"), "[0, 2]");
+        // ensure extra semicolons in blocks are ignored
+        eval("var i = 0; var a = []; while (i < 3) { if (i == 1) { i++;; continue;; };; a.push(i);; i++;; };;");
+        match(get("a"), "[0, 2]");
+    }
+
+    @Test
+    void testDoWhileLoop() {
+        eval("var i = 0; var a = []; do { a.push(i); i++ } while (i < 3)");
+        match(get("a"), "[0, 1, 2]");
+        eval("var i = 0; var a = []; do { if (i == 1) break; a.push(i); i++ } while (i < 3)");
+        match(get("a"), "[0]");
+        eval("var i = 0; var a = []; do { if (i == 1) { i++; continue }; a.push(i); i++ } while (i < 3)");
+        match(get("a"), "[0, 2]");
+    }
+
+    @Test
+    void testTernary() {
+        eval("a = true ? 1 : 2");
+        assertEquals(1, get("a"));
+        eval("a = false ? 1 : 2");
+        assertEquals(2, get("a"));
+        eval("a = 5; b = a > 3 ? 'foo' : 4 + 5");
+        assertEquals("foo", get("b"));
+        eval("a = 5; b = a < 3 ? 'foo' : 4 + 5");
+        assertEquals(9, get("b"));
+        match(eval("1 && 0 ? 'foo' : 'bar'"), "bar");
+        match(eval("0 && 1 ? 'foo' : 'bar'"), "bar");
+        match(eval("var a = { b: false }; a && a.b ? 1 : 2"), "2");
+    }
+
+    @Test
+    void testTypeOf() {
+        assertEquals("string", eval("typeof 'foo'"));
+        assertEquals("function", eval("var a = function(){}; typeof a"));
+        assertEquals("object", eval("typeof new Error('foo')"));
+        assertEquals(true, eval("typeof 'foo' === 'string'"));
+        assertEquals("undefined", eval("typeof bar"));
+    }
+
+    @Test
+    void testTryCatch() {
+        eval("var a; try { throw 'foo' } catch (e) { a = e }");
+        assertEquals("foo", get("a"));
+        eval("var a, b; try { throw 'foo' } catch (e) { a = e; if (true) return; a = null } finally { b = 2 }");
+        assertEquals("foo", get("a"));
+        assertEquals(2, get("b"));
+        eval("var a; try { } finally { a = 3 }");
+        assertEquals(3, get("a"));
+        eval("var a; try { throw 'foo' } catch { a = 'bar' }");
+        assertEquals("bar", get("a"));
+    }
+
+    @Test
+    void testBracketExpression() {
+        assertNull(eval("var foo = {}; foo['bar']"));
+    }
+
+    @Test
+    void testDotExpressionUndefined() {
+        assertNull(eval("var foo = {}; foo.bar"));
+    }
+
+    @Test
+    void testDotExpressionFailure() {
+        try {
+            eval("foo.bar");
+            fail("error expected");
+        } catch (Exception e) {
+            assertTrue(e.getMessage().contains("foo is not defined"));
+        }
+        try {
+            eval("var obj = { a: null }; obj.a.b");
+            fail("error expected");
+        } catch (Exception e) {
+            assertTrue(e.getMessage().contains("cannot read properties of null (reading 'b')"));
+        }
+        try {
+            eval("var obj = { }; obj.a.b");
+            fail("error expected");
+        } catch (Exception e) {
+            assertTrue(e.getMessage().contains("cannot read properties of undefined (reading 'b')"));
+        }
+    }
+
+    @Test
+    void testDotExpressionOptional() {
+        assertNull(eval("var foo = null; foo?.bar"));
+        assertNull(eval("var foo = undefined; foo?.bar"));
+        assertNull(eval("var foo; foo?.bar"));
+        assertEquals("baz", eval("var foo = { bar: 'baz' }; foo?.bar"));
+        assertEquals(42, eval("var obj = { num: 42 }; obj?.num"));
+        assertNull(eval("var obj = null; obj?.a?.b?.c"));
+        assertNull(eval("var obj = { a: null }; obj?.a?.b?.c"));
+        assertNull(eval("var obj = { a: { b: null } }; obj?.a?.b?.c"));
+        assertEquals("deep", eval("var obj = { a: { b: { c: 'deep' } } }; obj?.a?.b?.c"));
+        assertEquals("value", eval("var obj = { a: { b: 'value' } }; obj?.a.b"));
+        try {
+            eval("var obj = { a: null }; obj?.a.b");
+            fail("error expected");
+        } catch (Exception e) {
+            assertTrue(e.getMessage().contains("cannot read properties of null (reading 'b')"));
+        }
+        // bracket
+        assertNull(eval("var obj = null; obj?.['key']"));
+        assertEquals("value", eval("var obj = { key: 'value' }; obj?.['key']"));
+        assertEquals("dynamic", eval("var obj = { foo: 'dynamic' }; var key = 'foo'; obj?.[key]"));
+        // function call
+        assertNull(eval("var obj = null; obj?.method()"));
+        assertEquals("called", eval("var obj = { method: function() { return 'called'; } }; obj?.method()"));
+        assertNull(eval("var obj = { method: null }; obj?.method?.()"));
+    }
+
+    @Test
+    void testOptionalChainLongShortCircuit() {
+        // When `?.` fires (LHS is nullish), the WHOLE chain short-circuits to undefined,
+        // not just the immediate access. Per spec 13.3.9: a chain head's nullish base
+        // makes the whole OptionalExpression evaluate to undefined.
+        assertNull(eval("var a = undefined; a?.b.c"));
+        assertNull(eval("var a = undefined; a?.b.c.d"));
+        assertNull(eval("var a = null; a?.b.c.d.e"));
+        assertNull(eval("var a = undefined; a?.b().c"));
+        assertNull(eval("var a = null; a?.b.c().d"));
+        assertNull(eval("var a = undefined; a?.[0].x"));
+        assertNull(eval("var a = null; a?.[0].x.y"));
+        // chain succeeds, then short-circuits at a NESTED ?. that goes nullish
+        assertNull(eval("var a = { b: null }; a?.b?.c.d"));
+        // chain succeeds and reads through normally
+        assertEquals(42, eval("var a = { b: { c: { d: 42 } } }; a?.b.c.d"));
+        // ?. does NOT short-circuit when an intermediate value is null but the
+        // optional was on a non-nullish step — `null.b` still throws TypeError.
+        try {
+            eval("var obj = { a: null }; obj?.a.b.c");
+            fail("error expected");
+        } catch (Exception e) {
+            assertTrue(e.getMessage().contains("cannot read properties of null"));
+        }
+    }
+
+    @Test
+    void testOptionalChainYieldsUndefinedNotNull() {
+        // The engine unwraps undefined to Java null at the boundary, so the
+        // JS-level identity has to be asserted from inside the script.
+        assertEquals("undefined", eval("var o = {}; typeof (o.x?.y)"));
+        assertEquals(true, eval("var o = {}; (o.x?.y) === undefined"));
+        assertEquals(true, eval("var o = {}; (o.x?.y) !== null"));
+        assertEquals(true, eval("var o = {}; var k = 'z'; (o.x?.[k]) === undefined"));
+        assertEquals(true, eval("var o = {}; (o.f?.()) === undefined"));
+        assertEquals(true, eval("var o = {}; (o.x?.y.z.w) === undefined"));
+        assertEquals(true, eval("var o = {}; (o.x?.y()) === undefined"));
+        // ?. after a null step short-circuits the rest of the chain
+        assertEquals(true, eval("var o = { a: null }; (o.a?.b) === undefined"));
+        // a short-circuited chain carries undefined into every consumer
+        assertEquals("undefined", eval("var o = {}; var r = o.x?.y; typeof r"));
+        assertEquals(true, eval("var o = {}; [o.x?.y][0] === undefined"));
+        assertEquals(true, eval("var o = {}; ({ v: o.x?.y }).v === undefined"));
+        assertEquals(true, eval("var o = {}; (function(x){ return x })(o.x?.y) === undefined"));
+        assertEquals("{}", eval("var o = {}; JSON.stringify({ v: o.x?.y })"));
+    }
+
+    @Test
+    void testOptionalChainUndefinedIsNotAFreePass() {
+        // The undefined a chain short-circuits to is only produced at the chain
+        // root — a non-optional step on a nullish value still throws, and parens
+        // end the chain so the next access is on plain undefined.
+        try {
+            eval("var o = { a: null }; o?.a.b");
+            fail("error expected");
+        } catch (Exception e) {
+            assertTrue(e.getMessage().contains("cannot read properties of null (reading 'b')"));
+        }
+        try {
+            eval("var o = {}; (o.x?.y).z");
+            fail("error expected");
+        } catch (Exception e) {
+            assertTrue(e.getMessage().contains("cannot read properties of undefined (reading 'z')"));
+        }
+    }
+
+    @Test
+    void testOptionalChainSideEffectShortCircuit() {
+        // When the chain head is nullish, no further sub-expressions in the chain
+        // are evaluated — so increments / function args inside the tail must not run.
+        assertEquals(1, eval("var a = undefined; var x = 1; a?.[++x]; x"));
+        assertEquals(1, eval("var a = null; var x = 1; a?.b.c(++x).d; x"));
+        assertEquals(1, eval("var a = undefined; var x = 1; a?.b(++x); x"));
+        // when the chain succeeds, side effects DO run
+        assertEquals(20, eval("var a = [10, 20]; var x = 0; a?.[++x]"));
+        assertEquals(1, eval("var a = [10, 20]; var x = 0; a?.[++x]; x"));
+    }
+
+    @Test
+    void testOptionalCallActuallyInvokes() {
+        // `a?.()` must call `a`, not just return its value (regression: previously
+        // returned the function value without invoking).
+        assertEquals(99, eval("var f = function(){ return 99; }; f?.()"));
+        assertEquals(10, eval("var f = function(x){ return x * 2; }; f?.(5)"));
+        // null/undefined target short-circuits
+        assertNull(eval("var f = null; f?.()"));
+        assertNull(eval("var f = undefined; f?.(throwIfCalled())"));
+    }
+
+    @Test
+    void testOptionalCallPreservesThis() {
+        // `a.b?.()` must keep `a` as receiver — otherwise `this` inside b is wrong.
+        // Spec EvaluateCall passes baseValue as thisValue.
+        String setup = "var a = { b: function(){ return this._b; }, _b: 42 }; ";
+        assertEquals(42, eval(setup + "a.b?.()"));
+        assertEquals(42, eval(setup + "a?.b?.()"));
+        assertEquals(42, eval(setup + "a?.b()"));
+        // method chain after optional call
+        String setup2 = "var a = { b: function(){ return this._b; }, _b: { c: 99 } }; ";
+        assertEquals(99, eval(setup2 + "a.b?.().c"));
+        assertEquals(99, eval(setup2 + "a?.b?.().c"));
+    }
+
+    @Test
+    void testParenPreservesReceiver() {
+        // Per spec, parens preserve the Reference Record — `(a.b)()` and `(a?.b)()`
+        // call with `this = a`. Previously parens dropped the receiver.
+        String setup = "var a = { b: function(){ return this._b; }, _b: 42 }; ";
+        assertEquals(42, eval(setup + "(a.b)()"));
+        assertEquals(42, eval(setup + "(a?.b)()"));
+        assertEquals(42, eval(setup + "(a.b)?.()"));
+        assertEquals(42, eval(setup + "(a?.b)?.()"));
+        // BUT — parens terminate the optional chain. `(a?.b).c` does NOT
+        // short-circuit when a is nullish; instead `(undefined).c` throws.
+        try {
+            eval("var a = null; (a?.b).c");
+            fail("error expected — parens terminate optional chain");
+        } catch (Exception e) {
+            assertTrue(e.getMessage().contains("cannot read properties"));
+        }
+    }
+
+    @Test
+    void testQuesDotDecimalLookahead() {
+        // Per spec `OptionalChainingPunctuator :: ?. [lookahead ∉ DecimalDigit]`,
+        // so `1 ?.5 : 0` lexes as ternary `1 ? .5 : 0`, not `1 ?. 5 : 0`.
+        assertEquals(0.5d, eval("true ?.5 : 0"));
+        assertEquals(0.5d, eval("var x = true; x?.5 : 0"));
+        // and `?.` is still recognized when followed by non-digit
+        assertEquals(1, eval("var a = { b: 1 }; a?.b"));
+    }
+
+    @Test
+    void testNullishCoalescingShortCircuit() {
+        // RHS not evaluated when LHS is non-nullish.
+        assertEquals(0, eval("var x = 0; (function(){ x = 1; return 'r'; })(), 0 ?? (function(){ x = 2; return 'r'; })()"));
+        // chained ??
+        assertEquals(1, eval("null ?? null ?? 1"));
+        assertEquals(2, eval("null ?? 2 ?? 1"));
+        // RHS-only side effects fire when LHS IS nullish
+        assertEquals(7, eval("var x = 0; var r = null ?? (x = 7); x"));
+    }
+
+    @Test
+    void testThrow() {
+        try {
+            eval("function a(b){ b() }; a(() => { throw new Error('foo') })");
+            fail("error expected");
+        } catch (Exception e) {
+            assertTrue(e.getMessage().contains("foo"));
+        }
+    }
+
+    @Test
+    void testThrowFunction() {
+        // Per spec OrdinaryCallBindThis: a free call `a(...)` (no receiver, no
+        // `new`) gets `this = globalThis`, not `this = a`. The assignment to
+        // `this.bar` lands on globalThis; we verify the side effect happened
+        // before the inner throw by reading `bar` as a free variable
+        // (globalThis property) afterwards.
+        try {
+            eval("function a(b){ this.bar = 'baz'; b() }; a(function(){ throw new Error('foo') })");
+            fail("error expected");
+        } catch (Exception e) {
+            assertTrue(e.getMessage().contains("foo"));
+            assertEquals("baz", engine.get("bar"));
+        }
+    }
+
+    @Test
+    void testSwitch() {
+        eval("var a = 2; var b; switch (a) { case 2: b = 1 }");
+        assertEquals(1, get("b"));
+        eval("var a = 2; var b; switch (a) { case 1: b = 1; break; case 2: b = 2; break }");
+        assertEquals(2, get("b"));
+        eval("var a = 2; var b; switch (a) { case 1: b = 1; break; default: b = 2 }");
+        assertEquals(2, get("b"));
+        eval("var a = 1; var b; switch (a) { case 1: b = 1; default: b = 2 }");
+        assertEquals(2, get("b"));
+        // multiple statements in case body
+        eval("var a = 'x'; var b; switch (a) { case 'x': var c = 1; b = c }");
+        assertEquals(1, get("b"));
+        eval("var a = 'x'; var b; switch (a) { case 'x': let c = 1; b = c }");
+        assertEquals(1, get("b"));
+    }
+
+    @Test
+    void testSwitchDefaultNotLast() {
+        // §14.12.9: cases are matched in source order wherever `default` sits, and
+        // `default` runs only when nothing matched — then falls through what follows it
+        assertEquals("c", eval("var r = ''; switch (1) { default: r += 'd'; break; case 1: r += 'c' } r"));
+        assertEquals("d2", eval("var r = ''; switch (9) { case 1: r += '1'; default: r += 'd'; case 2: r += '2' } r"));
+        assertEquals("2", eval("var r = ''; switch (2) { case 1: r += '1'; default: r += 'd'; case 2: r += '2' } r"));
+        assertEquals("1d2", eval("var r = ''; switch (1) { case 1: r += '1'; default: r += 'd'; case 2: r += '2' } r"));
+        assertEquals("d", eval("var r = ''; switch (9) { default: r += 'd'; break; case 1: r += '1' } r"));
+    }
+
+    @Test
+    void testTryCatchNoBindingWithFinally() {
+        eval("var a, b; try { throw 'foo' } catch { a = 'bar' } finally { b = 2 }");
+        assertEquals("bar", get("a"));
+        assertEquals(2, get("b"));
+        eval("var a, b; try { a = 1 } catch { a = 'bar' } finally { b = 2 }");
+        assertEquals(1, get("a"));
+        assertEquals(2, get("b"));
+    }
+
+    @Test
+    void testDeleteExpression() {
+        // `delete` is a UnaryExpression: usable anywhere, and it evaluates to a boolean
+        assertEquals(true, eval("var o = { a: 1 }; var d = delete o.a; d"));
+        assertEquals(false, eval("var o = { a: 1 }; delete o"));
+        assertEquals("yes", eval("var o = { a: 1 }; if (delete o.a) { 'yes' } else { 'no' }"));
+        assertEquals(true, eval("var o = { a: 1 }; (() => delete o.a)()"));
+        eval("var o = { a: 1, b: 2 }; var d = [delete o.a, delete o.b]");
+        NodeUtils.match(get("o"), "{}");
+        NodeUtils.match(get("d"), "[true, true]");
+        // statement position still works
+        eval("var o = { a: 1 }; delete o.a");
+        NodeUtils.match(get("o"), "{}");
+    }
+
+    @Test
+    void testTrailingDotNumbers() {
+        assertEquals(1, eval("var a = 1.; a"));
+        assertEquals(1000, eval("1.e3"));
+        // the first dot closes the literal, the second is member access
+        assertEquals("1", eval("1..toString()"));
+        assertEquals("1.5", eval("1.5.toString()"));
+    }
+
+    @Test
+    void testAsiAcrossComments() {
+        assertEquals(3, eval("var a = 1\n/* c */ var b = 2; a + b"));
+        assertEquals(3, eval("var a = 1 /* multi\n*/ var b = 2; a + b"));
+        // a LineTerminator inside a block comment ends a restricted production too
+        assertNull(eval("(function() { return /* multi\n*/ 1 })()"));
+    }
+
+    @Test
+    void testHashbang() {
+        assertEquals(2, eval("#!/usr/bin/env node\nvar a = 2; a"));
+    }
+
+    @Test
+    void testRestParamDestructuring() {
+        assertEquals(3, eval("function f(...[a, b]) { return a + b } f(1, 2)"));
+        assertEquals(2, eval("function f(...{length}) { return length } f(1, 2)"));
+        assertEquals(6, eval("function f(x, ...[a, b]) { return x + a + b } f(1, 2, 3)"));
+        assertEquals(3, eval("var f = (...[a, b]) => a + b; f(1, 2)"));
+        assertEquals("2-3", eval("function f(...[a, ...r]) { return r.join('-') } f(1, 2, 3)"));
+        assertEquals(9, eval("function f(...[a = 9]) { return a } f()"));
+        assertNull(eval("function f(...[a, b]) { return b } f(1)"));
+    }
+
+    @Test
+    void testSwitchBreakScoping() {
+        // break inside switch must not escape the enclosing if block
+        eval("var after = false; if (true) { switch ('a') { case 'a': break; case 'b': break } after = true }");
+        assertEquals(true, get("after"));
+        // break inside switch must not escape the enclosing for loop
+        eval("var count = 0; for (var i = 0; i < 3; i++) { switch (i) { case 0: break; case 1: break } count++ }");
+        assertEquals(3, get("count"));
+        // break inside switch must not escape the enclosing while loop
+        eval("var count = 0; var i = 0; while (i < 3) { switch (i) { case 0: break; case 1: break } count++; i++ }");
+        assertEquals(3, get("count"));
+        // break only unwinds the innermost switch (nested switches)
+        eval("var after = false; switch ('x') { case 'x': switch ('y') { case 'y': break } after = true; break }");
+        assertEquals(true, get("after"));
+        // default branch hit but break still confined to switch
+        eval("var after = false; if (true) { switch ('z') { case 'a': break; default: break } after = true }");
+        assertEquals(true, get("after"));
+        // return inside a switch inside a function still propagates out
+        eval("function f() { switch (1) { case 1: return 42 } return 0 } var r = f()");
+        assertEquals(42, get("r"));
+        // continue inside a switch inside a for loop still propagates to the loop
+        eval("var hits = 0; for (var i = 0; i < 3; i++) { switch (i) { case 1: continue } hits++ }");
+        assertEquals(2, get("hits"));
+    }
+
+    @Test
+    void testLabelledBreak() {
+        // the nested-loop break that unlabelled break cannot express — `trace` pins that the
+        // OUTER loop really stopped, which a snapshot of the break-time state cannot show
+        eval("""
+                var trace = ''
+                outer:
+                for (var a = 0; a < 3; a++) {
+                    for (var b = 0; b < 3; b++) {
+                        if (b === 1) break outer
+                        trace += a + '' + b
+                    }
+                }
+                """);
+        assertEquals("00", get("trace"));
+        // same, with per-iteration let bindings and with for-of
+        eval("var t = ''; o: for (let a = 0; a < 3; a++) { for (let b = 0; b < 3; b++) { if (b === 1) break o; t += a + '' + b } }");
+        assertEquals("00", get("t"));
+        eval("var t = ''; o: for (var a of [0,1,2]) { for (var b of [0,1,2]) { if (b === 1) break o; t += a + '' + b } }");
+        assertEquals("00", get("t"));
+        eval("var t = ''; o: for (var a in [0,1,2]) { for (var b in [0,1,2]) { if (b === '1') break o; t += a + '' + b } }");
+        assertEquals("00", get("t"));
+        eval("var t = ''; o: while (t.length < 6) { while (true) { t += 'x'; break o } }");
+        assertEquals("x", get("t"));
+        eval("var t = ''; o: do { do { t += 'x'; break o } while (true) } while (t.length < 6)");
+        assertEquals("x", get("t"));
+        // break naming the inner loop is the same as an unlabelled break
+        eval("""
+                var hits = 0
+                outer: for (var a = 0; a < 3; a++) {
+                    inner: for (var b = 0; b < 3; b++) {
+                        if (b === 1) break inner
+                        hits++
+                    }
+                }
+                """);
+        assertEquals(3, get("hits"));
+        // while, do-while and switch as the labelled statement
+        eval("var i = 0; w: while (true) { i++; if (i === 2) break w }");
+        assertEquals(2, get("i"));
+        eval("var i = 0; d: do { i++; if (i === 2) break d } while (i < 9)");
+        assertEquals(2, get("i"));
+        eval("var b; s: switch (1) { case 1: b = 1; break s; }");
+        assertEquals(1, get("b"));
+        // a labelled block is a legal break target even though it is not a loop
+        eval("var steps = ''; foo: { steps += 'a'; break foo; steps += 'b' } steps += 'c'");
+        assertEquals("ac", get("steps"));
+        // stacked labels both name the same loop
+        eval("var n = 0; a: b: for (var i = 0; i < 5; i++) { n++; if (i === 2) break a }");
+        assertEquals(3, get("n"));
+        eval("var n = 0; a: b: for (var i = 0; i < 5; i++) { n++; if (i === 2) break b }");
+        assertEquals(3, get("n"));
+    }
+
+    @Test
+    void testLabelledContinue() {
+        eval("""
+                var cnt = 0
+                loop2: for (var a = 0; a < 3; a++) {
+                    for (var b = 0; b < 3; b++) {
+                        if (b === 1) continue loop2
+                        cnt++
+                    }
+                }
+                """);
+        assertEquals(3, get("cnt"));
+        // continue naming the innermost loop behaves like an unlabelled continue
+        eval("var a = []; me: for (var i = 0; i < 3; i++) { if (i === 1) continue me; a.push(i) }");
+        match(get("a"), "[0, 2]");
+        // while / do-while / for-of / for-in
+        eval("var i = 0, n = 0; w: while (i < 4) { i++; if (i === 2) continue w; n++ }");
+        assertEquals(3, get("n"));
+        eval("var i = 0, n = 0; d: do { i++; if (i === 2) continue d; n++ } while (i < 4)");
+        assertEquals(3, get("n"));
+        eval("var a = []; o: for (var x of [1,2,3]) { if (x === 2) continue o; a.push(x) }");
+        match(get("a"), "[1, 3]");
+        eval("var a = []; p: for (var k in {x:1,y:2}) { if (k === 'x') continue p; a.push(k) }");
+        match(get("a"), "['y']");
+        // continue targeting an outer loop across a nested loop of each kind
+        eval("var t = ''; o: for (var a of [0,1,2]) { for (var b of [0,1,2]) { if (b === 1) continue o; t += a + '' + b } }");
+        assertEquals("001020", get("t"));
+        eval("var t = ''; var a = 0; o: while (a < 3) { a++; var b = 0; while (b < 3) { b++; if (b === 2) continue o; t += b } }");
+        assertEquals("111", get("t"));
+        eval("var t = ''; var a = 0; o: do { a++; var b = 0; do { b++; if (b === 2) continue o; t += b } while (b < 3) } while (a < 3)");
+        assertEquals("111", get("t"));
+        // continue targeting an outer loop from inside a switch and a labelled block
+        eval("var n = 0; up: for (var i = 0; i < 3; i++) { switch (i) { case 1: continue up } n++ }");
+        assertEquals(2, get("n"));
+        eval("var n = 0; up: for (var i = 0; i < 3; i++) { blk: { if (i === 1) continue up } n++ }");
+        assertEquals(2, get("n"));
+        // let-bound loop variable takes the per-iteration path — labels must work there too
+        eval("var n = 0; up: for (let i = 0; i < 4; i++) { if (i % 2 === 0) continue up; n += i }");
+        assertEquals(4, get("n"));
+    }
+
+    @Test
+    void testLabelledStatementForms() {
+        // a label on an expression statement
+        eval("x: y = 5");
+        assertEquals(5, get("y"));
+        // labels are statement-position only: object literals, ternaries and case
+        // clauses must be unaffected
+        matchEval("({a: 1})", "{ a: 1 }");
+        assertEquals(2, eval("var c = false; c ? 1 : 2"));
+        assertEquals("hit", eval("var r; switch (1) { case 1: r = 'hit' } r"));
+        // labelled break/continue survive a finally, which saves and restores the completion
+        eval("var log = ''; o: for (var i = 0; i < 3; i++) { try { if (i === 1) break o } finally { log += i } }");
+        assertEquals("01", get("log"));
+        eval("var log = ''; o: for (var i = 0; i < 3; i++) { try { if (i === 1) continue o } finally { log += i } }");
+        assertEquals("012", get("log"));
+        // a label may be reused once the statement carrying it has ended
+        eval("var n = 0; a: for (var i = 0; i < 2; i++) n++; a: for (var j = 0; j < 2; j++) n++");
+        assertEquals(4, get("n"));
+        // `break` on its own line is not a labelled break — ASI ends the statement, so the
+        // identifier below it is a plain expression statement and never has to be a label
+        eval("var foo = 9; var n = 0; bar: for (var i = 0; i < 3; i++) { break\nfoo\n} n = foo");
+        assertEquals(9, get("n"));
+        // no stale label: a consumed labelled break must not affect a later plain break/continue
+        eval("var log = ''; a: for (var i = 0; i < 2; i++) { break a } "
+                + "for (var k = 0; k < 2; k++) { log += k; if (k === 0) continue; log += 'x' }");
+        assertEquals("01x", get("log"));
+        // an abrupt finally replaces the saved labelled completion entirely
+        assertEquals("done", eval(
+                "o: for (var i = 0; i < 3; i++) { try { break o } finally { continue } } 'done'"));
+        // the finally's `break b` replaces `break a` on every outer iteration,
+        // so the outer loop runs to completion
+        assertEquals("012", eval("var log = ''; a: for (var i = 0; i < 3; i++) { "
+                + "b: for (var j = 0; j < 3; j++) { try { break a } finally { break b } } log += i } log"));
+    }
+
+    @Test
+    void testLetAndConstBasic() {
+        assertEquals(1, eval("let a = 1; a"));
+        assertEquals(1, get("a"));
+        assertEquals(2, eval("let b = 1; b = 2"));
+        assertEquals(2, get("b"));
+        assertEquals(1, eval("const a = 1; a"));
+        assertEquals(1, get("a"));
+    }
+
+    @Test
+    void testLetWithoutInitializerBindsUndefined() {
+        assertEquals(true, eval("let y; y === undefined"));
+        assertEquals(true, eval("function f() { let y; return y === undefined } f()"));
+        assertEquals(true, eval("let ok = false; { let y; ok = y === undefined } ok"));
+        assertEquals(3, eval("let y; y = 3; y"));
+    }
+
+    @Test
+    void testConstReassign() {
+        try {
+            eval("const a = 1; a = 2");
+            fail("error expected");
+        } catch (Exception e) {
+            assertTrue(e.getMessage().contains("assignment to constant: a"));
+        }
+    }
+
+    @Test
+    void testConstRedeclare() {
+        try {
+            eval("const a = 1; const a = 2");
+            fail("error expected");
+        } catch (Exception e) {
+            assertTrue(e.getMessage().contains("identifier 'a' has already been declared"));
+        }
+        try {
+            eval("let b = 1; let b = 2");
+            fail("error expected");
+        } catch (Exception e) {
+            assertTrue(e.getMessage().contains("identifier 'b' has already been declared"));
+        }
+        try {
+            eval("const c = 1; let c = 2");
+            fail("error expected");
+        } catch (Exception e) {
+            assertTrue(e.getMessage().contains("identifier 'c' has already been declared"));
+        }
+    }
+
+    @Test
+    void testBlockScopeVarHoisting() {
+        eval("{ var a = 1; { var b = 2; } }");
+        assertEquals(1, get("a"));
+        assertEquals(2, get("b"));
+    }
+
+    @Test
+    void testBlockScopeLet() {
+        assertEquals(2, eval("{ let a = 1; } var a = 2; a"));
+        assertEquals(1, eval("var a = 1; { let a = 2; } a"));
+        try {
+            eval("{ let a = 1; } a");
+            fail("error expected");
+        } catch (Exception e) {
+            assertTrue(e.getMessage().contains("a is not defined"));
+        }
+        assertEquals(3, eval("let a = 1; { let a = 2; { let a = 3; a } }"));
+    }
+
+    @Test
+    void testForLoopScope() {
+        matchEval("var funcs = []; for (let i = 0; i < 3; i++) { funcs.push(() => i) }; funcs.map(f => f())", "[0, 1, 2]");
+        matchEval("var funcs = []; for (var i = 0; i < 3; i++) { funcs.push(() => i) }; funcs.map(f => f())", "[3, 3, 3]");
+        matchEval("var funcs = []; for (let x of [10, 20, 30]) { funcs.push(() => x) }; funcs.map(f => f())", "[10, 20, 30]");
+        matchEval("var funcs = []; for (var x of [10, 20, 30]) { funcs.push(() => x) }; funcs.map(f => f())", "[30, 30, 30]");
+        matchEval("var funcs = []; var obj = {a: 1, b: 2, c: 3}; for (let k in obj) { funcs.push(() => k) }; funcs.map(f => f())", "[a, b, c]");
+        matchEval("var funcs = []; var obj = {a: 1, b: 2, c: 3}; for (var k in obj) { funcs.push(() => k) }; funcs.map(f => f())", "[c, c, c]");
+    }
+
+    @Test
+    void testVarArrayDestructuring() {
+        eval("var [a, b] = [1, 2]");
+        assertEquals(1, get("a"));
+        assertEquals(2, get("b"));
+        eval("let [a, , c] = [1, 2, 3]");
+        assertEquals(1, get("a"));
+        assertEquals(3, get("c"));
+        eval("let [a = 5] = []");
+        assertEquals(5, get("a"));
+        eval("let [a = 5] = [undefined]");
+        assertEquals(5, get("a"));
+        eval("let [a = 5] = [null]");
+        assertNull(get("a"));
+        eval("let [a, ...rest] = [1, 2, 3]");
+        assertEquals(1, get("a"));
+        match(get("rest"), "[2, 3]");
+        eval("let [a, ...rest] = [1]");
+        assertEquals(1, get("a"));
+        match(get("rest"), "[]");
+        eval("var res = []; var o = { a: 1, b: 2 }; for (const [k, v] of Object.entries(o)) { res.push(k + v) }");
+        match(get("res"), "['a1', 'b2']");
+    }
+
+    @Test
+    void testVarObjectDestructuring() {
+        eval("let { a: x, b: y } = { a: 1, b: 2 }");
+        assertEquals(1, get("x"));
+        assertEquals(2, get("y"));
+        eval("let { a, b } = { a: 1, b: 2 }");
+        assertEquals(1, get("a"));
+        assertEquals(2, get("b"));
+        eval("let {a = 5} = {}");
+        assertEquals(5, get("a"));
+        eval("let {a, ...rest} = {a: 1, b: 2, c: 3}");
+        assertEquals(1, get("a"));
+        match(get("rest"), "{b: 2, c: 3}");
+        eval("let {a, ...rest} = {a: 1}");
+        assertEquals(1, get("a"));
+        match(get("rest"), "{}");
+        eval("var res = []; var list = [{ a: 1 }, { a: 2 }]; for (const {a: x} of list) { res.push(x) }");
+        match(get("res"), "[1, 2]");
+    }
+
+    @Test
+    void testAssignDestructuring() {
+        eval("[x, y] = [1, 2]");
+        assertEquals(1, get("x"));
+        assertEquals(2, get("y"));
+        eval("({ a: x } = { a: 2 })");
+        assertEquals(2, get("x"));
+    }
+
+    @Test
+    void testNestedDeclarationDestructuring() {
+        // Nested array pattern
+        eval("var [a, [b, c]] = [1, [2, 3]]");
+        assertEquals(1, get("a"));
+        assertEquals(2, get("b"));
+        assertEquals(3, get("c"));
+        // Nested object pattern
+        eval("var {x: {y}} = {x: {y: 99}}");
+        assertEquals(99, get("y"));
+        // Rename + default: {a: b = default}
+        eval("var {a: b = 5} = {a: 10}");
+        assertEquals(10, get("b"));
+        eval("var {a: b = 5} = {}");
+        assertEquals(5, get("b"));
+        // Shorthand default fires only on undefined
+        eval("var {a = 5} = {a: 10}");
+        assertEquals(10, get("a"));
+        eval("var {a = 5} = {a: null}");
+        assertNull(get("a"));
+        // Nested pattern with default
+        eval("var [[a = 5] = []] = [[]]");
+        assertEquals(5, get("a"));
+        // let/const work the same way
+        eval("let {foo: {bar}} = {foo: {bar: 'deep'}}");
+        assertEquals("deep", get("bar"));
+    }
+
+    @Test
+    void testCommaOperatorInParens() {
+        // sequence operator returns the last value
+        assertEquals(3, eval("(1, 2, 3)"));
+        assertEquals("c", eval("('a', 'b', 'c')"));
+        // side effects in earlier expressions are observed
+        eval("var x = 0; var y = (x = 1, x + 1)");
+        assertEquals(1, get("x"));
+        assertEquals(2, get("y"));
+        // in an assignment rhs
+        eval("var a; a = (1, 2, 3)");
+        assertEquals(3, get("a"));
+    }
+
+    @Test
+    void testCommaOperatorInForLoop() {
+        // idiomatic for-loop with multi-declarator var and comma-sequence update
+        eval("var sum = 0; for (var i = 0, j = 10; i < 3; i++, j--) { sum += i + j; }");
+        // iterations: (0,10)+(1,9)+(2,8) = 10+10+10 = 30
+        assertEquals(30, get("sum"));
+    }
+
+    @Test
+    void testCommaOperatorInReturnAndThrow() {
+        eval("function f() { return 1, 2, 3; } var r = f()");
+        assertEquals(3, get("r"));
+        eval("var caught; try { throw (1, 'err-msg'); } catch (e) { caught = e; }");
+        assertEquals("err-msg", get("caught"));
+    }
+
+    @Test
+    void testMultiDeclaratorVar() {
+        eval("var a = 1, b = 2, c = 3");
+        assertEquals(1, get("a"));
+        assertEquals(2, get("b"));
+        assertEquals(3, get("c"));
+        // mixed — no-init declarators are undefined; initialized ones use their own expr
+        eval("var p, q = 10, r, s = 20");
+        assertNull(get("p"));
+        assertEquals(10, get("q"));
+        assertNull(get("r"));
+        assertEquals(20, get("s"));
+        // initializer side effects observable during the declaration
+        eval("var m = 1, n = m + 1");
+        assertEquals(1, get("m"));
+        assertEquals(2, get("n"));
+    }
+
+    @Test
+    void testMultiDeclaratorLet() {
+        eval("let a = 1, b = 2");
+        assertEquals(1, get("a"));
+        assertEquals(2, get("b"));
+        // let per-iteration isolation with multiple loop vars — each closure snapshots (i, j)
+        eval("var captured = [];\n" +
+             "for (let i = 0, j = 10; i < 3; i++, j--) {\n" +
+             "  captured.push(function() { return i + '/' + j; });\n" +
+             "}\n" +
+             "var out = captured.map(function (f) { return f(); }).join(',')");
+        assertEquals("0/10,1/9,2/8", get("out"));
+    }
+
+    @Test
+    void testMultiDeclaratorConstRequiresInit() {
+        // const without initializer is a parse error
+        assertThrows(Exception.class, () -> eval("const a = 1, b"));
+    }
+
+    @Test
+    void testCommaOperatorInConditions() {
+        // if condition
+        eval("var taken; if (0, 1) { taken = 'then'; } else { taken = 'else'; }");
+        assertEquals("then", get("taken"));
+        // while condition — stops when last value is falsy
+        eval("var n = 0; while (n++, n < 3) { }");
+        assertEquals(3, get("n"));
+    }
+
+    @Test
+    void testObjectGettersAndSetters() {
+        // Basic getter.
+        assertEquals(42, eval("({ get foo() { return 42; } }).foo"));
+        // Basic setter updates `this`.
+        assertEquals(5, eval("var o = { set bar(v) { this._x = v; } }; o.bar = 5; o._x"));
+        // Paired getter + setter share state on same key.
+        assertEquals(14, eval(
+                "var o = { _n: 10, get n() { return this._n; }, set n(v) { this._n = v * 2; } };"
+                        + " o.n = 7; o.n"));
+        // Getter-only: assignment is silently ignored.
+        assertEquals(1, eval("var o = { get x() { return 1; } }; o.x = 999; o.x"));
+        // Setter-only: read is undefined.
+        assertEquals("undefined", eval("var o = { set x(v) {} }; typeof o.x"));
+        // `get` / `set` as regular property names still work.
+        assertEquals(1, eval("({ get: 1 }).get"));
+        assertEquals(2, eval("({ set: 2 }).set"));
+        // Shorthand method named `get` or `set`.
+        assertEquals(99, eval("({ get() { return 99; } }).get()"));
+        // String-literal accessor key.
+        assertEquals("bar", eval("({ get 'foo'() { return 'bar'; } }).foo"));
+        // Computed accessor key.
+        assertEquals("computed", eval("var k='dyn'; ({ get [k]() { return 'computed'; } }).dyn"));
+    }
+
+    @Test
+    void testObjectComputedKeys() {
+        // Simple computed key
+        assertEquals(42, eval("var k = 'x'; ({[k]: 42})[k]"));
+        // Computed key from an expression
+        assertEquals(1, eval("({['a' + 'b']: 1}).ab"));
+        // Number expression coerces to string key
+        assertEquals("four", eval("({[2+2]: 'four'})[4]"));
+        // Mixed with regular and shorthand keys
+        assertEquals(true, eval(
+                "var k = 'x'; var o = {a: 1, [k]: 2, [k + '2']: 3};"
+                        + " o.a === 1 && o.x === 2 && o.x2 === 3"));
+        // Computed key with shorthand method
+        assertEquals(99, eval("var k = 'f'; ({[k]() { return 99; }}).f()"));
+    }
+
+    @Test
+    void testObjectShorthandMethods() {
+        // Zero-arg shorthand method
+        assertEquals(1, eval("({ foo() { return 1; } }).foo()"));
+        // Multi-arg shorthand method
+        assertEquals(7, eval("({ add(a, b) { return a + b; } }).add(3, 4)"));
+        // `this` inside shorthand method refers to the object
+        assertEquals(42, eval("({ x: 42, get() { return this.x; } }).get()"));
+        // typeof reports "function"
+        assertEquals("function", eval("typeof ({ foo() {} }).foo"));
+        // Mixed with regular properties and arrow/function values
+        assertEquals(true, eval(
+                "var o = { a: 1, f() { return 2; }, g: function() { return 3; } };"
+                        + " o.a === 1 && o.f() === 2 && o.g() === 3"));
+    }
+
+    @Test
+    void testDestructuringAssignmentExpression() {
+        // Array destructuring assignment as expression
+        eval("var a, b; [a, b] = [1, 2]");
+        assertEquals(1, get("a"));
+        assertEquals(2, get("b"));
+        // Object destructuring assignment
+        eval("var x, y; ({x, y} = {x: 10, y: 20})");
+        assertEquals(10, get("x"));
+        assertEquals(20, get("y"));
+        // Nested patterns recurse
+        eval("var p, q, r; [p, [q, r]] = [1, [2, 3]]");
+        assertEquals(1, get("p"));
+        assertEquals(2, get("q"));
+        assertEquals(3, get("r"));
+        // Default values fire only when source is undefined
+        assertEquals("5:7", eval("var a, b; [a = 5, b = 6] = [undefined, 7]; a+':'+b"));
+        assertEquals(10, eval("var a; ({a = 5} = {a: 10}); a"));
+        assertEquals(5, eval("var a; ({a = 5} = {}); a"));
+        // Rename + default in object pattern
+        assertEquals(10, eval("var p; ({a: p = 5} = {a: 10}); p"));
+        assertEquals(5, eval("var p; ({a: p = 5} = {}); p"));
+        // Nested object destructuring
+        assertEquals(99, eval("var y; ({x: {y}} = {x: {y: 99}}); y"));
+        // Property reference as destructuring target
+        assertEquals(99, eval("var o = {x: 0}; [o.x] = [99]; o.x"));
+        // Rest: array
+        assertEquals("1:2:3", eval("var a, r; [a, ...r] = [1, 2, 3]; a + ':' + r[0] + ':' + r[1]"));
+        // Rest: object
+        assertEquals(true, eval("var a, r; ({a, ...r} = {a: 1, b: 2, c: 3}); a === 1 && r.b === 2 && r.c === 3"));
+        // Return value is the RHS
+        assertEquals(true, eval("var a, b; var r = ([a, b] = [1, 2]); r[0] === 1 && r[1] === 2"));
+        // Chained destructuring assignment
+        assertEquals(true, eval("var a, b, c; a = [b, c] = [10, 20]; b === 10 && c === 20 && a[0] === 10 && a[1] === 20"));
+    }
+
+    @Test
+    void testArrayLiteralSpread() {
+        // Bare identifier — the only shape that ever worked.
+        matchEval("var a = [1, 2, 3]; [...a]", "[1, 2, 3]");
+        // Spread argument is any expression — function call, method call,
+        // array literal, paren expression — not just an identifier.
+        matchEval("function f(){ return [1, 2, 3] }; [...f()]", "[1, 2, 3]");
+        matchEval("var s = new Set([1, 2, 3]); [...s.values()]", "[1, 2, 3]");
+        matchEval("[...[1, 2, 3]]", "[1, 2, 3]");
+        matchEval("[...(true ? [1, 2] : [3, 4])]", "[1, 2]");
+        // Multiple spreads + interleaved elements.
+        matchEval("var a = [1, 2], b = [3, 4]; [0, ...a, ...b, 5]", "[0, 1, 2, 3, 4, 5]");
+        // Spread of an iterable that isn't a JsArray.
+        matchEval("[...new Set([1, 2, 3])]", "[1, 2, 3]");
+        // Spread of a string iterates code units.
+        matchEval("[...'abc']", "['a', 'b', 'c']");
+        // Non-iterable spread → TypeError (not a misleading ReferenceError).
+        try {
+            eval("[...undefined]");
+            fail("expected TypeError");
+        } catch (Exception e) {
+            assertTrue(e.getMessage().contains("not iterable"), e.getMessage());
+        }
+        // Calling a missing method inside a spread surfaces as
+        // "not a function" (TypeError), not "X(args) is not defined".
+        try {
+            eval("var x = {}; [...x.foo()]");
+            fail("expected TypeError");
+        } catch (Exception e) {
+            String msg = e.getMessage();
+            assertTrue(msg.contains("is not a function") && !msg.contains("is not defined"), msg);
+        }
+    }
+
+    @Test
+    void testObjectLiteralSpread() {
+        // Bare identifier — the only shape that previously parsed.
+        matchEval("var a = {x: 1}; var o = {...a, y: 2}; [o.x, o.y]", "[1, 2]");
+        // Spread argument is any expression — function call, method call, object literal.
+        matchEval("function f(){ return {x: 1} }; var o = {...f(), y: 2}; [o.x, o.y]", "[1, 2]");
+        matchEval("var m = {g: function(){ return {x: 1} }}; var o = {...m.g()}; o.x", "1");
+        matchEval("var o = {...{x: 1}, y: 2}; [o.x, o.y]", "[1, 2]");
+        // Later keys override earlier spreads (left-to-right CopyDataProperties).
+        matchEval("var o = {a: 1, ...{a: 2, b: 3}, a: 4}; [o.a, o.b]", "[4, 3]");
+        // Spreading an array exposes integer-index keys; a string exposes code-unit keys.
+        matchEval("var o = {...[7, 8]}; [o['0'], o['1']]", "[7, 8]");
+        matchEval("var o = {...'ab'}; [o['0'], o['1']]", "['a', 'b']");
+        // null / undefined spread is a no-op, not an error.
+        matchEval("var o = {...null, ...undefined, a: 1}; o.a", "1");
+    }
+
+    @Test
+    void testImmediatelyInvokedFunctionExpression() {
+        // Named function expression immediately invoked
+        assertEquals(1, eval("var x = function f1(){ return 1; }(); x"));
+        // Anonymous function expression immediately invoked
+        assertEquals(2, eval("var y = function (){ return 2; }(); y"));
+        // Function expression wrapped in parens, then invoked
+        assertEquals(3, eval("var z = (function(){ return 3; })(); z"));
+        // Invoke-from-inside-parens form: (function(){ ... }())
+        assertEquals(4, eval("var w = (function(){ return 4; }()); w"));
+        // Arrow IIFE still works (was already supported via PAREN_EXPR)
+        assertEquals(10, eval("(x => x * 2)(5)"));
+        assertEquals(5, eval("((a, b) => a + b)(2, 3)"));
+        // IIFE with arguments
+        assertEquals(6, eval("(function(a, b){ return a + b; })(2, 4)"));
+    }
+
+    @Test
+    void testTaggedTemplate() {
+        // Basic no-substitution: strings[0] === 'hello', strings.raw[0] === 'hello'
+        assertEquals(true, eval("var s; function t(x){ s = x; return x[0] + '|' + x.raw[0]; }; t`hello` === 'hello|hello'"));
+        // N substitutions yield N+1 string slots
+        assertEquals("a|1|b|2|c", eval("function t(s, a, b){ return s[0]+'|'+a+'|'+s[1]+'|'+b+'|'+s[2]; }; t`a${1}b${2}c`"));
+        // Empty leading / trailing slot
+        assertEquals("||42||", eval("function t(s, x){ return s[0]+'|'+s[0]+'|'+x+'|'+s[1]+'|'+s[1]; }; t`${42}`"));
+        // Raw vs cooked: escape `\n` cooked as newline, raw as literal backslash-n
+        assertEquals(true, eval("function t(s){ return s[0].charCodeAt(0) === 10 && s.raw[0] === '\\\\n'; }; t`\\n`"));
+        // Tag is a method reference: `obj.tag\`x\`` receives obj as 'this'
+        assertEquals(99, eval("var o = {k: 99, t: function(s){ return this.k; }}; o.t`anything`"));
+        // `new tag\`x\`` — per spec, the tagged template evaluates first and new applies to the result
+        assertEquals(7, eval("function Ctor(){ this.v = 7; }; function tag(){ return Ctor; }; (new tag`first`).v"));
+    }
+
+    @Test
+    void testSymbolWellKnownKeys() {
+        // Well-known symbols are symbol values over the literal "@@<name>" strings the
+        // engine uses internally as property keys — that key is their ToString.
+        assertEquals("symbol", eval("typeof Symbol.iterator"));
+        assertEquals("@@iterator", eval("String(Symbol.iterator)"));
+        assertEquals("@@asyncIterator", eval("String(Symbol.asyncIterator)"));
+        assertEquals("@@toPrimitive", eval("String(Symbol.toPrimitive)"));
+        assertEquals("@@toStringTag", eval("String(Symbol.toStringTag)"));
+        assertEquals("@@hasInstance", eval("String(Symbol.hasInstance)"));
+        assertEquals("@@isConcatSpreadable", eval("String(Symbol.isConcatSpreadable)"));
+        assertEquals("@@species", eval("String(Symbol.species)"));
+        assertEquals("@@match", eval("String(Symbol.match)"));
+        assertEquals("@@matchAll", eval("String(Symbol.matchAll)"));
+        assertEquals("@@replace", eval("String(Symbol.replace)"));
+        assertEquals("@@search", eval("String(Symbol.search)"));
+        assertEquals("@@split", eval("String(Symbol.split)"));
+        assertEquals("@@unscopables", eval("String(Symbol.unscopables)"));
+    }
+
+    @Test
+    void testSymbolToPrimitiveDispatch() {
+        // @@toPrimitive overrides valueOf/toString in ToPrimitive. Spec hints:
+        //   binary +  → "default"   numeric ops → "number"   String() → "string"
+        // Binary + with hint "default": numeric branch
+        assertEquals(11, eval(
+                "var o = { [Symbol.toPrimitive]: function(h){ return h === 'default' ? 10 : -1; } };"
+                        + "o + 1"));
+        // Binary + with hint "default": string branch (returning a string makes + concatenate)
+        assertEquals("hi1", eval(
+                "var o = { [Symbol.toPrimitive]: function(h){ return h === 'default' ? 'hi' : 'x'; } };"
+                        + "o + 1"));
+        // @@toPrimitive takes precedence over valueOf/toString
+        assertEquals(99, eval(
+                "var o = { valueOf: function(){ return 1; }, toString: function(){ return '2'; },"
+                        + "  [Symbol.toPrimitive]: function(){ return 99; } };"
+                        + "o + 0"));
+        // Returning a non-primitive must throw TypeError per spec
+        assertThrows(Exception.class, () -> eval(
+                "var o = { [Symbol.toPrimitive]: function(){ return {}; } }; o + 0"));
+        // Set-but-not-callable @@toPrimitive must TypeError (spec GetMethod)
+        assertThrows(Exception.class, () -> eval(
+                "var o = { [Symbol.toPrimitive]: 1 }; o + 0"));
+    }
+
+    @Test
+    void testDateToPrimitive() {
+        // Date.prototype[@@toPrimitive] treats hint "default" as "string", so binary +
+        // string-concatenates Dates instead of adding their timestamps. Spec §21.4.4.45.
+        assertEquals(true, eval("var d = new Date(0); (d + d) === (d.toString() + d.toString())"));
+        // Hint "number" still routes to valueOf (the timestamp)
+        assertEquals(true, eval("var d = new Date(0); +d === d.getTime()"));
+        // Invalid hint TypeErrors
+        assertThrows(Exception.class, () -> eval(
+                "new Date()[Symbol.toPrimitive]('bogus')"));
+    }
+
+    @Test
+    void testSymbolToStringTag() {
+        // @@toStringTag (string) overrides the host-class-derived tag
+        assertEquals("[object Foo]", eval(
+                "var o = { [Symbol.toStringTag]: 'Foo' };"
+                        + "Object.prototype.toString.call(o)"));
+        // Non-string @@toStringTag is ignored — falls through to builtinTag
+        assertEquals("[object Object]", eval(
+                "var o = { [Symbol.toStringTag]: 42 };"
+                        + "Object.prototype.toString.call(o)"));
+        // Built-in tags still work when @@toStringTag is absent
+        assertEquals("[object Array]", eval("Object.prototype.toString.call([])"));
+        assertEquals("[object Object]", eval("Object.prototype.toString.call({})"));
+        // @@toStringTag inherited via prototype chain — set on parent, read on child
+        assertEquals("[object Bar]", eval(
+                "var parent = { [Symbol.toStringTag]: 'Bar' };"
+                        + "var child = Object.create(parent);"
+                        + "Object.prototype.toString.call(child)"));
+    }
+
+    @Test
+    void testInOperator() {
+        // Plain object — own properties
+        assertEquals(true, eval("'foo' in {foo: 1, bar: 2}"));
+        assertEquals(true, eval("'bar' in {foo: 1, bar: 2}"));
+        assertEquals(false, eval("'baz' in {foo: 1, bar: 2}"));
+        // Property set to undefined still counts as present (spec — own key)
+        assertEquals(true, eval("'foo' in {foo: undefined}"));
+        // Numeric key — coerced to string per ToPropertyKey
+        assertEquals(true, eval("0 in [10, 20, 30]"));
+        assertEquals(true, eval("2 in [10, 20, 30]"));
+        assertEquals(false, eval("5 in [10, 20, 30]"));
+        assertEquals(true, eval("'0' in [10, 20, 30]"));
+        // Inherited property (Array.prototype.length is own; push is inherited)
+        assertEquals(true, eval("'length' in []"));
+        assertEquals(true, eval("'push' in []"));
+        // String literal length is own-on-prototype
+        assertEquals(true, eval("'foo' in {foo: null}"));
+        // Empty object — no own keys, but inherited from Object.prototype
+        assertEquals(false, eval("'foo' in {}"));
+        assertEquals(true, eval("'toString' in {}"));
+    }
+
+    @Test
+    void testInOperatorTypeErrorOnNonObject() {
+        // RHS must be an object — primitives and null/undefined throw TypeError
+        assertThrows(Exception.class, () -> eval("'foo' in null"));
+        assertThrows(Exception.class, () -> eval("'foo' in undefined"));
+        assertThrows(Exception.class, () -> eval("0 in 42"));
+        assertThrows(Exception.class, () -> eval("'len' in 'hello'"));
+        assertThrows(Exception.class, () -> eval("0 in true"));
+    }
+
+    @Test
+    void testInOperatorInsideExpressions() {
+        // Used as a boolean in conditionals
+        assertEquals("yes", eval("var o = {a: 1}; ('a' in o) ? 'yes' : 'no'"));
+        assertEquals("no", eval("var o = {a: 1}; ('b' in o) ? 'yes' : 'no'"));
+        // Combined with logical operators
+        assertEquals(true, eval("'a' in {a: 1} && 'b' in {b: 2}"));
+        assertEquals(true, eval("'a' in {a: 1} || 'b' in {a: 1}"));
+        // Chained in a ternary deep inside an expression
+        assertEquals(1, eval("var o = {x: 1}; ('x' in o) && o.x"));
+        // Assigned to a variable
+        assertEquals(true, eval("var has = 'foo' in {foo: 1}; has"));
+    }
+
+    @Test
+    void testForInStillWorksAfterInOperator() {
+        // The originally-failing pattern from EngineTest.testForLoopIterationTracking —
+        // for-in must still consume IN at the for-statement level, not eat it as a
+        // relational operator in expression land. The noIn flag handles this.
+        eval("""
+                var a = {a: 1, b: 2, c: 3};
+                var keys = [];
+                for (x in a) keys.push(x);
+                """);
+        assertEquals(java.util.List.of("a", "b", "c"), get("keys"));
+        // for-in with `var` declaration
+        eval("""
+                var b = {x: 10, y: 20};
+                var ks = [];
+                for (var k in b) ks.push(k);
+                """);
+        assertEquals(java.util.List.of("x", "y"), get("ks"));
+    }
+
+    @Test
+    void testInOperatorInsideForInitParensResetNoIn() {
+        // Parens reset the no-in restriction — inside `for ( ... )` an `in`
+        // wrapped in further parens IS a relational operator. Without noIn
+        // reset, this would parse as a for-in header and choke.
+        eval("""
+                var o = {target: 99};
+                var x;
+                for (x = ('target' in o ? 1 : 0); x < 3; x++) { /* no body */ }
+                """);
+        assertEquals(3, get("x"));
+        // Mixed: relational `in` inside ternary inside the init expression's
+        // grouping, paired with a real for-loop test/update.
+        eval("""
+                var o = {found: true};
+                var collected = [];
+                for (var i = (('found' in o) ? 0 : 99); i < 3; i++) collected.push(i);
+                """);
+        assertEquals(java.util.List.of(0, 1, 2), get("collected"));
+    }
+
+    @Test
+    void testDestructuringDefaultUndefinedVsNull() {
+        // Present-with-undefined: default fires
+        assertEquals(1, eval("var x; ({ x = 1 } = { x: undefined }); x"));
+        // Present-with-null: default does NOT fire (null is a valid value)
+        assertNull(eval("var x; ({ x = 1 } = { x: null }); x"));
+        // Absent: default fires
+        assertEquals(5, eval("var x; ({ x = 5 } = {}); x"));
+        // Present-with-value: value wins
+        assertEquals(42, eval("var x; ({ x = 1 } = { x: 42 }); x"));
+        // Array destructuring on non-iterable throws TypeError (spec 13.3.3.5)
+        assertThrows(Exception.class, () -> eval("var a; [a] = true"));
+        assertThrows(Exception.class, () -> eval("[,] = 1"));
+        // String is iterable (destructures by code unit)
+        assertEquals("h", eval("var a; [a] = 'hello'; a"));
+    }
+
+}

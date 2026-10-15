@@ -1,0 +1,1107 @@
+package io.karatelabs.gherkin;
+
+import io.karatelabs.common.Resource;
+import io.karatelabs.parser.Node;
+import io.karatelabs.parser.NodeType;
+import io.karatelabs.parser.SyntaxError;
+import io.karatelabs.parser.Token;
+import io.karatelabs.parser.TokenType;
+import org.junit.jupiter.api.Test;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.List;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+class GherkinParserTest {
+
+    static final Logger logger = LoggerFactory.getLogger(GherkinParserTest.class);
+
+    Feature feature;
+    Scenario scenario;
+    ScenarioOutline outline;
+
+    private void feature(String text) {
+        Resource resource = Resource.text(text);
+        GherkinParser parser = new GherkinParser(resource);
+        feature = parser.parse();
+        scenario = null;
+        if (!feature.getSections().isEmpty()) {
+            FeatureSection section = feature.getSections().getFirst();
+            scenario = section.getScenario();
+            outline = section.getScenarioOutline();
+        }
+    }
+
+    @Test
+    void testFeatureBasics() {
+        feature("""
+                Feature:
+                """);
+        assertNull(feature.getName());
+
+        feature("""
+                Feature: foo
+                """);
+        assertEquals("foo", feature.getName());
+
+        feature("""
+                Feature: foo
+                    bar
+                """);
+        assertEquals("foo", feature.getName());
+        assertEquals("bar", feature.getDescription());
+        assertTrue(feature.getTags().isEmpty());
+
+        feature("""
+                @tag1 @tag2
+                Feature: foo
+                """);
+        List<Tag> tags = feature.getTags();
+        assertEquals(2, tags.size());
+        assertEquals("tag1", tags.get(0).getName());
+        assertEquals("tag2", tags.get(1).getName());
+
+    }
+
+    @Test
+    void testScenarioBasics() {
+        feature("""
+                Feature:
+                Scenario: foo
+                  bar
+                  * print 'hello world'
+                """);
+        assertEquals("foo", scenario.getName());
+        assertEquals("bar", scenario.getDescription());
+        assertEquals(1, scenario.getSteps().size());
+        Step step = scenario.getSteps().getFirst();
+        assertEquals("*", step.getPrefix());
+        assertEquals("print", step.getKeyword());
+        assertEquals("'hello world'", step.getText());
+    }
+
+    @Test
+    void testSimpleHttp() {
+        feature("""
+                Feature:
+                Scenario:
+                  * url 'http://httpbin.org/get'
+                  * method get
+                """);
+        Step step1 = scenario.getSteps().getFirst();
+        assertEquals("url", step1.getKeyword());
+        assertEquals("'http://httpbin.org/get'", step1.getText());
+        Step step2 = scenario.getSteps().get(1);
+        assertEquals("method", step2.getKeyword());
+        assertEquals("get", step2.getText());
+    }
+
+    // ========== AST Structure Tests ==========
+
+    private GherkinParser parser;
+
+    private void parseWithAst(String text) {
+        parseWithAst(text, false);
+    }
+
+    private void parseWithAst(String text, boolean errorRecovery) {
+        Resource resource = Resource.text(text);
+        parser = new GherkinParser(resource, errorRecovery);
+        feature = parser.parse();
+        scenario = null;
+        outline = null;
+        if (!feature.getSections().isEmpty()) {
+            FeatureSection section = feature.getSections().getFirst();
+            scenario = section.getScenario();
+            outline = section.getScenarioOutline();
+        }
+    }
+
+    @Test
+    void testAstStructure() {
+        parseWithAst("""
+                @tag1
+                Feature: name
+                  description
+                Scenario: test
+                  * def x = 1
+                """);
+
+        Node ast = parser.getAst();
+        assertNotNull(ast);
+        assertEquals(NodeType.G_FEATURE, ast.type);
+
+        // Verify tags node exists
+        Node tags = ast.findFirstChild(NodeType.G_TAGS);
+        assertNotNull(tags);
+
+        // Verify scenario node exists
+        Node scenarioNode = ast.findFirstChild(NodeType.G_SCENARIO);
+        assertNotNull(scenarioNode);
+
+        // Verify step node exists
+        Node step = ast.findFirstChild(NodeType.G_STEP);
+        assertNotNull(step);
+    }
+
+    @Test
+    void testAstAvailable() {
+        parseWithAst("""
+                Feature: test
+                Scenario: first
+                  * print 'hello'
+                """);
+
+        Node ast = parser.getAst();
+        assertNotNull(ast);
+        assertEquals(NodeType.G_FEATURE, ast.type);
+    }
+
+    // ========== Error Recovery Tests ==========
+
+    @Test
+    void testMissingFeatureKeyword() {
+        parseWithAst("""
+                @tag
+                Scenario: orphan
+                  * print 'hello'
+                """, true);
+        // Should recover and parse scenario
+        assertNotNull(scenario);
+        assertEquals("orphan", scenario.getName());
+        assertEquals(1, scenario.getSteps().size());
+
+        // Should have recorded an error
+        assertTrue(parser.hasErrors());
+        List<SyntaxError> errors = parser.getErrors();
+        assertFalse(errors.isEmpty());
+    }
+
+    @Test
+    void testIncompleteStep() {
+        parseWithAst("""
+                Feature: test
+                Scenario: incomplete
+                  * def
+                """, true);
+        // Should parse without throwing
+        assertNotNull(scenario);
+        assertEquals(1, scenario.getSteps().size());
+        Step step = scenario.getSteps().getFirst();
+        assertEquals("def", step.getKeyword());
+        // Missing RHS - text should be null
+        assertNull(step.getText());
+    }
+
+    @Test
+    void testMultipleScenarios() {
+        parseWithAst("""
+                Feature: multi
+                Scenario: first
+                  * print 'one'
+                Scenario: second
+                  * print 'two'
+                """);
+        assertEquals(2, feature.getSections().size());
+        assertEquals("first", feature.getSections().get(0).getScenario().getName());
+        assertEquals("second", feature.getSections().get(1).getScenario().getName());
+    }
+
+    @Test
+    void testScenarioWithTags() {
+        parseWithAst("""
+                Feature: test
+                @smoke @regression
+                Scenario: tagged
+                  * print 'hello'
+                """);
+        assertNotNull(scenario);
+        assertNotNull(scenario.getTags());
+        assertEquals(2, scenario.getTags().size());
+        assertEquals("smoke", scenario.getTags().get(0).getName());
+        assertEquals("regression", scenario.getTags().get(1).getName());
+    }
+
+    @Test
+    void testBackground() {
+        parseWithAst("""
+                Feature: with background
+                Background:
+                  * def base = 'http://localhost'
+                Scenario: test
+                  * print base
+                """);
+        assertNotNull(feature.getBackground());
+        assertEquals(1, feature.getBackground().getSteps().size());
+        Step bgStep = feature.getBackground().getSteps().getFirst();
+        assertEquals("def", bgStep.getKeyword());
+    }
+
+    @Test
+    void testTable() {
+        parseWithAst("""
+                Feature: test
+                Scenario: with table
+                  * def data =
+                    | name | age |
+                    | John | 30  |
+                    | Jane | 25  |
+                """);
+        assertNotNull(scenario);
+        assertEquals(1, scenario.getSteps().size());
+        Step step = scenario.getSteps().getFirst();
+        assertNotNull(step.getTable());
+        assertEquals(3, step.getTable().getRows().size()); // header + 2 data rows
+    }
+
+    @Test
+    void testTableWithEscapedPipe() {
+        // A backslash-escaped pipe "\|" inside a cell is a literal pipe, not a column delimiter
+        parseWithAst("""
+                Feature: test
+                Scenario: with escaped pipe
+                  * def data =
+                    | message           |
+                    | Hello \\| World    |
+                """);
+        assertNotNull(scenario);
+        Step step = scenario.getSteps().getFirst();
+        assertNotNull(step.getTable());
+        List<List<String>> rows = step.getTable().getRows();
+        assertEquals(2, rows.size()); // header + 1 data row
+        assertEquals(1, rows.get(0).size()); // single column, pipe was not a delimiter
+        assertEquals("message", rows.get(0).get(0));
+        assertEquals(1, rows.get(1).size());
+        assertEquals("Hello | World", rows.get(1).get(0));
+    }
+
+    @Test
+    void testScenarioOutlineWithExamples() {
+        parseWithAst("""
+                Feature: outline test
+                Scenario Outline: parameterized
+                  * print '<name>'
+                Examples:
+                  | name  |
+                  | Alice |
+                  | Bob   |
+                """);
+        assertNotNull(outline);
+        assertEquals("parameterized", outline.getName());
+        assertEquals(1, outline.getSteps().size());
+        assertEquals(1, outline.getExamplesTables().size());
+        assertNotNull(outline.getExamplesTables().get(0).getTable());
+    }
+
+    @Test
+    void testNoErrors() {
+        parseWithAst("""
+                Feature: valid
+                Scenario: test
+                  * def x = 1
+                  * print x
+                """);
+        assertFalse(parser.hasErrors());
+        assertTrue(parser.getErrors().isEmpty());
+    }
+
+    // ========== MatchExpression Parsing Tests ==========
+
+    @Test
+    void testParseMatchExpressionEquals() {
+        MatchExpression me = GherkinParser.parseMatchExpression("foo == bar");
+        assertFalse(me.isEach());
+        assertEquals("foo", me.getActualExpr());
+        assertEquals("==", me.getOperator());
+        assertEquals("bar", me.getExpectedExpr());
+        assertEquals("EQUALS", me.getMatchTypeName());
+    }
+
+    @Test
+    void testParseMatchExpressionContains() {
+        MatchExpression me = GherkinParser.parseMatchExpression("foo contains { a: '#number' }");
+        assertFalse(me.isEach());
+        assertEquals("foo", me.getActualExpr());
+        assertEquals("contains", me.getOperator());
+        assertEquals("{ a: '#number' }", me.getExpectedExpr());
+        assertEquals("CONTAINS", me.getMatchTypeName());
+    }
+
+    @Test
+    void testParseMatchExpressionEach() {
+        MatchExpression me = GherkinParser.parseMatchExpression("each foo == '#number'");
+        assertTrue(me.isEach());
+        assertEquals("foo", me.getActualExpr());
+        assertEquals("==", me.getOperator());
+        assertEquals("'#number'", me.getExpectedExpr());
+        assertEquals("EACH_EQUALS", me.getMatchTypeName());
+    }
+
+    @Test
+    void testParseMatchExpressionContainsDeep() {
+        MatchExpression me = GherkinParser.parseMatchExpression("foo contains deep { a: 1 }");
+        assertFalse(me.isEach());
+        assertEquals("foo", me.getActualExpr());
+        assertEquals("contains deep", me.getOperator());
+        assertEquals("{ a: 1 }", me.getExpectedExpr());
+        assertEquals("CONTAINS_DEEP", me.getMatchTypeName());
+    }
+
+    @Test
+    void testParseMatchExpressionContainsDeepWithNewline() {
+        // This simulates "* match message contains deep" followed by content on next line
+        // The operator should be "contains deep", not just "contains" with "deep" as expected
+        // Note: Using docstring syntax to match actual Gherkin usage
+        MatchExpression me = GherkinParser.parseMatchExpression("message contains deep\n\"\"\"\n{ order_id: 5 }\n\"\"\"");
+        assertFalse(me.isEach());
+        assertEquals("message", me.getActualExpr());
+        assertEquals("contains deep", me.getOperator());
+        assertTrue(me.getExpectedExpr().contains("order_id"));
+        assertEquals("CONTAINS_DEEP", me.getMatchTypeName());
+    }
+
+    @Test
+    void testParseMatchExpressionContainsDeepWithIndentedDocstring() {
+        // Match actual failing test: "* match message contains deep" with indented docstring
+        MatchExpression me = GherkinParser.parseMatchExpression("message contains deep\n  \"\"\"\n  { order_id: 5 }\n  \"\"\"");
+        assertFalse(me.isEach());
+        assertEquals("message", me.getActualExpr());
+        assertEquals("contains deep", me.getOperator());
+        assertTrue(me.getExpectedExpr().contains("order_id"));
+        assertEquals("CONTAINS_DEEP", me.getMatchTypeName());
+    }
+
+    @Test
+    void testTokenizeContainsDeepWithNewline() {
+        // Verify "contains deep" is tokenized as single G_KEYWORD when followed by docstring
+        Resource resource = Resource.text("* match message contains deep\n  \"\"\"\n  { order_id: 5 }\n  \"\"\"");
+        GherkinLexer lexer = new GherkinLexer(resource);
+        Token token;
+        boolean foundContainsDeep = false;
+        do {
+            token = lexer.nextToken();
+            if (token.type == TokenType.G_KEYWORD && "contains deep".equals(token.getText())) {
+                foundContainsDeep = true;
+            }
+        } while (token.type != TokenType.EOF);
+        assertTrue(foundContainsDeep, "Expected 'contains deep' as single G_KEYWORD token");
+    }
+
+    @Test
+    void testParseMatchExpressionContainsDeepNoExpected() {
+        // When step.getText() is "message contains deep" (no expected value on same line),
+        // the docstring provides the expected value separately.
+        // The operator should be "contains deep", not just "contains" with "deep" as expected.
+        MatchExpression me = GherkinParser.parseMatchExpression("message contains deep");
+        assertEquals("message", me.getActualExpr());
+        assertEquals("contains deep", me.getOperator());
+        // Expected should be null or empty since docstring will provide it
+        assertTrue(me.getExpectedExpr() == null || me.getExpectedExpr().isEmpty(),
+                "Expected expr should be null/empty, but was: '" + me.getExpectedExpr() + "'");
+        assertEquals("CONTAINS_DEEP", me.getMatchTypeName());
+    }
+
+    @Test
+    void testParseMatchExpressionNotContains() {
+        MatchExpression me = GherkinParser.parseMatchExpression("foo !contains bar");
+        assertFalse(me.isEach());
+        assertEquals("foo", me.getActualExpr());
+        assertEquals("!contains", me.getOperator());
+        assertEquals("bar", me.getExpectedExpr());
+        assertEquals("NOT_CONTAINS", me.getMatchTypeName());
+    }
+
+    @Test
+    void testParseMatchExpressionNotEquals() {
+        MatchExpression me = GherkinParser.parseMatchExpression("foo != bar");
+        assertFalse(me.isEach());
+        assertEquals("foo", me.getActualExpr());
+        assertEquals("!=", me.getOperator());
+        assertEquals("bar", me.getExpectedExpr());
+        assertEquals("NOT_EQUALS", me.getMatchTypeName());
+    }
+
+    @Test
+    void testParseMatchExpressionBracketAccess() {
+        MatchExpression me = GherkinParser.parseMatchExpression("json['hy-phen'] == 'bar'");
+        assertFalse(me.isEach());
+        assertEquals("json['hy-phen']", me.getActualExpr());
+        assertEquals("==", me.getOperator());
+        assertEquals("'bar'", me.getExpectedExpr());
+    }
+
+    @Test
+    void testParseMatchExpressionWithMethodCall() {
+        MatchExpression me = GherkinParser.parseMatchExpression("query == read('file.txt').replaceAll(\"\\r\", \"\")");
+        assertFalse(me.isEach());
+        assertEquals("query", me.getActualExpr());
+        assertEquals("==", me.getOperator());
+        assertEquals("read('file.txt').replaceAll(\"\\r\", \"\")", me.getExpectedExpr());
+    }
+
+    @Test
+    void testParseMatchExpressionWithin() {
+        MatchExpression me = GherkinParser.parseMatchExpression("subset within superset");
+        assertFalse(me.isEach());
+        assertEquals("subset", me.getActualExpr());
+        assertEquals("within", me.getOperator());
+        assertEquals("superset", me.getExpectedExpr());
+        assertEquals("WITHIN", me.getMatchTypeName());
+    }
+
+    @Test
+    void testParseMatchExpressionNotWithin() {
+        MatchExpression me = GherkinParser.parseMatchExpression("foo !within bar");
+        assertFalse(me.isEach());
+        assertEquals("foo", me.getActualExpr());
+        assertEquals("!within", me.getOperator());
+        assertEquals("bar", me.getExpectedExpr());
+        assertEquals("NOT_WITHIN", me.getMatchTypeName());
+    }
+
+    @Test
+    void testParseMatchExpressionBareXPath() {
+        // V1 SOAP syntax: match /Envelope/Body/AddResponse/AddResult == '5'
+        MatchExpression me = GherkinParser.parseMatchExpression("/Envelope/Body/AddResponse/AddResult == '5'");
+        assertFalse(me.isEach());
+        assertEquals("/Envelope/Body/AddResponse/AddResult", me.getActualExpr());
+        assertEquals("==", me.getOperator());
+        assertEquals("'5'", me.getExpectedExpr());
+    }
+
+    @Test
+    void testDocStringWithJsonArray() {
+        feature("""
+                Feature: docstring test
+                Scenario: with json array
+                  * def expected =
+                  \"\"\"
+                  [
+                      { name: '#notnull' },
+                      { name: '#notnull' }
+                  ]
+                  \"\"\"
+                  * print expected
+                """);
+        assertNotNull(scenario);
+        assertEquals(2, scenario.getSteps().size());
+        Step step = scenario.getSteps().getFirst();
+        assertEquals("def", step.getKeyword());
+        assertNotNull(step.getDocString());
+        assertTrue(step.getDocString().contains("["));
+    }
+
+    // ========== Call Syntax Tests ==========
+
+    @Test
+    void testCallWithInlineJsonArg() {
+        // V1 syntax: call fun { key: 'value' } - inline JSON argument
+        feature("""
+                Feature: call test
+                Scenario: call with inline json
+                  * def fun = function(arg){ return arg.first }
+                  * def result = call fun { first: 'dummy', second: 'other' }
+                  * match result == 'dummy'
+                """);
+        assertNotNull(scenario);
+        assertEquals(3, scenario.getSteps().size());
+        Step step = scenario.getSteps().get(1);
+        assertEquals("def", step.getKeyword());
+        assertEquals("result = call fun { first: 'dummy', second: 'other' }", step.getText());
+    }
+
+    @Test
+    void testStepComments() {
+        // Test that comments preceding a step are captured
+        feature("""
+                Feature: test
+                Scenario: with comment
+                  * def foo = 1
+                  # this is a comment label
+                  * match foo == 1
+                """);
+        assertNotNull(scenario);
+        assertEquals(2, scenario.getSteps().size());
+        Step matchStep = scenario.getSteps().get(1);
+        assertEquals("match", matchStep.getKeyword());
+        List<String> comments = matchStep.getComments();
+        assertNotNull(comments, "Step should have comments");
+        assertFalse(comments.isEmpty(), "Comments should not be empty");
+        assertTrue(comments.get(0).contains("this is a comment label"));
+    }
+
+    @Test
+    void testDocStringWithTrailingSpaces() {
+        // Test that closing """ with trailing spaces is parsed correctly
+        // This was a bug where {NOT_LF}+ would match """ plus trailing chars
+        feature("""
+                Feature: docstring test
+                Scenario Outline: with trailing spaces
+                  * def expected =
+                  \"\"\"
+                  [
+                      { name: '#notnull' }
+                  ]
+                  \"\"\"
+                  Given path 'search'
+                Examples:
+                  | name |
+                  | foo  |
+                """);
+        assertNotNull(outline);
+        assertEquals(2, outline.getSteps().size());
+        Step step1 = outline.getSteps().get(0);
+        assertEquals("def", step1.getKeyword());
+        assertNotNull(step1.getDocString());
+        assertTrue(step1.getDocString().contains("["));
+    }
+
+    // ========== Windows CRLF Compatibility Tests ==========
+
+    @Test
+    void testWindowsCrlfLineEndings() {
+        // Simulate Windows CRLF line endings - tags should not include \r
+        String windowsFeature = "@ignore\r\n" +
+                "Feature: windows test\r\n" +
+                "\r\n" +
+                "@setup\r\n" +
+                "Scenario: test scenario\r\n" +
+                "  * def x = 1\r\n";
+        feature(windowsFeature);
+
+        // Feature @ignore tag should be parsed correctly (no \r)
+        assertEquals(1, feature.getTags().size());
+        assertEquals("ignore", feature.getTags().get(0).getName());
+        assertFalse(feature.getTags().get(0).getName().contains("\r"),
+                "Tag name should not contain carriage return");
+
+        // Scenario @setup tag should be parsed correctly (no \r)
+        assertNotNull(scenario);
+        assertEquals(1, scenario.getTags().size());
+        assertEquals("setup", scenario.getTags().get(0).getName());
+        assertFalse(scenario.getTags().get(0).getName().contains("\r"),
+                "Tag name should not contain carriage return");
+    }
+
+    @Test
+    void testWindowsCrlfWithTagValues() {
+        // Test tags with values using CRLF
+        String windowsFeature = "@env=dev,qa\r\n" +
+                "Feature: env test\r\n" +
+                "Scenario: test\r\n" +
+                "  * print 'hello'\r\n";
+        feature(windowsFeature);
+
+        assertEquals(1, feature.getTags().size());
+        Tag envTag = feature.getTags().get(0);
+        assertEquals("env", envTag.getName());
+        assertEquals(2, envTag.getValues().size());
+        assertEquals("dev", envTag.getValues().get(0));
+        assertEquals("qa", envTag.getValues().get(1));
+    }
+
+    // ========== Keyword vs JS Expression Tests ==========
+
+    @Test
+    void testCookieKeywordVsJsExpression() {
+        // Test that "cookie foo = 'bar'" is parsed with cookie as keyword
+        // but "cookie({...})" is parsed as JS expression (no keyword)
+        feature("""
+                Feature: cookie parsing
+                Scenario: keyword form
+                  * cookie foo = 'bar'
+                Scenario: js expression form
+                  * cookie({ name: 'test', value: 'hello' })
+                """);
+
+        // First scenario: cookie as keyword
+        Scenario keywordScenario = feature.getSections().get(0).getScenario();
+        Step keywordStep = keywordScenario.getSteps().getFirst();
+        assertEquals("cookie", keywordStep.getKeyword());
+        assertEquals("foo = 'bar'", keywordStep.getText());
+
+        // Second scenario: cookie as JS expression (no keyword)
+        Scenario exprScenario = feature.getSections().get(1).getScenario();
+        Step exprStep = exprScenario.getSteps().getFirst();
+        assertNull(exprStep.getKeyword(), "cookie({...}) should not have a keyword");
+        assertEquals("cookie({ name: 'test', value: 'hello' })", exprStep.getText());
+    }
+
+    @Test
+    void testHeaderKeywordVsJsExpression() {
+        // Same pattern applies to other assign keywords like header
+        feature("""
+                Feature: header parsing
+                Scenario: keyword form
+                  * header Authorization = 'Bearer token'
+                Scenario: js expression form
+                  * header({ name: 'Authorization', value: 'Bearer token' })
+                """);
+
+        // First scenario: header as keyword
+        Scenario keywordScenario = feature.getSections().get(0).getScenario();
+        Step keywordStep = keywordScenario.getSteps().getFirst();
+        assertEquals("header", keywordStep.getKeyword());
+        assertEquals("Authorization = 'Bearer token'", keywordStep.getText());
+
+        // Second scenario: header as JS expression (no keyword)
+        Scenario exprScenario = feature.getSections().get(1).getScenario();
+        Step exprStep = exprScenario.getSteps().getFirst();
+        assertNull(exprStep.getKeyword(), "header({...}) should not have a keyword");
+        assertEquals("header({ name: 'Authorization', value: 'Bearer token' })", exprStep.getText());
+    }
+
+    @Test
+    void testDefKeywordVsArrayAccess() {
+        // Test that "def foo = bar" is keyword but "def[0]" is JS expression
+        feature("""
+                Feature: def parsing
+                Scenario: keyword form
+                  * def foo = 'bar'
+                Scenario: array access form
+                  * def[0].name
+                """);
+
+        // First scenario: def as keyword
+        Scenario keywordScenario = feature.getSections().get(0).getScenario();
+        Step keywordStep = keywordScenario.getSteps().getFirst();
+        assertEquals("def", keywordStep.getKeyword());
+        assertEquals("foo = 'bar'", keywordStep.getText());
+
+        // Second scenario: def[0] as JS expression (no keyword)
+        Scenario exprScenario = feature.getSections().get(1).getScenario();
+        Step exprStep = exprScenario.getSteps().getFirst();
+        assertNull(exprStep.getKeyword(), "def[0] should not have a keyword");
+        assertEquals("def[0].name", exprStep.getText());
+    }
+
+    // ========== DocString Line Offset Tests ==========
+
+    @Test
+    void testDocStringLineOffset() {
+        // Line numbers are 1-indexed for step.getLine()
+        // docStringLine is 0-indexed (for the lexer)
+        feature("""
+                Feature: test
+                Scenario: eval docstring
+                  * eval
+                    \"\"\"
+                    var x = 1;
+                    var y = 2;
+                    \"\"\"
+                """);
+        Step step = scenario.getSteps().getFirst();
+        assertEquals("eval", step.getKeyword());
+        assertNotNull(step.getDocString());
+        assertTrue(step.getDocString().contains("var x = 1"));
+        // step is on line 3 (1-indexed), """ is on line 4, content starts on line 5
+        // docStringLine is 0-indexed, so line 5 → index 4
+        assertTrue(step.getDocStringLine() >= 0, "docStringLine should be set");
+        assertEquals(4, step.getDocStringLine());
+    }
+
+    @Test
+    void testDocStringLineOffsetWithDef() {
+        feature("""
+                Feature: test
+                Scenario: def docstring
+                  * def foo =
+                    \"\"\"
+                    function() { return 1 }
+                    \"\"\"
+                """);
+        Step step = scenario.getSteps().getFirst();
+        assertEquals("def", step.getKeyword());
+        assertNotNull(step.getDocString());
+        assertTrue(step.getDocStringLine() >= 0);
+        // """ is on line 4 (1-indexed → 0-indexed = 3), content on line 5 (0-indexed = 4)
+        assertEquals(4, step.getDocStringLine());
+    }
+
+    @Test
+    void testDocStringLineNotSetWithoutDocString() {
+        feature("""
+                Feature: test
+                Scenario: no docstring
+                  * eval 1 + 2
+                """);
+        Step step = scenario.getSteps().getFirst();
+        assertNull(step.getDocString());
+        assertEquals(-1, step.getDocStringLine());
+    }
+
+    // ========== Empty File Handling Tests ==========
+
+    @Test
+    void testConfigureDriverSteps() {
+        feature("""
+                Feature:
+
+                  Scenario:
+                    * configure driver = { type: 'chrome' }
+                    * driver 'https://github.com/login'
+                    * karate.pause(10000)
+                """);
+        assertNotNull(scenario, "Scenario should be parsed");
+        assertEquals(3, scenario.getSteps().size(), "Should have 3 steps");
+        Step step1 = scenario.getSteps().get(0);
+        assertEquals("configure", step1.getKeyword());
+        Step step2 = scenario.getSteps().get(1);
+        assertEquals("driver", step2.getKeyword());
+        Step step3 = scenario.getSteps().get(2);
+        // karate.pause() is a JS expression, no keyword
+        logger.info("step3 keyword: {}, text: {}", step3.getKeyword(), step3.getText());
+    }
+
+    @Test
+    void testEmptyFile() {
+        // Empty file should return an empty feature, not throw an exception
+        feature("");
+        assertNotNull(feature);
+        assertNull(feature.getName());
+        assertTrue(feature.getSections().isEmpty());
+    }
+
+    @Test
+    void testWhitespaceOnlyFile() {
+        // File with only whitespace should be handled gracefully
+        feature("   \n\n   \n");
+        assertNotNull(feature);
+        assertNull(feature.getName());
+        assertTrue(feature.getSections().isEmpty());
+    }
+
+    @Test
+    void testCommentOnlyFile() {
+        // File with only comments should be handled gracefully
+        feature("""
+                # this is just a comment
+                # and another one
+                """);
+        assertNotNull(feature);
+        assertNull(feature.getName());
+        assertTrue(feature.getSections().isEmpty());
+    }
+
+    // ========== Docstring under Scenario Outline ==========
+
+    @Test
+    void testExamplesTagsBelongToExamplesNotOutline() {
+        // Tags on Examples blocks should be parsed as children of G_EXAMPLES,
+        // not as children of G_SCENARIO_OUTLINE
+        parseWithAst("""
+                Feature: tag filter
+                @smoke
+                Scenario Outline: mixed
+                  * def x = '<label>'
+                Examples:
+                  | label   |
+                  | run_me  |
+                @skip
+                Examples:
+                  | label    |
+                  | skip_me  |
+                """);
+        assertNotNull(outline, "Outline should be parsed");
+        // Outline tags should only have @smoke, not @skip
+        List<Tag> outlineTags = outline.getTags();
+        assertNotNull(outlineTags);
+        assertEquals(1, outlineTags.size(), "Outline should have 1 tag (@smoke)");
+        assertEquals("smoke", outlineTags.get(0).getName());
+        // Second Examples block should have @skip
+        assertEquals(2, outline.getExamplesTables().size());
+        assertNull(outline.getExamplesTables().get(0).getTags(), "First examples should have no tags");
+        List<Tag> exTags = outline.getExamplesTables().get(1).getTags();
+        assertNotNull(exTags, "Second examples should have @skip tag");
+        assertEquals(1, exTags.size());
+        assertEquals("skip", exTags.get(0).getName());
+    }
+
+    @Test
+    void testScenarioOutlineWithDocstringBeforeSteps() {
+        parseWithAst("""
+                Feature: Docstring bug
+                Scenario Outline: My outline
+                    \"\"\"
+                    This is a doc comment describing the outline.
+                    \"\"\"
+                    * print "row: <label>"
+                Examples:
+                    | label |
+                    | A     |
+                    | B     |
+                """);
+        assertNotNull(outline, "Outline should be parsed");
+        assertEquals("My outline", outline.getName());
+        assertEquals(1, outline.getSteps().size());
+        assertEquals(1, outline.getExamplesTables().size());
+        // header + 2 data rows = 3 rows total
+        assertEquals(3, outline.getExamplesTables().get(0).getTable().getRows().size());
+    }
+
+    @Test
+    void testMatchExpressionWithParenthesizedSubExpression() {
+        // The == inside parentheses is JS equality, not a match operator
+        MatchExpression me = GherkinParser.parseMatchExpression("(0 == null) == false");
+        assertEquals("(0 == null)", me.getActualExpr());
+        assertEquals("==", me.getOperator());
+        assertEquals("false", me.getExpectedExpr());
+    }
+
+    @Test
+    void testMatchExpressionWithNestedParens() {
+        MatchExpression me = GherkinParser.parseMatchExpression("(a != b && c == d) == true");
+        assertEquals("(a != b && c == d)", me.getActualExpr());
+        assertEquals("==", me.getOperator());
+        assertEquals("true", me.getExpectedExpr());
+    }
+
+    @Test
+    void testMatchExpressionWithBrackets() {
+        // Brackets should also be tracked
+        MatchExpression me = GherkinParser.parseMatchExpression("arr[0] == 'foo'");
+        assertEquals("arr[0]", me.getActualExpr());
+        assertEquals("==", me.getOperator());
+        assertEquals("'foo'", me.getExpectedExpr());
+    }
+
+    @Test
+    void testDocstringWithAtSignTokenization() {
+        // Debug: verify @ inside docstring is NOT tokenized as G_TAG
+        String text = "Feature: test\nScenario Outline: x\n  \"\"\"\n  @foo\n  \"\"\"\n  * print '<a>'\nExamples:\n  | a |\n  | 1 |\n";
+        Resource resource = Resource.text(text);
+        GherkinLexer lexer = new GherkinLexer(resource);
+        Token token;
+        boolean foundTagInDocstring = false;
+        do {
+            token = lexer.nextToken();
+            if (token.type == TokenType.G_TAG && token.getText().contains("foo")) {
+                foundTagInDocstring = true;
+            }
+        } while (token.type != TokenType.EOF);
+        assertFalse(foundTagInDocstring, "@foo inside docstring should NOT be tokenized as G_TAG");
+    }
+
+    @Test
+    void testDocstringWithAtSignDoesNotBreakParsing() {
+        // An @ inside a docstring should NOT be tokenized as a tag
+        parseWithAst("""
+                Feature: Docstring with @
+                @test
+                Scenario Outline: My outline
+                    \"\"\"
+                    @This is a doc comment describing the outline.
+                    \"\"\"
+                    * print "row: <label>"
+                Examples:
+                    | label |
+                    | A     |
+                    | B     |
+                """);
+        assertNotNull(outline, "Outline should be parsed");
+        assertEquals("My outline", outline.getName());
+        assertEquals(1, outline.getSteps().size());
+        assertEquals(1, outline.getExamplesTables().size());
+        assertEquals(3, outline.getExamplesTables().get(0).getTable().getRows().size());
+        // The bare docstring is consumed as documentation, not attached to any step
+        assertNull(outline.getSteps().get(0).getDocString());
+    }
+
+
+    private String span(SourceSpan span) {
+        return span.text(feature.getResource().getText());
+    }
+
+    @Test
+    void testStepSpanExtendsThroughDocString() {
+        feature("""
+                Feature:
+                Scenario:
+                  * def a =
+                    \"\"\"
+                    { b: 1 }
+                    \"\"\"
+                  * print a
+                """);
+        Step step = scenario.getSteps().get(0);
+        assertEquals(3, step.getLine());
+        assertEquals(3, step.getEndLine()); // report-visible end line is unchanged
+        assertEquals(new SourceSpan(step.getSpan().start(), step.getSpan().end(), 3, 6), step.getSpan());
+        assertEquals("* def a =\n    \"\"\"\n    { b: 1 }\n    \"\"\"", span(step.getSpan()));
+        assertEquals("* print a", span(scenario.getSteps().get(1).getSpan()));
+    }
+
+    @Test
+    void testStepSpanExtendsThroughTable() {
+        feature("""
+                Feature:
+                Scenario:
+                  * table t
+                    | a | b |
+                    | 1 | 2 |
+                  * print t
+                """);
+        Step step = scenario.getSteps().get(0);
+        assertEquals(3, step.getEndLine());
+        assertEquals(5, step.getSpan().endLine());
+        assertEquals("* table t\n    | a | b |\n    | 1 | 2 |", span(step.getSpan()));
+        assertEquals("| 1 | 2 |", span(step.getTable().getRowSpan(1)));
+        assertEquals(5, step.getTable().getRowSpan(1).line());
+    }
+
+    @Test
+    void testCommentSpans() {
+        feature("""
+                Feature:
+                Scenario:
+                  * print 1
+                  # owned by two  \s
+                  * print 2
+                  # trailing
+                """);
+        Step first = scenario.getSteps().get(0);
+        Step second = scenario.getSteps().get(1);
+        assertEquals("* print 1", span(first.getSpan()));
+        assertTrue(first.getCommentSpans().isEmpty());
+        assertNull(first.getComments());
+        SourceSpan comment = second.getCommentSpans().getFirst();
+        assertEquals("# owned by two   ", span(comment));
+        assertEquals(4, comment.line());
+        assertEquals("# owned by two", second.getComments().getFirst()); // legacy accessor stays trimmed
+        List<SourceSpan> all = feature.getCommentSpans();
+        assertEquals(2, all.size());
+        assertEquals(comment, all.get(0));
+        assertEquals("# trailing", span(all.get(1)));
+        assertEquals(6, all.get(1).line());
+    }
+
+    @Test
+    void testSpansIndexRawCrlfText() {
+        feature("Feature:\r\n@t1\r\nScenario: s\r\n  * def a =\r\n    \"\"\"\r\n    x\r\n    \"\"\"\r\n  # c\r\n  * table t\r\n    | a |\r\n");
+        String text = feature.getResource().getText();
+        assertTrue(text.contains("\r\n"), "CRLF is not normalized");
+        Tag tag = scenario.getTags().getFirst();
+        assertEquals(text.indexOf("@t1"), tag.getSpan().start());
+        assertEquals("@t1", span(tag.getSpan()));
+        assertEquals(2, tag.getSpan().line());
+        assertEquals("# c", span(scenario.getSteps().get(1).getCommentSpans().getFirst()));
+        Step docStep = scenario.getSteps().get(0);
+        assertEquals("* def a =\r\n    \"\"\"\r\n    x\r\n    \"\"\"", span(docStep.getSpan()));
+        assertEquals(4, docStep.getSpan().line());
+        assertEquals(7, docStep.getSpan().endLine());
+        assertEquals("x", docStep.getDocString());
+        Step tableStep = scenario.getSteps().get(1);
+        assertEquals("* table t\r\n    | a |", span(tableStep.getSpan()));
+        assertEquals(10, tableStep.getSpan().endLine());
+        assertEquals(scenario.getSpan().end(), tableStep.getSpan().end());
+        assertTrue(span(scenario.getSpan()).startsWith("Scenario: s\r\n"));
+    }
+
+    @Test
+    void testSpansIndexTextWithBom() {
+        byte[] bom = {(byte) 0xEF, (byte) 0xBB, (byte) 0xBF};
+        byte[] body = "Feature: f\nScenario: s\n  * print 1\n".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] bytes = new byte[bom.length + body.length];
+        System.arraycopy(bom, 0, bytes, 0, bom.length);
+        System.arraycopy(body, 0, bytes, bom.length, body.length);
+        feature = new GherkinParser(Resource.bytes(bytes)).parse();
+        String text = feature.getResource().getText();
+        assertEquals('﻿', text.charAt(0), "BOM is kept as char 0");
+        assertEquals("f", feature.getName());
+        scenario = feature.getSections().getFirst().getScenario();
+        assertEquals(1, feature.getLine());
+        assertEquals(2, scenario.getLine());
+        Step step = scenario.getSteps().getFirst();
+        assertEquals(text.indexOf("* print 1"), step.getSpan().start());
+        assertEquals("* print 1", span(step.getSpan()));
+    }
+
+    @Test
+    void testOutlineAndExamplesSpans() {
+        feature("""
+                Feature:
+                Background:
+                  * def x = 1
+                Scenario Outline: o
+                  * print '<a>'
+                  @one
+                  Examples: first
+                    | a |
+                    | 1 |
+                  Examples: second
+                    | a |
+                    | 2 |
+                    | 3 |
+                """);
+        assertEquals("Background:\n  * def x = 1", span(feature.getBackground().getSpan()));
+        assertEquals(4, outline.getSpan().line());
+        assertEquals(13, outline.getSpan().endLine());
+        List<ExamplesTable> examples = outline.getExamplesTables();
+        assertEquals(2, examples.size());
+        ExamplesTable first = examples.get(0);
+        assertEquals("Examples: first\n    | a |\n    | 1 |", span(first.getSpan()));
+        assertEquals("@one", span(first.getTags().getFirst().getSpan()));
+        ExamplesTable second = examples.get(1);
+        assertEquals(10, second.getSpan().line());
+        assertEquals(13, second.getSpan().endLine());
+        assertEquals("| 3 |", span(second.getTable().getRowSpan(2)));
+        assertEquals(outline.getSpan().end(), second.getSpan().end());
+        // expanded scenarios carry the template step's span
+        Scenario expanded = outline.toScenario(null, 0, 10, null);
+        assertEquals(outline.getSteps().getFirst().getSpan(), expanded.getSteps().getFirst().getSpan());
+    }
+
+
+    @Test
+    void testCommentBelowSectionLineIsNotDescription() {
+        feature("""
+                Feature: f
+                # under feature
+                Background:
+                  # under background
+                  * def a = 1
+                Scenario: s
+                  # under scenario
+                  * print a
+                """);
+        assertNull(feature.getDescription());
+        assertEquals("f", feature.getName());
+        assertEquals("# under feature", span(feature.getCommentSpans().getFirst()));
+        Step bgStep = feature.getBackground().getSteps().getFirst();
+        assertEquals(List.of("# under background"), bgStep.getComments());
+        assertNull(scenario.getDescription());
+        Step step = scenario.getSteps().getFirst();
+        assertEquals(List.of("# under scenario"), step.getComments());
+        assertEquals("# under scenario", span(step.getCommentSpans().getFirst()));
+        assertEquals(3, feature.getCommentSpans().size());
+    }
+
+    @Test
+    void testCommentAfterMultiLineDescription() {
+        feature("""
+                Feature:
+                Scenario: s
+                  line one
+                  line two
+                  # the step title
+                  * print 1
+                """);
+        assertEquals("s", scenario.getName());
+        assertEquals("line one\nline two", scenario.getDescription());
+        assertEquals(List.of("# the step title"), scenario.getSteps().getFirst().getComments());
+        feature("""
+                Feature:
+                Scenario: s #1
+                  one
+                  # interleaved
+                  two
+                  * print 1
+                """);
+        assertEquals("s #1", scenario.getName());
+        assertEquals("one\ntwo", scenario.getDescription());
+        assertEquals("# interleaved", span(feature.getCommentSpans().getFirst()));
+    }
+
+}

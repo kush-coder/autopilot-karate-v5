@@ -1,0 +1,1456 @@
+/*
+ * The MIT License
+ *
+ * Copyright 2025 Karate Labs Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package io.karatelabs.core;
+
+import io.karatelabs.common.FileUtils;
+import io.karatelabs.common.Resource;
+import io.karatelabs.common.ResourceNotFoundException;
+import io.karatelabs.driver.DriverProvider;
+import io.karatelabs.driver.PooledDriverProvider;
+import io.karatelabs.gherkin.ExamplesTable;
+import io.karatelabs.gherkin.Feature;
+import io.karatelabs.gherkin.FeatureSection;
+import io.karatelabs.gherkin.Scenario;
+import io.karatelabs.gherkin.Tag;
+import io.karatelabs.output.*;
+import org.slf4j.Logger;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReentrantLock;
+
+/**
+ * Immutable suite configuration and execution engine.
+ * <p>
+ * Suite instances can only be created via {@link Runner.Builder}.
+ * All configuration fields are public final for inspection.
+ * <p>
+ * Example usage:
+ * <pre>
+ * SuiteResult result = Runner.path("features/")
+ *     .tags("@smoke")
+ *     .parallel(4);
+ * </pre>
+ */
+public class Suite {
+
+    private static final Logger logger = LogContext.RUNTIME_LOGGER;
+
+    /** Subfolder for JSON output (JSONL events, etc.) */
+    public static final String KARATE_JSON_SUBFOLDER = "karate-json";
+
+    // ========== Configuration (immutable, public final) ==========
+
+    public final List<Feature> features;
+    public final String env;
+    public final String tagSelector;
+    public final int threadCount;
+    public final boolean parallel;
+    public final boolean dryRun;
+    public final String configPath;
+    public final Path outputDir;
+    public final Path workingDir;
+    /** THE project root — see {@link #getRoot()}. Computed before config discovery. */
+    public final Path root;
+    /** The {@code classpath:}-miss fallback dir — see {@link #getClasspathRoot()}. Never null. */
+    public final Path classpathRoot;
+    public final boolean outputHtmlReport;
+    public final boolean outputJsonLines;
+    public final boolean outputJunitXml;
+    public final boolean outputCucumberJson;
+    public final boolean backupReportDir;
+    public final boolean outputConsoleSummary;
+    public final boolean retainCallResults;
+    public final boolean retainStepLogs;
+    /** Explicit {@code Runner.Builder.captureStepLogs()}, or null — see {@link #isCaptureStepLogs()}. */
+    private final Boolean captureStepLogs;
+    public final Map<String, String> systemProperties;
+    /** {@code Runner.Builder.systemEnv}, immutable; empty when none was given. */
+    private final Map<String, String> systemEnv;
+    public final List<RunListener> listeners;
+    public final List<RunListenerFactory> listenerFactories;
+    public final DriverProvider driverProvider;
+    public final io.karatelabs.http.HttpClientFactory httpClientFactory;
+    public final boolean skipTagFiltering;
+    public final Map<String, Set<Integer>> lineFilters;
+    public final String scenarioName;
+
+    // Debug support (for IDE debugging)
+    public final io.karatelabs.js.RunInterceptor<?> debugInterceptor;
+    public final io.karatelabs.js.DebugPointFactory<?> debugPointFactory;
+
+    // Config resources (loaded in constructor, immutable)
+    public final Resource baseResource;
+    public final Resource configResource;
+    public final Resource configEnvResource;
+
+    // The parsed form of each config resource above, built on first use and shared by every
+    // scenario in this Suite — config is EVALUATED per scenario by design, but it was also
+    // being lexed and parsed per scenario, which is the same file re-read N times for a
+    // suite of N scenarios. Keyed on the resource identity the Suite itself resolved.
+    private final Map<Resource, ConfigScript> configScripts = new ConcurrentHashMap<>();
+
+    // ========== Runtime State (mutable, private) ==========
+
+    // Result listeners are mutable because auto-registered listeners are added in run()
+    private final List<ResultListener> resultListeners;
+
+
+    // Caches (shared across features within a Suite — or longer-lived when injected
+    // via Runner.Builder, e.g. by karate-gatling so callSingle/callOnce survive across
+    // virtual users of the same simulation).
+    private final Map<String, Object> CALLSINGLE_CACHE;
+    private final ReentrantLock callSingleLock;
+    private final Map<String, Map<String, Object>> callOnceCacheStore;
+    private final Map<String, ReentrantLock> callOnceLockStore;
+    private final Map<String, Map<String, Object>> setupOnceCacheStore;
+
+    // Lock manager for @lock tag support (mutual exclusion across parallel scenarios)
+    private final ScenarioLockManager lockManager = new ScenarioLockManager();
+
+    // Abort flag for abortSuiteOnFailure support
+    private final AtomicBoolean aborted = new AtomicBoolean();
+
+    // Servers karate.start() opened under this Suite, stopped when its run ends unless a host detached them.
+    private final List<MockServer> servers = new CopyOnWriteArrayList<>();
+    // A host-injected callSingle cache outlives this Suite, and so must what callSingle started.
+    private final boolean sharedCallSingleCache;
+
+    // Per-thread listeners
+    private final ThreadLocal<List<RunListener>> threadListeners = new ThreadLocal<>();
+
+    // Channel factories registered by exts at boot (e.g. io.karatelabs.ext.grpc.GrpcExt,
+    // io.karatelabs.ext.kafka.KafkaExt) via registerChannelFactory(). These take precedence
+    // over the name-convention fallback in KarateJs.channel() (io.karatelabs.ext.<type>.
+    // <Type>ChannelFactory), letting an ext own its channel wiring + suite/JVM-wide init from
+    // onBoot() instead of relying on classpath presence alone. See docs/EXT.md § Channel factories.
+    private final Map<String, ChannelFactory> channelFactories = new ConcurrentHashMap<>();
+
+    // The run-unique execution index every scenario result carries (stamped on SCENARIO_ENTER, on
+    // SCENARIO_EXIT and on the FEATURE_EXIT result entry), so a stream consumer can identify one
+    // execution across events without any state outside the stream.
+    private final java.util.concurrent.atomic.AtomicInteger executionSequence = new java.util.concurrent.atomic.AtomicInteger();
+
+    /** The next run-unique execution index (1-based). */
+    public int nextExecutionIndex() {
+        return executionSequence.incrementAndGet();
+    }
+
+    // Shared executor and semaphore for scenario-level parallelism
+    private volatile ExecutorService scenarioExecutor;
+    private volatile Semaphore scenarioSemaphore;
+
+    // Lane pool for timeline reporting
+    private volatile Queue<Integer> availableLanes;
+    private final ThreadLocal<Integer> currentLane = new ThreadLocal<>();
+
+    // Results
+    private SuiteResult result;
+
+    // Performance testing hook (for Gatling integration)
+    private PerfHook perfHook;
+
+    // karate-boot.js exts, evaluated by BootLoader.evalIfPresent() in the constructor.
+    // Exposed via getBootBinding() so SuiteRunEvent can surface ext manifests on
+    // SUITE_ENTER. Null when no karate-boot.js file is present in the workdir.
+    private final BootBinding bootBinding;
+
+    // Ext globals registered by exts in their onBoot(Suite) — name → instance
+    // (typically a SimpleObject). Seeded into every scenario's JS scope before
+    // karate-config.js evaluates (see ScenarioRuntime.initEngine). Populated only
+    // during single-threaded boot, then read-only for the parallel run.
+    private final Map<String, Object> globals = new LinkedHashMap<>();
+
+    // Ext report-asset contributions registered by exts in onBoot — name → spec.
+    // Read by HtmlReportWriter at report-write time to copy ext assets and splice
+    // <script>/<link> tags. Like globals: populated single-threaded at boot,
+    // read-only thereafter.
+    private final Map<String, ReportAssets> reportAssets = new LinkedHashMap<>();
+
+    // KPI summary cards an ext contributes for the summary-page hero (e.g. coverage %,
+    // requirements covered). Unlike reportAssets (static, boot-time), these carry post-run
+    // VALUES, so an ext adds them in onShutdown() — which runs before the report listener's
+    // onSuiteEnd() write (Suite.run finally-block ordering), so the values are ready in time.
+    // Read by HtmlReportListener at onSuiteEnd and inlined into the summary page data.
+    private final List<Map<String, Object>> summaryCards = new ArrayList<>();
+
+    // ========== Constructor (package-private) ==========
+
+    /**
+     * Creates an immutable Suite from a Runner.Builder.
+     * This constructor is package-private - only Runner.Builder can create Suite instances.
+     */
+    Suite(Runner.Builder builder, int threadCount) {
+        // Caches — use injected stores when present (e.g. from karate-gatling protocol),
+        // otherwise allocate fresh per-Suite stores.
+        this.sharedCallSingleCache = builder.getCallSingleCache() != null;
+        this.CALLSINGLE_CACHE = builder.getCallSingleCache() != null
+                ? builder.getCallSingleCache() : new ConcurrentHashMap<>();
+        this.callSingleLock = builder.getCallSingleLock() != null
+                ? builder.getCallSingleLock() : new ReentrantLock();
+        this.callOnceCacheStore = builder.getCallOnceCacheStore() != null
+                ? builder.getCallOnceCacheStore() : new ConcurrentHashMap<>();
+        this.callOnceLockStore = builder.getCallOnceLockStore() != null
+                ? builder.getCallOnceLockStore() : new ConcurrentHashMap<>();
+        this.setupOnceCacheStore = builder.getSetupOnceCacheStore() != null
+                ? builder.getSetupOnceCacheStore() : new ConcurrentHashMap<>();
+
+        // Core configuration
+        this.env = builder.getEnv();
+        this.tagSelector = builder.getTags() != null && !builder.getTags().isEmpty()
+                ? TagSelector.fromKarateOptionsTags(builder.getTags())
+                : null;
+        this.threadCount = Math.max(1, threadCount);
+        this.parallel = this.threadCount > 1;
+        this.dryRun = builder.isDryRun();
+        this.configPath = resolveConfigPath(builder.getConfigDir());
+        this.outputDir = builder.getOutputDir() != null
+                ? builder.getOutputDir()
+                : Path.of(FileUtils.getBuildDir(), "karate-reports");
+        this.outputHtmlReport = builder.isOutputHtmlReport();
+        this.outputJsonLines = builder.isOutputJsonLines();
+        this.outputJunitXml = builder.isOutputJunitXml();
+        this.outputCucumberJson = builder.isOutputCucumberJson();
+        this.backupReportDir = builder.isBackupOutputDir();
+        this.outputConsoleSummary = builder.isOutputConsoleSummary();
+        this.retainCallResults = builder.isRetainCallResults();
+        this.retainStepLogs = builder.isRetainStepLogs();
+        this.captureStepLogs = builder.getCaptureStepLogs();
+        this.systemProperties = builder.getSystemProperties() != null
+                ? Collections.unmodifiableMap(new HashMap<>(builder.getSystemProperties()))
+                : null;
+        this.systemEnv = builder.getSystemEnv() != null ? Map.copyOf(builder.getSystemEnv()) : Map.of();
+        this.listeners = List.copyOf(builder.getListeners());
+        this.listenerFactories = List.copyOf(builder.getListenerFactories());
+        // Programmatic ext globals injected via Runner.Builder.global(...) — the run-free binding
+        // seam (an embedder binds a JS global for a no-feature-file run, e.g. the loop-report
+        // synthesizer's replay object). Registered like an ext's onBoot globals: visible to every
+        // scenario before karate-config.js; a reserved-name collision fails the suite loud here.
+        builder.getProgrammaticGlobals().forEach(this::registerGlobal);
+        this.resultListeners = new ArrayList<>(builder.getResultListeners());
+        // Auto-create PooledDriverProvider if none is set (default pooling behavior)
+        DriverProvider configuredProvider = builder.getDriverProvider();
+        if (configuredProvider != null) {
+            this.driverProvider = configuredProvider;
+        } else {
+            // Default to pooled driver provider with pool size = thread count
+            this.driverProvider = new PooledDriverProvider(threadCount);
+            logger.debug("Auto-created PooledDriverProvider with pool size: {}", threadCount);
+        }
+        this.httpClientFactory = builder.getHttpClientFactory();
+        this.skipTagFiltering = builder.isSkipTagFiltering();
+        // Trim to null so downstream shouldSelect() checks are simple (null = no filter)
+        String rawScenarioName = builder.getScenarioName();
+        this.scenarioName = rawScenarioName == null || rawScenarioName.trim().isEmpty()
+                ? null
+                : rawScenarioName.trim();
+        this.debugInterceptor = builder.getDebugInterceptor();
+        this.debugPointFactory = builder.getDebugPointFactory();
+
+        // THE root — computed BEFORE config discovery and boot, from the explicit configDir /
+        // a classloader probe / the explicit workingDir / the CWD. Deliberately never derived
+        // from where karate-config.js was eventually FOUND: a project that maps its resources
+        // (boot.classpath) has its config under the mapped dir, and letting the root drift there
+        // would silently re-anchor every reference one level in. See getRoot().
+        this.root = computeRoot(builder, this.configPath);
+
+        // Boot BEFORE config discovery and feature resolution — karate-boot.js is what declares
+        // the resource mapping (boot.classpath) that both of those then honour.
+        this.bootBinding = builder.isSkipBootFile()
+                ? null
+                : BootLoader.evalIfPresent(this, bootstrapWorkingDir(builder), this.env);
+        String declaredClasspathDir = bootBinding == null ? null : bootBinding.getClasspathDir();
+        this.classpathRoot = declaredClasspathDir == null
+                ? this.root
+                : this.root.resolve(Resource.stripLeadingSlashes(declaredClasspathDir)).normalize();
+        // An explicit workingDir always wins. Otherwise a declared classpath dir re-anchors the
+        // working dir on the root, so a Java project behaves identically under a JVM run and a
+        // bare-folder (serve) run; with nothing declared, the process CWD is the default.
+        this.workingDir = builder.getWorkingDir() != null
+                ? builder.getWorkingDir()
+                : (declaredClasspathDir != null ? this.root : FileUtils.WORKING_DIR.toPath());
+
+        // Load config resources (all inputs are now available)
+        this.baseResource = tryLoadConfigResource(getBasePath(this.configPath), false);
+        if (this.baseResource != null) {
+            logger.info("{} processed", getBasePath(this.configPath));
+        }
+        this.configResource = tryLoadConfigResource(this.configPath, true);
+        if (this.configResource != null) {
+            logger.info("{} processed", this.configPath);
+        }
+        if (this.env != null && !this.env.isEmpty()) {
+            String envConfigPath = this.configPath.replace(".js", "-" + this.env + ".js");
+            this.configEnvResource = tryLoadConfigResource(envConfigPath, false);
+            if (this.configEnvResource != null) {
+                logger.info("{} processed", envConfigPath);
+            }
+        } else {
+            this.configEnvResource = null;
+        }
+
+        // Features LAST, anchored on THE root (not the working dir) and carrying the classpath root —
+        // this is what makes read('/x') inside a feature and cov.openapi='/x' in karate-boot.js the SAME
+        // file in a Maven bolt-on, where the root is the classpath root and the working dir is the module
+        // dir. Relative CLI paths still resolve CWD-relative (launch semantics) inside resolveFeatures.
+        this.features = List.copyOf(builder.resolveFeaturesAt(this.root, this.classpathRoot));
+        // read AFTER resolution: "file.feature:LINE" filters are keyed by the resolved resource URI,
+        // so the Builder only knows them once the features have been read
+        this.lineFilters = builder.getLineFilters() != null
+                ? Collections.unmodifiableMap(new HashMap<>(builder.getLineFilters()))
+                : Collections.emptyMap();
+    }
+
+    private String resolveConfigPath(String configDir) {
+        if (configDir == null) {
+            return "classpath:karate-config.js";
+        }
+        return configDir.endsWith(".js") ? configDir : configDir + "/karate-config.js";
+    }
+
+    /**
+     * Where {@code karate-boot.js} is looked for: the dir the USER named as the project — the explicit
+     * working dir, else an explicit filesystem config dir, else the process CWD. Never the
+     * classloader-probed root, so a Java project whose resources are copied to {@code target/test-classes}
+     * does not start booting a file it never asked to boot.
+     */
+    private static Path bootstrapWorkingDir(Runner.Builder builder) {
+        if (builder.getWorkingDir() != null) {
+            return builder.getWorkingDir();
+        }
+        String configDir = builder.getConfigDir();
+        if (configDir != null && !configDir.startsWith(Resource.CLASSPATH_COLON)) {
+            String fsPath = configDir.startsWith(Resource.FILE_COLON)
+                    ? configDir.substring(Resource.FILE_COLON.length()) : configDir;
+            Path given = Path.of(fsPath).toAbsolutePath().normalize();
+            Path dir = fsPath.endsWith(".js") ? given.getParent() : given;
+            if (dir != null) {
+                return dir;
+            }
+        }
+        return FileUtils.WORKING_DIR.toPath();
+    }
+
+    /**
+     * THE root, per the lane that built this Suite. Depends only on inputs that are known before
+     * anything is loaded — an explicit {@code configDir}, a classloader probe of the config path, an
+     * explicit {@code workingDir}, or the process CWD.
+     */
+    private static Path computeRoot(Runner.Builder builder, String configPath) {
+        String configDir = builder.getConfigDir();
+        if (configDir != null && !configDir.startsWith(Resource.CLASSPATH_COLON)) {
+            String fsPath = configDir.startsWith(Resource.FILE_COLON)
+                    ? configDir.substring(Resource.FILE_COLON.length()) : configDir;
+            // launch semantics: a relative configDir is CWD-relative, as typed
+            Path given = Path.of(fsPath).toAbsolutePath().normalize();
+            Path dir = fsPath.endsWith(".js") ? given.getParent() : given;
+            if (dir != null) {
+                return dir;
+            }
+        }
+        // A Java project: karate-config.js is on the real classpath, so its parent is the
+        // classpath root (target/test-classes). A jar-backed hit maps to no directory — skip it.
+        if (configPath != null) {
+            try {
+                Resource probe = Resource.path(configPath);
+                Path found = probe.isFile() ? probe.getPath() : null;
+                if (found != null && found.getFileSystem() == java.nio.file.FileSystems.getDefault()
+                        && found.getParent() != null) {
+                    return found.getParent().toAbsolutePath().normalize();
+                }
+            } catch (Exception e) {
+                // not on the classpath — fall through
+            }
+        }
+        return builder.getWorkingDir() != null ? builder.getWorkingDir() : FileUtils.WORKING_DIR.toPath();
+    }
+
+    private String getBasePath(String configPath) {
+        return configPath.endsWith("karate-config.js")
+                ? configPath.replace("karate-config.js", "karate-base.js")
+                : "classpath:karate-base.js";
+    }
+
+    /**
+     * Try to load a config file and return the Resource (for debugging support).
+     */
+    private Resource tryLoadConfigResource(String path, boolean warnIfMissing) {
+        // Try the explicit path first. Probing, not loading — karate-base.js and
+        // karate-config-<env>.js are absent in most projects, and this runs per Suite, so a miss
+        // must not cost an exception.
+        try {
+            Resource resource = Resource.optional(path);
+            if (resource != null && resource.exists()) {
+                return resource.isFile() && resource.getPath() != null
+                        && resource.getPath().getFileSystem() == java.nio.file.FileSystems.getDefault()
+                        ? Resource.from(resource.getPath(), root, classpathRoot)
+                        : resource;
+            }
+        } catch (ResourceNotFoundException e) {
+            // Not found at explicit path - continue to fallbacks
+        } catch (Exception e) {
+            logger.warn("Error loading config {}: {}", path, e.getMessage());
+            return null;
+        }
+
+        String fileName = configFallbackName(path);
+        if (fileName != null) {
+            // the working dir, then the boot-declared classpath dir — a served Maven project keeps
+            // its karate-config.js under src/test/resources while THE root stays the project dir
+            for (Path dir : classpathRoot.equals(workingDir)
+                    ? List.of(workingDir) : List.of(workingDir, classpathRoot)) {
+                try {
+                    Path candidate = dir.resolve(fileName);
+                    if (Files.exists(candidate)) {
+                        return Resource.from(candidate, root, classpathRoot);
+                    }
+                } catch (Exception e) {
+                    logger.debug("Could not load config from {}: {}", dir, e.getMessage());
+                }
+            }
+        }
+
+        if (warnIfMissing) {
+            // INFO, not WARN: plenty of runs legitimately have no config at all. Still worth saying,
+            // because a standalone (CLI) run has no JVM classpath to fall back on, so a project whose
+            // config does not sit under the working dir loses every config variable and only fails
+            // much later, as a bare ReferenceError in the first step that reads one. Name the dirs
+            // actually probed — that is what points at the fix (--workingdir).
+            String probed = fileName == null ? path
+                    : path + " (also looked in: " + (classpathRoot.equals(workingDir)
+                    ? workingDir : workingDir + ", " + classpathRoot) + ")";
+            logger.info("{} not found - no config variables will be set", probed);
+        }
+        return null;
+    }
+
+    /**
+     * The parsed form of one config JS, shared by every scenario in this Suite. Evaluating config
+     * per scenario is Karate semantics; <em>parsing</em> it per scenario is not, and the AST is
+     * read-only once built, so one parse serves them all. Errors are not cached as errors: a
+     * source that will not parse yields a null AST and the caller falls back exactly as it did
+     * when the parse ran inline.
+     */
+    static final class ConfigScript {
+
+        /** The source parsed as {@code (source)} — the shape a {@code function fn(){...}} config
+         *  needs to evaluate to a callable. Null when the source is not a single parenthesizable
+         *  expression, which is the signal to use {@link #direct()}. */
+        final io.karatelabs.parser.Node wrapped;
+
+        private final Resource resource;
+        private io.karatelabs.parser.Node direct;
+
+        private ConfigScript(Resource resource) {
+            this.resource = resource;
+            this.wrapped = parse(Resource.embedded("(" + resource.getText() + ")", resource, 0));
+        }
+
+        /** The source parsed as-is — the self-invoking / declarations-plus-helpers shape. Built on
+         *  demand because the wrapped form covers the common case and this one never runs then. */
+        synchronized io.karatelabs.parser.Node direct() {
+            if (direct == null) {
+                direct = parse(resource);
+            }
+            return direct;
+        }
+
+        private static io.karatelabs.parser.Node parse(Resource resource) {
+            try {
+                return new io.karatelabs.parser.JsParser(resource).leadingFunctionExpression().parse();
+            } catch (Exception e) {
+                return null;
+            }
+        }
+
+    }
+
+    /**
+     * The parsed {@link ConfigScript} for one of this Suite's config resources, parsed on first ask.
+     */
+    ConfigScript configScript(Resource resource) {
+        return configScripts.computeIfAbsent(resource, ConfigScript::new);
+    }
+
+    /**
+     * The root-relative name to retry a missed config path under. An explicit configDir yields an
+     * absolute {@code configPath}: relativize it against the root so {@code <root>/karate-config.js}
+     * retries as {@code karate-config.js} under the working dir / the mapped classpath dir. Returns
+     * null when the path points somewhere else entirely — the caller asked for THAT file, and a
+     * silent retry elsewhere would be a surprise.
+     */
+    private String configFallbackName(String path) {
+        String stripped = Resource.removePrefix(path);
+        Path asGiven = Path.of(stripped);
+        if (!asGiven.isAbsolute()) {
+            return stripped;
+        }
+        Path normalized = asGiven.normalize();
+        return normalized.startsWith(root) ? root.relativize(normalized).toString() : null;
+    }
+
+    // ========== Execution ==========
+
+    public SuiteResult run() {
+        result = new SuiteResult();
+        result.setStartTime(System.currentTimeMillis());
+        result.setReportDir(outputDir);
+        result.setHtmlReportEnabled(outputHtmlReport);
+        result.setDryRun(dryRun);
+
+        // Clear any per-Scenario selection cache from a prior run against the same
+        // parsed Feature objects. The pre-filter below will repopulate for this run.
+        clearScenarioSelectionCache();
+
+        // Backup existing report directory if enabled
+        if (backupReportDir) {
+            backupReportDirIfExists();
+        }
+
+        // Auto-register HTML report listener
+        if (outputHtmlReport) {
+            resultListeners.add(new HtmlReportListener(outputDir, env));
+        }
+
+        // Auto-register Cucumber JSON report listener
+        if (outputCucumberJson) {
+            resultListeners.add(new CucumberJsonReportListener(outputDir));
+        }
+
+        // Auto-register JUnit XML report listener
+        if (outputJunitXml) {
+            resultListeners.add(new JunitXmlReportListener(outputDir));
+        }
+
+        // karate-boot.js already evaluated in the constructor — before config discovery and
+        // feature resolution, since boot.classpath(dir) is what those two honour. Its exts are
+        // therefore registered well before the JSONL writer is wired below, so an ext that
+        // requests the event stream (Ext.requiresJsonlEvents()) is seen here.
+
+        // Optionally register JSON Lines event stream writer — explicitly requested
+        // (-f karate:jsonl / outputJsonLines(true)) or required by a booted ext.
+        JsonLinesEventWriter jsonlWriter = null;
+        boolean jsonlEnabled = outputJsonLines;
+        if (!jsonlEnabled && bootBinding != null) {
+            for (Ext ext : bootBinding.getExts()) {
+                if (ext.requiresJsonlEvents()) {
+                    logger.info("JSONL event stream auto-enabled by ext: {}", ext.getClass().getSimpleName());
+                    jsonlEnabled = true;
+                    break;
+                }
+            }
+        }
+        if (jsonlEnabled) {
+            jsonlWriter = new JsonLinesEventWriter(outputDir, env, threadCount);
+            try {
+                jsonlWriter.init();
+                // Add to a mutable copy for event firing
+                addJsonlListener(jsonlWriter);
+            } catch (Exception e) {
+                logger.warn("Failed to initialize JSONL event stream: {}", e.getMessage());
+                jsonlWriter = null;
+            }
+        }
+
+        try {
+            // Notify listeners
+            // Reset the embed file sequence (001_, 002_, …) for THIS run, regardless of whether HTML
+            // reporting is on — embeds are externalized from the FEATURE_EXIT seam (see fireEvent) so the
+            // counter must restart even for a JSONL-only run.
+            HtmlReportWriter.resetEmbedCounter();
+
+            for (ResultListener listener : resultListeners) {
+                listener.onSuiteStart(this);
+            }
+
+            // Fire SUITE_ENTER event
+            fireEvent(SuiteRunEvent.enter(this));
+
+            if (parallel && threadCount > 1) {
+                runParallel();
+            } else {
+                runSequential();
+            }
+
+            // set end time before firing SUITE_EXIT so the event carries a valid durationMillis
+            result.setEndTime(System.currentTimeMillis());
+
+            // Fire SUITE_EXIT event
+            fireEvent(SuiteRunEvent.exit(this, result));
+        } finally {
+            try {
+                teardown(jsonlWriter);
+            } finally {
+                stopServers();
+            }
+        }
+
+        return result;
+    }
+
+    private void teardown(JsonLinesEventWriter jsonlWriter) {
+        if (result.getEndTime() == 0) {
+            result.setEndTime(System.currentTimeMillis());
+        }
+
+        // Shutdown driver provider if one exists
+        if (driverProvider != null) {
+            driverProvider.shutdown();
+        }
+
+        // Close JSONL event writer
+        if (jsonlWriter != null) {
+            try {
+                removeJsonlListener(jsonlWriter);
+                jsonlWriter.close();
+            } catch (Exception e) {
+                logger.warn("Failed to close JSONL event stream: {}", e.getMessage());
+            }
+        }
+
+        // Ext onShutdown — best-effort; exceptions are logged + dropped per K43.
+        if (bootBinding != null) {
+            for (Ext ext : bootBinding.getExts()) {
+                try {
+                    ext.onShutdown();
+                } catch (Exception e) {
+                    logger.warn("ext onShutdown failed ({}): {}",
+                            ext.getClass().getName(), e.getMessage());
+                }
+                removeJsonlListener(ext);
+            }
+        }
+
+        // Notify listeners
+        for (ResultListener listener : resultListeners) {
+            listener.onSuiteEnd(result);
+        }
+    }
+
+    // Thread-safe listener management for JSONL writer
+    private final List<RunListener> mutableListeners = new ArrayList<>();
+
+    private void addJsonlListener(RunListener listener) {
+        synchronized (mutableListeners) {
+            mutableListeners.add(listener);
+        }
+    }
+
+    /**
+     * Register an {@link Ext} as a {@link RunListener} on this Suite. Called from
+     * {@link BootBinding#ext(String)} during karate-boot.js evaluation, before
+     * SUITE_ENTER fires. Ext will see every event from SUITE_ENTER onward.
+     */
+    public void registerExtListener(Ext ext) {
+        addJsonlListener(ext);
+    }
+
+    /** The launch/output anchor. Equals {@link #getRoot()} when the project declares {@code boot.classpath}. */
+    public Path getWorkingDir() {
+        return workingDir;
+    }
+
+    /**
+     * <b>THE root</b> — the single anchor every path <i>reference</i> resolves against: a leading
+     * {@code /} means this directory, a bare ref is relative to it, and a {@code classpath:} miss
+     * falls back under {@link #getClasspathRoot()}. Resolution is fully deterministic — no
+     * filesystem probing — so one spelling lands on the same file on every machine.
+     *
+     * <p>Assigned before config discovery and before {@code karate-boot.js} evaluates, from the
+     * explicit {@code configDir} (a {@code *.js} value contributes its parent), else a classloader
+     * probe of the config path (a Java project's {@code target/test-classes}), else the explicit
+     * {@code workingDir}, else the process CWD. It is deliberately NOT derived from where the config
+     * file was found, so a mapped config dir cannot silently move the root.</p>
+     */
+    public Path getRoot() {
+        return root;
+    }
+
+    /**
+     * The directory a {@code classpath:} reference retries against when the classloader misses,
+     * declared by {@code boot.classpath(dir)} in {@code karate-boot.js}. Equals {@link #getRoot()}
+     * when nothing is declared — so a bare-folder project needs no declaration at all. Never null.
+     */
+    public Path getClasspathRoot() {
+        return classpathRoot;
+    }
+
+    /**
+     * The directory of the resolved {@code karate-config.js}. Retained for reporting/diagnostics
+     * only — <b>{@link #getRoot()} is the anchor for path references</b>; this value can differ
+     * from it (a project that maps its resources keeps its config under the mapped dir).
+     */
+    public Path getConfigDir() {
+        if (configResource != null) {
+            try {
+                Path p = configResource.getPath();
+                if (p != null && p.getParent() != null) {
+                    return p.getParent();         // resolved config (filesystem-backed even via classpath:)
+                }
+            } catch (RuntimeException e) {
+                // a non-filesystem resource (e.g. MemoryResource from a jar/jpackage classpath fallback)
+                // has no real path — fall through to the configPath / workingDir fallbacks below
+            }
+        }
+        // No config file found. Honour an explicit, filesystem configDir (configPath = <dir>/karate-config.js
+        // or <dir>/<name>.js); a classpath: configPath we cannot map to a real dir without the file → workdir.
+        if (configPath != null && !configPath.startsWith("classpath:")) {
+            String fsPath = configPath.startsWith("file:") ? configPath.substring("file:".length()) : configPath;
+            Path parent = Path.of(fsPath).getParent();
+            if (parent != null) {
+                return parent;
+            }
+        }
+        return workingDir;
+    }
+
+    /**
+     * Returns the karate-boot.js {@link BootBinding} populated during construction,
+     * or {@code null} when no boot file is present in the workdir. Surfaced so
+     * {@link SuiteRunEvent#toJson()} can attach {@code exts[]} manifests to
+     * SUITE_ENTER — receivers read this to know which exts were active and which
+     * embed names to expect.
+     */
+    public BootBinding getBootBinding() {
+        return bootBinding;
+    }
+
+    /**
+     * Register a {@link ChannelFactory} for an async channel type (e.g. {@code "grpc"},
+     * {@code "kafka"}). Called by an ext from {@link Ext#onBoot(Suite)} — typically right
+     * after its license gate passes — so {@code karate.channel('grpc')} resolves to the
+     * ext-supplied factory instead of the {@code io.karatelabs.ext.<type>.<Type>ChannelFactory}
+     * name-convention fallback. The factory instance is suite-scoped, giving the ext a home for
+     * suite/JVM-wide init (shared channels, pools). Last registration for a type wins.
+     */
+    public void registerChannelFactory(String type, ChannelFactory factory) {
+        channelFactories.put(type, factory);
+    }
+
+    /**
+     * Ext-registered {@link ChannelFactory} for the given type, or {@code null} if none —
+     * in which case {@code karate.channel()} falls back to the built-in name->FQCN map.
+     */
+    public ChannelFactory getChannelFactory(String type) {
+        return channelFactories.get(type);
+    }
+
+    /**
+     * Built-in JS-scope names an ext global may not shadow. Registration of a
+     * colliding ext global fails the Suite loud at boot (see EXT.md § Ext globals).
+     */
+    // `match` is intentionally NOT reserved — core no longer ships a global `match` (assertions are the
+    // Gherkin `match` keyword + `karate.match`); a consumer may register its own `match` global.
+    private static final Set<String> RESERVED_GLOBAL_NAMES = Set.of("karate", "read", "driver");
+
+    /**
+     * Register an ext global under {@code name}, seeded into every scenario's JS
+     * scope before {@code karate-config.js} evaluates. Called by an {@link Ext}
+     * from {@link Ext#onBoot(Suite)}; the instance is typically a
+     * {@link io.karatelabs.js.SimpleObject} so members cross into JS natively
+     * (no reflection). Throws — and so fails the Suite at boot — when the name is
+     * blank or collides with a built-in global ({@code karate}, {@code read},
+     * {@code match}, {@code driver}).
+     */
+    public void registerGlobal(String name, Object instance) {
+        if (name == null || name.isBlank()) {
+            throw new IllegalArgumentException("registerGlobal: name is null or empty");
+        }
+        if (RESERVED_GLOBAL_NAMES.contains(name)) {
+            throw new RuntimeException("ext global '" + name + "' collides with built-in '" + name + "'");
+        }
+        globals.put(name, instance);
+    }
+
+    /**
+     * Register a <em>per-scenario</em> ext global: the {@link ExtGlobalFactory} is
+     * invoked once per scenario at seed time to mint a fresh instance bound with the
+     * scenario's {@link KarateJsContext}. Prefer this over the singleton
+     * {@link #registerGlobal(String, Object)} when the global carries per-scenario
+     * mutable state or needs runtime / path access — see {@link ExtGlobalFactory}.
+     */
+    public void registerGlobal(String name, ExtGlobalFactory factory) {
+        if (name == null || name.isBlank()) {
+            throw new IllegalArgumentException("registerGlobal: name is null or empty");
+        }
+        if (RESERVED_GLOBAL_NAMES.contains(name)) {
+            throw new RuntimeException("ext global '" + name + "' collides with built-in '" + name + "'");
+        }
+        globals.put(name, factory);
+    }
+
+    /** The ext global registered under {@code name}, or {@code null} if none. */
+    public Object getGlobal(String name) {
+        return globals.get(name);
+    }
+
+    /** Immutable view of all ext globals, in registration order. */
+    public Map<String, Object> getGlobals() {
+        return Collections.unmodifiableMap(globals);
+    }
+
+    /**
+     * Register an ext's report-asset contribution. Called by an {@link Ext} from
+     * {@link Ext#onBoot(Suite)} with a fluent {@link ReportAssets} spec, e.g.
+     * {@code suite.registerReportAssets(ReportAssets.named("image").js("static/ext.js"), getClass().getClassLoader())}.
+     * Validates the spec against the classloader (referenced resources must exist);
+     * any failure throws and so fails the Suite loud at boot (see EXT.md § Report assets).
+     */
+    public void registerReportAssets(ReportAssets assets, ClassLoader classLoader) {
+        if (assets == null) {
+            throw new IllegalArgumentException("registerReportAssets: assets is null");
+        }
+        assets.validateAndBind(classLoader);
+        reportAssets.put(assets.name(), assets);
+    }
+
+    /** Immutable view of all registered ext report-asset specs, in registration order. */
+    public Map<String, ReportAssets> getReportAssets() {
+        return Collections.unmodifiableMap(reportAssets);
+    }
+
+    /**
+     * Contribute one KPI summary card to the summary-page hero (a key/value tile, e.g.
+     * {@code {label:'Coverage', value:'53%', sub:'8/15 endpoints'}}). Called by an {@link Ext}
+     * from {@link Ext#onShutdown()} (the values are post-run), which the run loop invokes before
+     * the report listener writes the summary, so cards are inlined into the page. Optional keys
+     * the renderer understands: {@code sub} (a second line), {@code href} (click-through), and
+     * {@code status} ({@code ok}/{@code warn}/{@code fail}, for accent colour).
+     */
+    public void addSummaryCard(Map<String, Object> card) {
+        if (card != null) {
+            summaryCards.add(card);
+        }
+    }
+
+    /** The contributed KPI summary cards, in registration order (empty when no ext added any). */
+    public List<Map<String, Object>> getSummaryCards() {
+        return Collections.unmodifiableList(summaryCards);
+    }
+
+    private void removeJsonlListener(RunListener listener) {
+        synchronized (mutableListeners) {
+            mutableListeners.remove(listener);
+        }
+    }
+
+    private void runSequential() {
+        initThreadListeners();
+        try {
+            for (Feature feature : features) {
+                if (isAborted() || isFeatureIgnored(feature)) {
+                    continue;
+                }
+                FeatureResult featureResult = runFeatureSafely(feature);
+                result.addFeatureResult(featureResult);
+                if (outputConsoleSummary) {
+                    featureResult.printSummary(dryRun);
+                }
+            }
+        } finally {
+            cleanupThreadListeners();
+        }
+    }
+
+    private FeatureResult runFeatureSafely(Feature feature) {
+        long startTime = System.currentTimeMillis();
+        FeatureRuntime fr = null;
+        try {
+            fr = new FeatureRuntime(this, feature);
+            return fr.call();
+        } catch (Exception e) {
+            logger.error("Unexpected error running feature '{}': {}", feature.getName(), e.getMessage(), e);
+            if (fr != null && fr.exitFired()) {
+                // the feature ran and its result reached every listener (fireEvent delivers past a failing
+                // one); a FEATURE_EXIT listener's failure is logged, never a second result for the stream
+                return fr.getResult();
+            }
+            FeatureResult result = FeatureResult.fromException(feature, e, startTime);
+            for (ScenarioResult sr : result.getScenarioResults()) {
+                if (sr.getExecutionIndex() == 0) {
+                    sr.setExecutionIndex(nextExecutionIndex());
+                }
+            }
+            // the synthetic result reaches the event stream exactly once — here when the feature never
+            // fired its own FEATURE_EXIT
+            if (fr == null || !fr.exitFired()) {
+                try {
+                    fireEvent(FeatureRunEvent.exit(fr, result));
+                } catch (RuntimeException listenerError) {
+                    logger.error("FEATURE_EXIT listener failed for '{}': {}", feature.getName(), listenerError.getMessage());
+                }
+            }
+            return result;
+        }
+    }
+
+    private void runParallel() {
+        // Initialize ALL parallel infrastructure BEFORE creating executor
+        availableLanes = new ConcurrentLinkedQueue<>();
+        for (int i = 1; i <= threadCount; i++) {
+            availableLanes.add(i);
+        }
+        scenarioSemaphore = new Semaphore(threadCount);
+        logger.info("Parallel execution initialized: threadCount={}, semaphore permits={}",
+                threadCount, scenarioSemaphore.availablePermits());
+
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            scenarioExecutor = executor;
+            List<Future<FeatureResult>> futures = new ArrayList<>();
+
+            for (Feature feature : features) {
+                if (isAborted() || isFeatureIgnored(feature)) {
+                    continue;
+                }
+                Future<FeatureResult> future = executor.submit(() -> {
+                    initThreadListeners();
+                    try {
+                        FeatureResult featureResult = runFeatureSafely(feature);
+                        if (outputConsoleSummary) {
+                            featureResult.printSummary(dryRun);
+                        }
+                        return featureResult;
+                    } finally {
+                        cleanupThreadListeners();
+                    }
+                });
+                futures.add(future);
+            }
+
+            // Collect results
+            for (Future<FeatureResult> future : futures) {
+                try {
+                    FeatureResult featureResult = future.get();
+                    result.addFeatureResult(featureResult);
+                } catch (Exception e) {
+                    logger.error("Unexpected error collecting feature result: {}", e.getMessage(), e);
+                }
+            }
+        } finally {
+            scenarioExecutor = null;
+            scenarioSemaphore = null;
+        }
+    }
+
+    private boolean isFeatureIgnored(Feature feature) {
+        for (Tag tag : feature.getTags()) {
+            if (Tag.IGNORE.equals(tag.getName())) {
+                return true;
+            }
+        }
+        return allSectionsExcluded(feature);
+    }
+
+    /**
+     * Returns true when no section in the feature can match the suite's filters,
+     * so running the feature would only produce an empty FeatureResult. Without this
+     * pre-filter, features whose feature-level tags (e.g. {@code @external}) exclude
+     * every scenario via a selector like {@code ~@external} still get added to the
+     * suite result with zero scenarios, showing up as green "passed" rows in the HTML
+     * summary and inflating the feature count. The check is sound: it iterates every
+     * section and returns true only if none of them could pass the selector.
+     * <p>
+     * Short-circuits when no tag selector is set — {@code @ignore}/{@code @env} at the
+     * scenario level still produce empty FeatureResults under the status quo and the
+     * bug report explicitly asked to preserve that.
+     * <p>
+     * Never pre-excludes when a bypass filter is active — line filters, scenario name
+     * filters, and {@code skipTagFiltering} all have their own selection semantics in
+     * {@link FeatureRuntime} that bypass tag selection.
+     * <p>
+     * For persistent (non-outline) scenarios, the evaluation result is cached on the
+     * {@link Scenario} via {@link Scenario#setSelected(Boolean)} so that
+     * {@link FeatureRuntime#shouldSelect} can reuse it instead of re-evaluating.
+     */
+    private boolean allSectionsExcluded(Feature feature) {
+        if (tagSelector == null) {
+            return false;
+        }
+        if (skipTagFiltering) {
+            return false;
+        }
+        if (scenarioName != null) {
+            return false;
+        }
+        if (!lineFilters.isEmpty()) {
+            String featureUri = feature.getResource().getUri().toString();
+            Set<Integer> lines = lineFilters.get(featureUri);
+            if (lines != null && !lines.isEmpty()) {
+                return false;
+            }
+        }
+        List<FeatureSection> sections = feature.getSections();
+        if (sections == null || sections.isEmpty()) {
+            return false;
+        }
+        List<Tag> featureTags = feature.getTags();
+        // Full iteration (no early exit) so every non-outline Scenario's selection
+        // gets cached — FeatureRuntime reads the cache in shouldSelect and avoids
+        // a second TagSelector.evaluate. Net evaluations drop from ~1.5× per
+        // scenario to exactly 1× for features that run.
+        boolean anyPassed = false;
+        for (FeatureSection section : sections) {
+            if (sectionCanMatch(section, featureTags)) {
+                anyPassed = true;
+            }
+        }
+        return !anyPassed;
+    }
+
+    private boolean sectionCanMatch(FeatureSection section, List<Tag> featureTags) {
+        if (section.isOutline()) {
+            List<Tag> base = mergeTags(featureTags, section.getScenarioOutline().getTags());
+            List<ExamplesTable> tables = section.getScenarioOutline().getExamplesTables();
+            if (tables != null && !tables.isEmpty()) {
+                // Examples tables can carry their own tags that only apply to rows in
+                // that table — if any table could make the selector pass, we can't skip.
+                // Row-level scenarios are generated fresh per run; no cache to populate.
+                boolean anyTablePasses = false;
+                for (ExamplesTable table : tables) {
+                    if (tagSelectorPasses(mergeTags(base, table.getTags()))) {
+                        anyTablePasses = true;
+                    }
+                }
+                return anyTablePasses;
+            }
+            return tagSelectorPasses(base);
+        }
+        Scenario scenario = section.getScenario();
+        boolean passes = tagSelectorPasses(mergeTags(featureTags, scenario.getTags()));
+        scenario.setSelected(passes);
+        return passes;
+    }
+
+    private boolean tagSelectorPasses(List<Tag> tags) {
+        return new TagSelector(tags).evaluate(tagSelector, env);
+    }
+
+    private void clearScenarioSelectionCache() {
+        for (Feature feature : features) {
+            List<FeatureSection> sections = feature.getSections();
+            if (sections == null) continue;
+            for (FeatureSection section : sections) {
+                if (!section.isOutline() && section.getScenario() != null) {
+                    section.getScenario().setSelected(null);
+                }
+            }
+        }
+    }
+
+    private static List<Tag> mergeTags(List<Tag> a, List<Tag> b) {
+        if (a == null || a.isEmpty()) {
+            return b == null ? Collections.emptyList() : b;
+        }
+        if (b == null || b.isEmpty()) {
+            return a;
+        }
+        List<Tag> merged = new ArrayList<>(a.size() + b.size());
+        merged.addAll(a);
+        merged.addAll(b);
+        return merged;
+    }
+
+    // ========== Event System ==========
+
+    void initThreadListeners() {
+        if (listenerFactories.isEmpty()) {
+            return;
+        }
+        List<RunListener> perThread = new ArrayList<>();
+        for (RunListenerFactory factory : listenerFactories) {
+            perThread.add(factory.create());
+        }
+        threadListeners.set(perThread);
+    }
+
+    void cleanupThreadListeners() {
+        threadListeners.remove();
+    }
+
+    public boolean fireEvent(RunEvent event) {
+        // Externalize embed bytes to embeds/ BEFORE any listener serializes the result, so neither the
+        // JSONL event stream nor the HTML data JSON inlines base64 — large screenshots stay on-disk files
+        // the report references off a folder / file:// (D136). One shared counter, done once on the
+        // canonical FeatureResult; the HTML writer's later pass is idempotent. Only the TOP-LEVEL feature
+        // (callDepth 0) externalizes: its walk recurses nested call results, so a called feature's own
+        // FEATURE_EXIT must not number them first (that would invert the embed sequence).
+        if (event.getType() == RunEventType.FEATURE_EXIT
+                && event instanceof FeatureRunEvent fre && fre.result() != null
+                && fre.source() != null && fre.source().getCallDepth() == 0) {
+            HtmlReportWriter.externalizeEmbeds(fre.result(), outputDir);
+        }
+
+        boolean proceed = true;
+        // one listener's failure never withholds the event from the others (the JSONL writer above all):
+        // every listener is attempted, and the first failure is rethrown once all have seen the event
+        RuntimeException failed = null;
+
+        // Global listeners (immutable list)
+        for (RunListener listener : listeners) {
+            try {
+                if (!listener.onEvent(event)) {
+                    proceed = false;
+                }
+            } catch (RuntimeException e) {
+                failed = failed == null ? e : failed;
+            }
+        }
+
+        // Mutable listeners (JSONL writer)
+        synchronized (mutableListeners) {
+            for (RunListener listener : mutableListeners) {
+                try {
+                    if (!listener.onEvent(event)) {
+                        proceed = false;
+                    }
+                } catch (RuntimeException e) {
+                    failed = failed == null ? e : failed;
+                }
+            }
+        }
+
+        // Per-thread listeners
+        List<RunListener> perThread = threadListeners.get();
+        if (perThread != null) {
+            for (RunListener listener : perThread) {
+                try {
+                    if (!listener.onEvent(event)) {
+                        proceed = false;
+                    }
+                } catch (RuntimeException e) {
+                    failed = failed == null ? e : failed;
+                }
+            }
+        }
+
+        if (failed != null) {
+            throw failed;
+        }
+        return proceed;
+    }
+
+    private static final DateTimeFormatter BACKUP_DATE_FORMAT =
+            DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss");
+
+    private void backupReportDirIfExists() {
+        if (!Files.exists(outputDir)) {
+            return;
+        }
+        String timestamp = LocalDateTime.now().format(BACKUP_DATE_FORMAT);
+        String baseName = outputDir.getFileName() + "_" + timestamp;
+        Path backupPath = outputDir.resolveSibling(baseName);
+        int suffix = 1;
+        while (Files.exists(backupPath)) {
+            backupPath = outputDir.resolveSibling(baseName + "_" + suffix);
+            suffix++;
+        }
+        try {
+            Files.move(outputDir, backupPath);
+            logger.info("backed up existing output to: {}", backupPath);
+        } catch (Exception e) {
+            logger.warn("Failed to backup existing dir '{}': {}", outputDir, e.getMessage());
+        }
+    }
+
+    // ========== Accessors (for private fields) ==========
+
+    public String getOutputDir() {
+        return outputDir.toString();
+    }
+
+    public Map<String, Object> getCallSingleCache() {
+        return CALLSINGLE_CACHE;
+    }
+
+    public ReentrantLock getCallSingleLock() {
+        return callSingleLock;
+    }
+
+    /**
+     * Get the callOnce cache for the given feature key (its resource URI). The cache
+     * is created on first access and reused across all FeatureRuntimes for the same
+     * feature within this Suite — and across Suites when the underlying store was
+     * injected via Runner.Builder.
+     */
+    public Map<String, Object> getCallOnceCache(String featureKey) {
+        return callOnceCacheStore.computeIfAbsent(featureKey, k -> new ConcurrentHashMap<>());
+    }
+
+    public ReentrantLock getCallOnceLock(String featureKey) {
+        return callOnceLockStore.computeIfAbsent(featureKey, k -> new ReentrantLock());
+    }
+
+    public Map<String, Object> getSetupOnceCache(String featureKey) {
+        return setupOnceCacheStore.computeIfAbsent(featureKey, k -> new ConcurrentHashMap<>());
+    }
+
+    public ScenarioLockManager getLockManager() {
+        return lockManager;
+    }
+
+    public ExecutorService getScenarioExecutor() {
+        return scenarioExecutor;
+    }
+
+    public Semaphore getScenarioSemaphore() {
+        return scenarioSemaphore;
+    }
+
+    public void acquireLane() {
+        if (availableLanes != null) {
+            Integer lane = availableLanes.poll();
+            if (lane != null) {
+                currentLane.set(lane);
+            }
+        }
+    }
+
+    public void releaseLane() {
+        if (availableLanes != null) {
+            Integer lane = currentLane.get();
+            if (lane != null) {
+                currentLane.remove();
+                availableLanes.add(lane);
+            }
+        }
+    }
+
+    public String getCurrentLaneName() {
+        Integer lane = currentLane.get();
+        return lane != null ? String.valueOf(lane) : null;
+    }
+
+    public void abort() {
+        aborted.set(true);
+    }
+
+    public boolean isAborted() {
+        return aborted.get();
+    }
+
+    /** A server {@code karate.start()} opened under this Suite: stopped when the run ends, except one started inside
+     *  {@code callSingle} under a host-injected cache, which lives as long as that cache. */
+    public void ownServer(MockServer server) {
+        if (sharedCallSingleCache && callSingleLock.isHeldByCurrentThread()) {
+            return;
+        }
+        servers.add(server);
+    }
+
+    /** The host seam: the servers this Suite started and would stop at the end of its run; from now on the caller
+     *  stops them. */
+    public List<MockServer> detachServers() {
+        List<MockServer> out = new ArrayList<>();
+        for (MockServer server : servers) {
+            // remove() is the one atomic step: a host detaching while the run ends takes each server once
+            if (servers.remove(server)) {
+                out.add(server);
+            }
+        }
+        return out;
+    }
+
+    private void stopServers() {
+        for (MockServer server : detachServers()) {
+            try {
+                server.stopAndWait();
+            } catch (RuntimeException e) {
+                logger.warn("mock server on port {} did not stop: {}", server.getPort(), e.getMessage());
+            }
+        }
+    }
+
+    public SuiteResult getResult() {
+        return result;
+    }
+
+    /**
+     * Whether a scenario's nested call trees can be dropped the moment the scenario ends,
+     * rather than waiting for its feature to finish.
+     *
+     * <p>This is what bounds memory for the shape that actually hurts: a single feature
+     * holding thousands of scenarios — a {@code Scenario Outline} — where feature end is
+     * the end of the whole run and releasing there frees nothing.
+     *
+     * <p>Only safe when nothing will want the detail later. The report writers build their
+     * output per <em>feature</em>, so they need every scenario's nesting still attached when
+     * the feature completes; a suite with any result listener therefore holds on until then.
+     * With no listeners — load runs, karate-gatling, reporting explicitly disabled — nothing
+     * ever reads it and it can go immediately. Custom listeners count as consumers, since
+     * there is no way to know what a caller's listener reads.
+     */
+    public boolean canReleaseCallResultsAtScenarioEnd() {
+        return !retainCallResults && resultListeners.isEmpty();
+    }
+
+    public List<ResultListener> getResultListeners() {
+        return resultListeners;
+    }
+
+    /**
+     * Get system properties for karate.properties.
+     * <p>
+     * A live view, not a copy: reading one key does not walk the JVM's whole property table,
+     * which {@code karate.sysprop('x')} and every {@code karate.properties['x']} used to do —
+     * a fresh HashMap of every system property, per access. Iteration still materializes.
+     */
+    public Map<String, String> getSystemProperties() {
+        return new SystemPropertiesView(systemProperties);
+    }
+
+    /** This Suite's environment overlay ({@code Runner.Builder.systemEnv}), immutable; empty when none. */
+    public Map<String, String> getSystemEnv() {
+        return systemEnv;
+    }
+
+    /** One environment variable, what {@code karate.sysenv(name)} reads: this Suite's overlay, then the process. */
+    public String getEnvVar(String name) {
+        String value = systemEnv.get(name);
+        return value != null ? value : System.getenv(name);
+    }
+
+    /**
+     * One property, without building the map — what {@code karate.sysprop(name)} wants.
+     * Builder-supplied properties win over the JVM's, matching the merge order of the view.
+     */
+    public String getSystemProperty(String key) {
+        if (systemProperties != null) {
+            String value = systemProperties.get(key);
+            if (value != null) {
+                return value;
+            }
+        }
+        return System.getProperty(key);
+    }
+
+    /**
+     * {@code karate.properties} as a Map whose {@code get} / {@code containsKey} go straight to
+     * {@link System#getProperty} — the only two operations the JS bridge performs for
+     * {@code karate.properties['x']}. Anything that needs the whole set (iteration, size,
+     * equality) materializes it on demand, so reads behave exactly as the per-access copy this
+     * replaced. Reads stay live: a {@code System.setProperty} mid-run is visible, as before.
+     * <p>
+     * Writes were always discarded — the copy they landed in was thrown away — and still are,
+     * but now they say so.
+     */
+    private static final class SystemPropertiesView extends java.util.AbstractMap<String, String> {
+
+        private final Map<String, String> overrides;
+
+        private SystemPropertiesView(Map<String, String> overrides) {
+            this.overrides = overrides;
+        }
+
+        @Override
+        public String get(Object key) {
+            if (!(key instanceof String name)) {
+                return null;
+            }
+            // containsKey, not a null check: a Runner.Builder property explicitly set to null
+            // shadows the JVM's, which is what merging the two maps used to do
+            if (overrides != null && overrides.containsKey(name)) {
+                return overrides.get(name);
+            }
+            return System.getProperty(name);
+        }
+
+        @Override
+        public boolean containsKey(Object key) {
+            if (overrides != null && overrides.containsKey(key)) {
+                return true;
+            }
+            return key instanceof String name && System.getProperty(name) != null;
+        }
+
+        /**
+         * {@code karate.properties['x'] = 'y'} has never set anything: it used to land in a
+         * throwaway copy and vanish. Kept a no-op rather than made to throw — a script doing it
+         * would start failing — but it is worth one line saying the write went nowhere, since
+         * silently losing it is how someone spends an afternoon.
+         */
+        @Override
+        public String put(String key, String value) {
+            logger.warn("karate.properties is read-only, ignoring write of '{}'"
+                    + " — use System.setProperty() or Runner.Builder.systemProperty() to set one", key);
+            return get(key);
+        }
+
+        @Override
+        public Set<Entry<String, String>> entrySet() {
+            Map<String, String> merged = new HashMap<>();
+            System.getProperties().forEach((k, v) -> merged.put(k.toString(), v.toString()));
+            if (overrides != null) {
+                merged.putAll(overrides);
+            }
+            return merged.entrySet();
+        }
+    }
+
+    public DriverProvider getDriverProvider() {
+        return driverProvider;
+    }
+
+    public PerfHook getPerfHook() {
+        return perfHook;
+    }
+
+    /**
+     * Set the performance hook for Gatling integration.
+     * This is the only mutable setter, needed for Gatling's deferred perfHook setup.
+     */
+    void setPerfHook(PerfHook hook) {
+        this.perfHook = hook;
+    }
+
+    public io.karatelabs.http.HttpClientFactory getHttpClientFactory() {
+        return httpClientFactory;
+    }
+
+    public boolean isPerfMode() {
+        return perfHook != null;
+    }
+
+    /**
+     * Whether each step's Karate output is collected into {@code StepResult.log} — see
+     * {@link Runner.Builder#captureStepLogs(boolean)}.
+     * <p>
+     * Unset, this answers "yes, unless this is a Gatling run": under Gatling there is no HTML
+     * report and nothing else reads the buffer, so building the text (which re-parses and
+     * pretty-prints every response body) would be pure waste. Resolved lazily rather than in
+     * the constructor because {@link #setPerfHook} runs after the Suite is built.
+     */
+    public boolean isCaptureStepLogs() {
+        return captureStepLogs != null ? captureStepLogs : !isPerfMode();
+    }
+
+    public boolean isSkipTagFiltering() {
+        return skipTagFiltering;
+    }
+
+}

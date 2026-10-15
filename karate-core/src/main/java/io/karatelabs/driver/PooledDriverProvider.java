@@ -1,0 +1,472 @@
+/*
+ * The MIT License
+ *
+ * Copyright 2025 Karate Labs Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package io.karatelabs.driver;
+
+import io.karatelabs.core.ScenarioRuntime;
+import io.karatelabs.driver.cdp.CdpDriver;
+import io.karatelabs.driver.cdp.CdpDriverOptions;
+import io.karatelabs.driver.w3c.W3cBrowserType;
+import io.karatelabs.driver.w3c.W3cDriver;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.Map;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+/**
+ * Driver provider that maintains a bounded pool of drivers.
+ * <p>
+ * This provider works correctly with virtual threads where each task gets a new
+ * thread ID. Drivers are pooled and reused across scenarios regardless of which
+ * thread executes them.
+ * <p>
+ * The pool size automatically matches the Suite's parallelism (threadCount),
+ * ensuring exactly the right number of drivers are created.
+ *
+ * <pre>
+ * // Usage - pool size auto-detected from Runner.parallel(N)
+ * Runner.path("features/")
+ *     .driverProvider(new PooledDriverProvider())
+ *     .parallel(4);  // Pool will have 4 drivers
+ *
+ * // Or with Testcontainers - override createDriver()
+ * Runner.path("features/")
+ *     .driverProvider(new PooledDriverProvider() {
+ *         protected Driver createDriver(Map&lt;String, Object&gt; config) {
+ *             return CdpDriver.connect(container.getCdpUrl(), options);
+ *         }
+ *     })
+ *     .parallel(4);
+ * </pre>
+ */
+public class PooledDriverProvider implements DriverProvider {
+
+    private static final Logger logger = LoggerFactory.getLogger(PooledDriverProvider.class);
+
+    private volatile int poolSize = -1;  // -1 means auto-detect from Suite
+    private volatile ArrayBlockingQueue<Driver> availableDrivers;
+    private final ConcurrentHashMap<ScenarioRuntime, Driver> assignedDrivers = new ConcurrentHashMap<>();
+    private final AtomicInteger createdCount = new AtomicInteger(0);
+    private final Object initLock = new Object();
+    private volatile boolean shutdown = false;
+
+    /**
+     * Create a pooled driver provider with auto-detected pool size.
+     * Pool size will match the Suite's parallelism (threadCount).
+     */
+    public PooledDriverProvider() {
+        // Pool size auto-detected on first acquire()
+    }
+
+    /**
+     * Create a pooled driver provider with explicit pool size.
+     * Use this when you need to override the auto-detected size.
+     *
+     * @param poolSize maximum number of drivers to create
+     */
+    public PooledDriverProvider(int poolSize) {
+        if (poolSize < 1) {
+            throw new IllegalArgumentException("Pool size must be at least 1");
+        }
+        this.poolSize = poolSize;
+        this.availableDrivers = new ArrayBlockingQueue<>(poolSize);
+    }
+
+    @Override
+    public Driver acquire(ScenarioRuntime runtime, Map<String, Object> config) {
+        if (shutdown) {
+            throw new IllegalStateException("Provider has been shut down");
+        }
+
+        // Initialize pool lazily with auto-detected size
+        ensurePoolInitialized(runtime);
+
+        // Check if this scenario already has a driver assigned (shouldn't happen normally)
+        Driver existing = assignedDrivers.get(runtime);
+        if (existing != null && !existing.isTerminated()) {
+            logger.debug("Returning existing driver for scenario: {}", runtime.getScenario().getName());
+            return existing;
+        }
+
+        // Try to get a driver from the pool
+        Driver driver = takeHealthyFromPool(runtime.getScenario().getName());
+
+        if (driver == null) {
+            // Need to create a new driver or wait for one
+            synchronized (initLock) {
+                // Double-check pool (another thread may have returned one)
+                driver = takeHealthyFromPool(runtime.getScenario().getName());
+                if (driver == null) {
+                    // Check if we can create more
+                    if (createdCount.get() < poolSize) {
+                        driver = createDriver(config);
+                        int count = createdCount.incrementAndGet();
+                        logger.info("Created driver {}/{} for scenario: {}",
+                                count, poolSize, runtime.getScenario().getName());
+                    } else {
+                        // Pool exhausted - wait for one to be returned
+                        driver = waitForDriver(config, runtime);
+                    }
+                }
+            }
+        }
+
+        assignedDrivers.put(runtime, driver);
+        return driver;
+    }
+
+    /**
+     * Poll a driver from the pool and reset it. Returns the driver if it's healthy
+     * after reset, or null if the pool was empty / the polled driver was terminated
+     * or failed its post-reset liveness probe (in which case it's already closed
+     * and {@code createdCount} is decremented — the caller should create a fresh
+     * driver in its place).
+     */
+    private Driver takeHealthyFromPool(String scenarioName) {
+        Driver driver = availableDrivers.poll();
+        if (driver == null) {
+            return null;
+        }
+        if (driver.isTerminated()) {
+            logger.debug("Discarding terminated driver from pool");
+            createdCount.decrementAndGet();
+            return null;
+        }
+        if (!resetDriver(driver)) {
+            // resetDriver already logged why (exception or liveness probe). Close and
+            // drop the slot so the caller creates a replacement. See resetDriver javadoc
+            // for why this matters (tab-switch.feature poisoning scenario).
+            closeDriverQuietly(driver);
+            createdCount.decrementAndGet();
+            return null;
+        }
+        logger.debug("Reusing pooled driver for scenario: {}", scenarioName);
+        return driver;
+    }
+
+    private void ensurePoolInitialized(ScenarioRuntime runtime) {
+        if (availableDrivers != null) {
+            return;
+        }
+        synchronized (initLock) {
+            if (availableDrivers != null) {
+                return;
+            }
+            // Auto-detect pool size from Suite's threadCount
+            if (poolSize < 1 && runtime.getFeatureRuntime() != null
+                    && runtime.getFeatureRuntime().getSuite() != null) {
+                poolSize = runtime.getFeatureRuntime().getSuite().threadCount;
+                logger.info("Auto-detected pool size from Suite: {}", poolSize);
+            }
+            if (poolSize < 1) {
+                poolSize = 1;  // Fallback
+                logger.warn("Could not detect pool size, defaulting to 1");
+            }
+            availableDrivers = new ArrayBlockingQueue<>(poolSize);
+        }
+    }
+
+    private Driver waitForDriver(Map<String, Object> config, ScenarioRuntime runtime) {
+        String scenarioName = runtime.getScenario().getName();
+        logger.warn("Pool exhausted for scenario '{}', waiting for available driver... [{}]",
+                scenarioName, getStats());
+        try {
+            Driver driver = availableDrivers.poll(30, TimeUnit.SECONDS);
+            if (driver == null) {
+                throw new RuntimeException("Timeout waiting for available driver for scenario '"
+                        + scenarioName + "' [" + getStats() + "]");
+            }
+            // If the driver is terminated OR fails reset/liveness, replace it.
+            // Same rationale as takeHealthyFromPool — a poisoned driver must not be
+            // handed out to the next scenario.
+            if (driver.isTerminated()) {
+                createdCount.decrementAndGet();
+                driver = createDriver(config);
+                createdCount.incrementAndGet();
+                logger.info("Replaced terminated driver for scenario: {}", scenarioName);
+            } else if (!resetDriver(driver)) {
+                closeDriverQuietly(driver);
+                createdCount.decrementAndGet();
+                driver = createDriver(config);
+                createdCount.incrementAndGet();
+                logger.info("Replaced unhealthy driver for scenario: {}", scenarioName);
+            } else {
+                logger.info("Acquired pooled driver after wait for scenario: {}", scenarioName);
+            }
+            return driver;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted while waiting for driver", e);
+        }
+    }
+
+    @Override
+    public void release(ScenarioRuntime runtime, Driver driver) {
+        assignedDrivers.remove(runtime);
+
+        if (shutdown) {
+            // During shutdown, just close the driver
+            closeDriverQuietly(driver);
+            return;
+        }
+
+        if (driver.isTerminated()) {
+            logger.debug("Not returning terminated driver to pool");
+            createdCount.decrementAndGet();
+            return;
+        }
+
+        // Eagerly discard a driver whose channel went sick mid-scenario instead of
+        // returning it to the pool. The acquire-time resetDriver() probe would catch
+        // it eventually, but only AFTER the next scenario inherits the poisoned driver
+        // and eats its own timeout — which is how a single renderer stall under a slow
+        // CI container ("CDP timeout for: Page.captureScreenshot") cascaded into a batch
+        // of failures on the same pooled driver. Probing here (cheap, bounded — see
+        // isResponsive()) caps that cross-scenario contagion. We probe BEFORE
+        // cleanScenarioState() so a dead channel can't hang the stopIntercept/onDialog
+        // teardown calls on the full CDP timeout. Note: an eval-based probe can still
+        // pass on a renderer stalled only on compositor/paint work (the screenshot path),
+        // so this is insurance, not a guarantee — the bounded failureScreenshot timeout
+        // covers that case.
+        if (!driver.isResponsive()) {
+            logger.warn("Driver failed liveness probe on release, discarding instead of returning to pool");
+            closeDriverQuietly(driver);
+            createdCount.decrementAndGet();
+            return;
+        }
+
+        // Tear down scenario-scoped state BEFORE returning to the pool. This is the
+        // "top-level scenario exit" hook per DRIVER.md — the owner scenario is done,
+        // so any driver state it installed (intercept handler, dialog handler, etc.)
+        // belongs to a scope that no longer exists and must not leak into the next
+        // scenario that acquires this driver.
+        //
+        // Why this matters (context for future maintainers): intercept.feature's
+        // wildcard-pattern scenario set Fetch.enable via driver.intercept() and never
+        // called stopIntercept. The driver went back to the pool with Fetch.enable
+        // still active and a stale JS InterceptHandler from a destroyed scenario.
+        // Every subsequent Page.navigate on that driver paused ALL subresource
+        // requests through our onRequestPaused event handler, which runs synchronously
+        // on the CDP websocket dispatch thread. A heavy page (HTML + CSS + JS + etc)
+        // could saturate that thread, queueing the Page.navigate command response
+        // behind the Fetch event backlog. The 30s CDP wall-clock timeout then fired
+        // before the response was dequeued → "CDP timeout for: Page.navigate".
+        cleanScenarioState(driver);
+
+        // Return to pool
+        boolean offered = availableDrivers.offer(driver);
+        if (!offered) {
+            // Pool full (shouldn't happen with correct sizing)
+            logger.warn("Pool full, closing excess driver");
+            closeDriverQuietly(driver);
+            createdCount.decrementAndGet();
+        } else {
+            logger.debug("Returned driver to pool for scenario: {}", runtime.getScenario().getName());
+        }
+    }
+
+    /**
+     * Tear down scenario-scoped driver state at owner-scenario exit. Called from
+     * {@link #release} before the driver is offered back to the pool.
+     * <p>
+     * Only state that belongs to the scenario's scope should be cleaned here —
+     * NOT cookies or page state, those belong in {@link #resetDriver} at acquire
+     * time (per-scenario setup vs per-scenario teardown).
+     * </p>
+     * <p>
+     * Subclasses overriding this should call {@code super.cleanScenarioState(driver)}
+     * to preserve intercept/dialog teardown.
+     * </p>
+     */
+    protected void cleanScenarioState(Driver driver) {
+        // stopIntercept is a cheap no-op on drivers that never enabled Fetch (Chrome
+        // treats Fetch.disable as a no-op when Fetch wasn't enabled). Always calling
+        // it is simpler than tracking per-driver intercept state here.
+        try {
+            driver.stopIntercept();
+        } catch (UnsupportedOperationException e) {
+            // W3C backend doesn't support intercept — fine
+        } catch (Exception e) {
+            logger.debug("stopIntercept on release failed (non-fatal): {}", e.getMessage());
+        }
+        // Dialog handler is a reference to a scenario's JS function — null it out so
+        // the next scenario doesn't get callbacks on someone else's code.
+        try {
+            driver.onDialog(null);
+        } catch (UnsupportedOperationException e) {
+            // W3C backend uses a different dialog model
+        } catch (Exception e) {
+            logger.debug("onDialog(null) on release failed (non-fatal): {}", e.getMessage());
+        }
+    }
+
+    @Override
+    public void shutdown() {
+        shutdown = true;
+        int count = createdCount.get();
+        logger.debug("Shutting down PooledDriverProvider, closing {} drivers", count);
+
+        // Close all assigned drivers
+        for (Driver driver : assignedDrivers.values()) {
+            closeDriverQuietly(driver);
+        }
+        assignedDrivers.clear();
+
+        // Close all pooled drivers
+        if (availableDrivers != null) {
+            Driver driver;
+            while ((driver = availableDrivers.poll()) != null) {
+                closeDriverQuietly(driver);
+            }
+        }
+    }
+
+    /**
+     * Reset driver state between scenarios.
+     * Override to customize reset behavior.
+     * <p>
+     * Returns {@code true} if the driver is healthy and safe to return to the pool,
+     * {@code false} if it should be discarded and replaced. Callers (see
+     * {@link #release(ScenarioRuntime, Driver)}) MUST honor the false return —
+     * otherwise a poisoned driver can pollute every subsequent scenario.
+     * </p>
+     * <p>
+     * <b>Context for the health-check + discard logic:</b> without this, observed in
+     * CI as deterministic "CDP timeout for: Page.navigate" failures after
+     * tab-switch.feature — that scenario's repeated activateTarget/attachToTarget
+     * calls leave the driver's CDP channel stuck on navigation commands. The pool
+     * kept handing the stuck driver back out and every other cookie/keys scenario
+     * timed out at 30s. The fix is to probe liveness (see
+     * {@link Driver#isResponsive()}) and recycle drivers that fail the probe.
+     * Subclasses overriding this should preserve the boolean contract.
+     * </p>
+     */
+    protected boolean resetDriver(Driver driver) {
+        try {
+            // Dismiss any open dialog first — dialogs block all CDP Runtime.evaluate calls
+            Dialog dialog = driver.getDialog();
+            if (dialog != null) {
+                logger.debug("Dismissing stale dialog before reset");
+                try {
+                    dialog.dismiss();
+                } catch (Exception e) {
+                    logger.debug("Dialog dismiss during reset (may already be handled): {}", e.getMessage());
+                }
+            }
+            driver.setUrl("about:blank");
+            driver.clearCookies();
+            // Barrier on readiness before reuse: setUrl("about:blank") returns early
+            // (about: URLs skip waitForPageLoad), so the fresh execution context may
+            // still be settling. waitUntilReady() blocks until it is live so the next
+            // scenario's first call never races a not-yet-ready context. No-op on
+            // backends that establish readiness synchronously.
+            driver.waitUntilReady();
+        } catch (Exception e) {
+            // Reset itself failed — channel is already sick (setUrl timeout, websocket closed, etc.)
+            logger.warn("Error resetting driver state, will discard: {}", e.getMessage());
+            return false;
+        }
+        // Post-reset liveness probe. setUrl("about:blank") can succeed on a driver that
+        // will still hang on the next http:// navigation (seen after tab-switch.feature —
+        // about:blank is local so Chrome handles it even when network-facing navigation
+        // is stuck). A bounded Runtime.evaluate catches the degraded state before we
+        // return the driver to the pool.
+        if (!driver.isResponsive()) {
+            logger.warn("Driver failed post-reset liveness probe, will discard");
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Create a new driver from config.
+     * Subclasses should override for custom driver creation (e.g., Testcontainers).
+     * <p>
+     * With no {@code webSocketUrl} each pooled driver launches its own browser process,
+     * so slots are isolated by construction. Against a SHARED browser the isolation has
+     * to be asked for: a browser-level endpoint gets each slot its own incognito context
+     * via {@link CdpDriver#connectNewContext}, because pooled slots sharing one browser
+     * context share its cookie jar, and the per-acquire {@code clearCookies()} in
+     * {@link #resetDriver} is context-wide — one slot resetting would wipe the cookies of
+     * every other slot mid-scenario.
+     * </p>
+     * <p>
+     * A page-level endpoint is taken at face value and attached to directly: the caller
+     * named a specific tab, so it owns that tab's lifetime and isolation. Pointing a pool
+     * of more than one slot at a single page endpoint means every slot drives the SAME
+     * tab — that is inherent to the request, not something this method can fix.
+     * </p>
+     */
+    protected Driver createDriver(Map<String, Object> config) {
+        String type = (String) config.getOrDefault("type", "chrome");
+        if (W3cBrowserType.isW3cType(type)) {
+            return W3cDriver.start(config);
+        }
+        // CDP (default)
+        CdpDriverOptions options = CdpDriverOptions.fromMap(config);
+        String wsUrl = options.getWebSocketUrl();
+        if (wsUrl == null || wsUrl.isEmpty()) {
+            return CdpDriver.start(options);
+        }
+        if (wsUrl.contains("/devtools/browser/")) {
+            return CdpDriver.connectNewContext(wsUrl, options);
+        }
+        if (poolSize > 1) {
+            logger.warn("pool size {} but webSocketUrl names a single page — all slots will drive the SAME tab."
+                    + " Pass a browser-level endpoint (see /json/version) for isolated slots: {}", poolSize, wsUrl);
+        }
+        return CdpDriver.connect(wsUrl, options);
+    }
+
+    private void closeDriverQuietly(Driver driver) {
+        try {
+            if (!driver.isTerminated()) {
+                driver.quit();
+            }
+        } catch (Exception e) {
+            logger.warn("Error closing driver: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Get current pool size (may be -1 if not yet initialized).
+     */
+    public int getPoolSize() {
+        return poolSize;
+    }
+
+    /**
+     * Get current pool statistics for monitoring.
+     */
+    public String getStats() {
+        return String.format("PooledDriverProvider[size=%d, created=%d, available=%d, assigned=%d]",
+                poolSize, createdCount.get(),
+                availableDrivers != null ? availableDrivers.size() : 0,
+                assignedDrivers.size());
+    }
+
+}

@@ -1,0 +1,888 @@
+/*
+ * The MIT License
+ *
+ * Copyright 2025 Karate Labs Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package io.karatelabs.output;
+
+import io.karatelabs.common.Json;
+import io.karatelabs.core.Globals;
+import io.karatelabs.core.Runner;
+import io.karatelabs.core.ScenarioResult;
+import io.karatelabs.core.Suite;
+import io.karatelabs.core.SuiteResult;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+class JsonLinesEventWriterTest {
+
+    @TempDir
+    Path tempDir;
+
+    @BeforeEach
+    void setup() {
+        Console.setColorsEnabled(false);
+    }
+
+    @Test
+    void testJsonLinesFileCreated() throws Exception {
+        Path feature = tempDir.resolve("test.feature");
+        Files.writeString(feature, """
+            Feature: JSON Lines Test
+
+            Scenario: Passing scenario
+            * def a = 1
+            * match a == 1
+            """);
+
+        Path reportDir = tempDir.resolve("reports");
+
+        SuiteResult result = Runner.path(feature.toString())
+                .workingDir(tempDir)
+                .outputDir(reportDir)
+                .outputJsonLines(true)  // opt-in to JSON Lines
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed());
+
+        // Verify JSON Lines file was created
+        Path jsonlPath = reportDir.resolve(Suite.KARATE_JSON_SUBFOLDER).resolve("karate-events.jsonl");
+        assertTrue(Files.exists(jsonlPath), "JSON Lines file should exist");
+
+        String content = Files.readString(jsonlPath);
+        String[] lines = content.trim().split("\n");
+
+        // Should have at least SUITE_ENTER, FEATURE_EXIT, SUITE_EXIT
+        assertTrue(lines.length >= 3, "Should have at least 3 event lines");
+    }
+
+    @Test
+    void testJsonLinesSuiteHeader() throws Exception {
+        Path feature = tempDir.resolve("test.feature");
+        Files.writeString(feature, """
+            Feature: Suite Header Test
+            Scenario: Test
+            * def a = 1
+            """);
+
+        Path reportDir = tempDir.resolve("reports");
+
+        Runner.path(feature.toString())
+                .workingDir(tempDir)
+                .outputDir(reportDir)
+                .outputJsonLines(true)
+                .karateEnv("dev")
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        Path jsonlPath = reportDir.resolve(Suite.KARATE_JSON_SUBFOLDER).resolve("karate-events.jsonl");
+        String[] lines = Files.readString(jsonlPath).trim().split("\n");
+
+        // Parse SUITE_ENTER event (first line)
+        @SuppressWarnings("unchecked")
+        Map<String, Object> envelope = (Map<String, Object>) Json.of(lines[0]).value();
+        @SuppressWarnings("unchecked")
+        Map<String, Object> data = (Map<String, Object>) envelope.get("data");
+
+        assertEquals("SUITE_ENTER", envelope.get("type"));
+        assertEquals("dev", data.get("env"));
+        assertEquals(Globals.KARATE_VERSION, data.get("version"));
+        assertTrue(envelope.containsKey("timeStamp"));
+        assertTrue(data.containsKey("threads"));
+    }
+
+    @Test
+    void testJsonLinesFeatureLine() throws Exception {
+        Path feature = tempDir.resolve("test.feature");
+        Files.writeString(feature, """
+            Feature: Feature Line Test
+
+            Scenario: Passing scenario
+            * def a = 1
+            * match a == 1
+            """);
+
+        Path reportDir = tempDir.resolve("reports");
+
+        Runner.path(feature.toString())
+                .workingDir(tempDir)
+                .outputDir(reportDir)
+                .outputJsonLines(true)
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        Path jsonlPath = reportDir.resolve(Suite.KARATE_JSON_SUBFOLDER).resolve("karate-events.jsonl");
+        String[] lines = Files.readString(jsonlPath).trim().split("\n");
+
+        // Find FEATURE_EXIT event
+        Map<String, Object> featureData = null;
+        for (String line : lines) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> envelope = (Map<String, Object>) Json.of(line).value();
+            if ("FEATURE_EXIT".equals(envelope.get("type"))) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> data = (Map<String, Object>) envelope.get("data");
+                featureData = data;
+                break;
+            }
+        }
+        assertNotNull(featureData, "Should have FEATURE_EXIT event");
+
+        assertEquals("Feature Line Test", featureData.get("name"));
+        assertTrue(featureData.get("relativePath").toString().endsWith("test.feature"));
+
+        // Check status
+        assertEquals(true, featureData.get("passed"));
+        assertTrue(featureData.containsKey("durationMillis"));
+
+        // Check scenarioResults array
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> scenarioResults = (List<Map<String, Object>>) featureData.get("scenarioResults");
+        assertEquals(1, scenarioResults.size());
+
+        Map<String, Object> scenario = scenarioResults.get(0);
+        assertEquals("Passing scenario", scenario.get("name"));
+
+        // Check stepResults
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> stepResults = (List<Map<String, Object>>) scenario.get("stepResults");
+        assertEquals(2, stepResults.size());
+        @SuppressWarnings("unchecked")
+        Map<String, Object> stepResult = (Map<String, Object>) stepResults.get(0).get("result");
+        assertEquals("passed", stepResult.get("status"));
+    }
+
+    @Test
+    void testJsonLinesSuiteEnd() throws Exception {
+        Path feature = tempDir.resolve("test.feature");
+        Files.writeString(feature, """
+            Feature: Suite End Test
+
+            Scenario: Passing
+            * def a = 1
+
+            Scenario: Also passing
+            * def b = 2
+            """);
+
+        Path reportDir = tempDir.resolve("reports");
+
+        SuiteResult result = Runner.path(feature.toString())
+                .workingDir(tempDir)
+                .outputDir(reportDir)
+                .outputJsonLines(true)
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        Path jsonlPath = reportDir.resolve(Suite.KARATE_JSON_SUBFOLDER).resolve("karate-events.jsonl");
+        String[] lines = Files.readString(jsonlPath).trim().split("\n");
+
+        // Find SUITE_EXIT event (last line)
+        Map<String, Object> summary = null;
+        Map<String, Object> suiteExitData = null;
+        for (String line : lines) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> envelope = (Map<String, Object>) Json.of(line).value();
+            if ("SUITE_EXIT".equals(envelope.get("type"))) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> data = (Map<String, Object>) envelope.get("data");
+                suiteExitData = data;
+                @SuppressWarnings("unchecked")
+                Map<String, Object> s = (Map<String, Object>) data.get("summary");
+                summary = s;
+                break;
+            }
+        }
+        assertNotNull(summary, "Should have SUITE_EXIT event with summary");
+
+        // The closing event carries the counters and nothing else. It used to serialize the whole
+        // SuiteResult, repeating every scenario and step of the run — which breaks the rule that
+        // the heavy payload lands exactly once (on FEATURE_EXIT) and, because each feature has by
+        // then released its step logs, shipped a quietly thinner copy of data already on the wire.
+        assertNull(suiteExitData.get("features"),
+                "SUITE_EXIT must not repeat the per-feature payload: " + suiteExitData.keySet());
+        assertEquals(java.util.Set.of("summary"), suiteExitData.keySet(),
+                "SUITE_EXIT.data is the summary and nothing else");
+
+        assertEquals(1, ((Number) summary.get("featuresPassed")).intValue());
+        assertEquals(0, ((Number) summary.get("featuresFailed")).intValue());
+        assertEquals(2, ((Number) summary.get("scenariosPassed")).intValue());
+        assertEquals(0, ((Number) summary.get("scenariosFailed")).intValue());
+        assertEquals(100, ((Number) summary.get("passedRate")).intValue());
+        long duration = ((Number) summary.get("durationMillis")).longValue();
+        assertTrue(duration >= 0, "durationMillis in SUITE_EXIT must not be negative");
+        // endTime is set exactly once — before SUITE_EXIT fires — so the event's duration
+        // must match what survives to the returned SuiteResult
+        assertEquals(result.getDurationMillis(), duration,
+                "SUITE_EXIT durationMillis should match the in-memory SuiteResult");
+
+        long startTime = ((Number) summary.get("startTime")).longValue();
+        long endTime = ((Number) summary.get("endTime")).longValue();
+        assertEquals(result.getStartTime(), startTime,
+                "summary.startTime should match the in-memory SuiteResult");
+        assertEquals(result.getEndTime(), endTime,
+                "summary.endTime should match the in-memory SuiteResult");
+        assertEquals(duration, endTime - startTime,
+                "summary durationMillis must equal endTime - startTime");
+    }
+
+    @Test
+    void testJsonLinesWithFailures() throws Exception {
+        Path feature = tempDir.resolve("failing.feature");
+        Files.writeString(feature, """
+            Feature: Failing Test
+
+            Scenario: Passing
+            * def a = 1
+
+            Scenario: Failing
+            * def b = 2
+            * match b == 999
+            """);
+
+        Path reportDir = tempDir.resolve("reports");
+
+        SuiteResult result = Runner.path(feature.toString())
+                .workingDir(tempDir)
+                .outputDir(reportDir)
+                .outputJsonLines(true)
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        assertTrue(result.isFailed());
+
+        Path jsonlPath = reportDir.resolve(Suite.KARATE_JSON_SUBFOLDER).resolve("karate-events.jsonl");
+        String[] lines = Files.readString(jsonlPath).trim().split("\n");
+
+        // Find FEATURE_EXIT event
+        Map<String, Object> featureData = null;
+        for (String line : lines) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> envelope = (Map<String, Object>) Json.of(line).value();
+            if ("FEATURE_EXIT".equals(envelope.get("type"))) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> data = (Map<String, Object>) envelope.get("data");
+                featureData = data;
+                break;
+            }
+        }
+        assertNotNull(featureData);
+
+        // Check status
+        assertEquals(true, featureData.get("failed"));
+        assertEquals(50, ((Number) featureData.get("passedRate")).intValue());
+
+        // Check scenarioResults - one passed, one failed
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> scenarioResults = (List<Map<String, Object>>) featureData.get("scenarioResults");
+        assertEquals(2, scenarioResults.size());
+
+        // Find SUITE_EXIT and check summary
+        Map<String, Object> summary = null;
+        for (String line : lines) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> envelope = (Map<String, Object>) Json.of(line).value();
+            if ("SUITE_EXIT".equals(envelope.get("type"))) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> data = (Map<String, Object>) envelope.get("data");
+                @SuppressWarnings("unchecked")
+                Map<String, Object> s = (Map<String, Object>) data.get("summary");
+                summary = s;
+                break;
+            }
+        }
+        assertNotNull(summary);
+        assertEquals(0, ((Number) summary.get("featuresPassed")).intValue());
+        assertEquals(1, ((Number) summary.get("featuresFailed")).intValue());
+        assertEquals(1, ((Number) summary.get("scenariosPassed")).intValue());
+        assertEquals(1, ((Number) summary.get("scenariosFailed")).intValue());
+        assertEquals(50, ((Number) summary.get("passedRate")).intValue());
+    }
+
+    @Test
+    void testJsonLinesWithTags() throws Exception {
+        Path feature = tempDir.resolve("tagged.feature");
+        Files.writeString(feature, """
+            Feature: Tagged Test
+
+            @smoke @regression
+            Scenario: Tagged scenario
+            * def a = 1
+            """);
+
+        Path reportDir = tempDir.resolve("reports");
+
+        Runner.path(feature.toString())
+                .workingDir(tempDir)
+                .outputDir(reportDir)
+                .outputJsonLines(true)
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        Path jsonlPath = reportDir.resolve(Suite.KARATE_JSON_SUBFOLDER).resolve("karate-events.jsonl");
+        String[] lines = Files.readString(jsonlPath).trim().split("\n");
+
+        // Find FEATURE_EXIT event
+        Map<String, Object> featureData = null;
+        for (String line : lines) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> envelope = (Map<String, Object>) Json.of(line).value();
+            if ("FEATURE_EXIT".equals(envelope.get("type"))) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> data = (Map<String, Object>) envelope.get("data");
+                featureData = data;
+                break;
+            }
+        }
+        assertNotNull(featureData);
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> scenarioResults = (List<Map<String, Object>>) featureData.get("scenarioResults");
+        Map<String, Object> scenario = scenarioResults.get(0);
+
+        @SuppressWarnings("unchecked")
+        List<String> tags = (List<String>) scenario.get("tags");
+        assertNotNull(tags);
+        assertEquals(2, tags.size());
+    }
+
+    @Test
+    void testJsonLinesMultipleFeatures() throws Exception {
+        Path feature1 = tempDir.resolve("feature1.feature");
+        Files.writeString(feature1, """
+            Feature: Feature One
+            Scenario: Test 1
+            * def a = 1
+            """);
+
+        Path feature2 = tempDir.resolve("feature2.feature");
+        Files.writeString(feature2, """
+            Feature: Feature Two
+            Scenario: Test 2
+            * def b = 2
+            """);
+
+        Path reportDir = tempDir.resolve("reports");
+
+        Runner.path(tempDir.toString())
+                .workingDir(tempDir)
+                .outputDir(reportDir)
+                .outputJsonLines(true)
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        Path jsonlPath = reportDir.resolve(Suite.KARATE_JSON_SUBFOLDER).resolve("karate-events.jsonl");
+        String[] lines = Files.readString(jsonlPath).trim().split("\n");
+
+        // Should have at least 4 event lines: SUITE_ENTER, 2x FEATURE_EXIT, SUITE_EXIT
+        assertTrue(lines.length >= 4);
+
+        // Verify both FEATURE_EXIT events
+        int featureCount = 0;
+        for (String line : lines) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> envelope = (Map<String, Object>) Json.of(line).value();
+            if ("FEATURE_EXIT".equals(envelope.get("type"))) {
+                featureCount++;
+            }
+        }
+        assertEquals(2, featureCount);
+
+        // Check SUITE_EXIT summary totals
+        Map<String, Object> summary = null;
+        for (String line : lines) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> envelope = (Map<String, Object>) Json.of(line).value();
+            if ("SUITE_EXIT".equals(envelope.get("type"))) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> data = (Map<String, Object>) envelope.get("data");
+                @SuppressWarnings("unchecked")
+                Map<String, Object> s = (Map<String, Object>) data.get("summary");
+                summary = s;
+                break;
+            }
+        }
+        assertNotNull(summary);
+        assertEquals(2, ((Number) summary.get("featuresPassed")).intValue());
+        assertEquals(2, ((Number) summary.get("scenariosPassed")).intValue());
+    }
+
+    @Test
+    void testJsonLinesScenarioExitCarriesError() throws Exception {
+        Path feature = tempDir.resolve("failing.feature");
+        Files.writeString(feature, """
+            Feature: Scenario Error Test
+
+            Scenario: will fail on a match
+            * def actual = 1
+            * match actual == 999
+            """);
+
+        Path reportDir = tempDir.resolve("reports");
+
+        Runner.path(feature.toString())
+                .workingDir(tempDir)
+                .outputDir(reportDir)
+                .outputJsonLines(true)
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        Path jsonlPath = reportDir.resolve(Suite.KARATE_JSON_SUBFOLDER).resolve("karate-events.jsonl");
+        String[] lines = Files.readString(jsonlPath).trim().split("\n");
+
+        Map<String, Object> scenarioExit = null;
+        for (String line : lines) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> envelope = (Map<String, Object>) Json.of(line).value();
+            if ("SCENARIO_EXIT".equals(envelope.get("type"))) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> data = (Map<String, Object>) envelope.get("data");
+                scenarioExit = data;
+                break;
+            }
+        }
+        assertNotNull(scenarioExit, "should have SCENARIO_EXIT event");
+        assertEquals(false, scenarioExit.get("passed"));
+        assertEquals(false, scenarioExit.get("skipped"));
+        String error = (String) scenarioExit.get("error");
+        assertNotNull(error, "SCENARIO_EXIT must carry an error message on failure");
+        assertTrue(error.contains("match") || error.contains("999") || error.contains("actual"),
+                "error should reference the failed step: " + error);
+    }
+
+    @Test
+    void testJsonLinesScenarioExitErrorLeadsWithFeatureLocation() throws Exception {
+        // IDE test runners show SCENARIO_EXIT.error as the failure text, with no other location
+        Path feature = tempDir.resolve("located.feature");
+        Files.writeString(feature, """
+            Feature: Located Error
+
+            Scenario: fails on line six
+            * def actual = 1
+            # labels the match
+            * match actual == 999
+
+            @report=false
+            Scenario: fails with report disabled
+            * def secret = 'sensitive-12345'
+            * match secret == 'other'
+            """);
+
+        Path reportDir = tempDir.resolve("reports");
+
+        Runner.path(feature.toString())
+                .workingDir(tempDir)
+                .outputDir(reportDir)
+                .outputJsonLines(true)
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        Path jsonlPath = reportDir.resolve(Suite.KARATE_JSON_SUBFOLDER).resolve("karate-events.jsonl");
+        Map<String, Map<String, Object>> scenarioExits = new HashMap<>();
+        String featureExitError = null;
+        for (String line : Files.readString(jsonlPath).trim().split("\n")) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> envelope = (Map<String, Object>) Json.of(line).value();
+            @SuppressWarnings("unchecked")
+            Map<String, Object> data = (Map<String, Object>) envelope.get("data");
+            if ("SCENARIO_EXIT".equals(envelope.get("type"))) {
+                scenarioExits.put((String) data.get("name"), data);
+            } else if ("FEATURE_EXIT".equals(envelope.get("type"))) {
+                @SuppressWarnings("unchecked")
+                List<Map<String, Object>> scenarios = (List<Map<String, Object>>) data.get("scenarioResults");
+                featureExitError = (String) scenarios.getFirst().get("error");
+            }
+        }
+        Map<String, Object> located = scenarioExits.get("fails on line six");
+        String scenarioError = (String) located.get("error");
+        String errorReason = (String) located.get("errorReason");
+        assertNotNull(scenarioError);
+        String[] errorLines = scenarioError.split("\n");
+        assertTrue(errorLines[0].endsWith("located.feature:6"), "first line is path:line: " + scenarioError);
+        assertEquals("# labels the match", errorLines[1]);
+        assertEquals("* match actual == 999", errorLines[2]);
+        assertTrue(errorLines[3].startsWith("match failed: EQUALS"), scenarioError);
+        // errorReason lets consumers split off the location, step and label without parsing lines
+        assertTrue(errorReason.startsWith("match failed: EQUALS"), errorReason);
+        assertTrue(scenarioError.endsWith("\n" + errorReason), scenarioError);
+        // the report payload renders the location itself, so its message stays raw
+        assertEquals("# labels the match\n" + errorReason, featureExitError);
+        Map<String, Object> suppressed = scenarioExits.get("fails with report disabled");
+        assertEquals(ScenarioResult.SUPPRESSED_FAILURE_MESSAGE, suppressed.get("error"));
+        assertEquals(ScenarioResult.SUPPRESSED_FAILURE_MESSAGE, suppressed.get("errorReason"));
+    }
+
+    @Test
+    void testJsonLinesScenarioExitSkipped() throws Exception {
+        Path feature = tempDir.resolve("skipped.feature");
+        Files.writeString(feature, """
+            Feature: Scenario Skip Test
+
+            Scenario: aborts mid-way
+            * def a = 1
+            * karate.abort()
+            * def b = 2
+            """);
+
+        Path reportDir = tempDir.resolve("reports");
+
+        Runner.path(feature.toString())
+                .workingDir(tempDir)
+                .outputDir(reportDir)
+                .outputJsonLines(true)
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        Path jsonlPath = reportDir.resolve(Suite.KARATE_JSON_SUBFOLDER).resolve("karate-events.jsonl");
+        String[] lines = Files.readString(jsonlPath).trim().split("\n");
+
+        Map<String, Object> scenarioExit = null;
+        for (String line : lines) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> envelope = (Map<String, Object>) Json.of(line).value();
+            if ("SCENARIO_EXIT".equals(envelope.get("type"))) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> data = (Map<String, Object>) envelope.get("data");
+                scenarioExit = data;
+                break;
+            }
+        }
+        assertNotNull(scenarioExit, "should have SCENARIO_EXIT event");
+        assertEquals(true, scenarioExit.get("skipped"), "aborted scenario must report skipped=true");
+        assertNull(scenarioExit.get("error"), "skipped scenario must not carry an error");
+
+        // A karate.abort()-bodied scenario — used as the declared-not-implemented
+        // convention — must still emit identity fields (slug + name) so receivers
+        // can register the scenario in their taxonomy even though it didn't run.
+        assertNotNull(scenarioExit.get("slug"), "skipped scenario must carry a slug");
+        assertEquals("aborts mid-way", scenarioExit.get("name"));
+    }
+
+    @Test
+    void testScenarioExitHonorsIdOverride() throws Exception {
+        // An author-set __id (a sibling of __row/__num) pins a rename-proof stable
+        // identity: set it via a `* def __id` step OR an Examples: column and it
+        // overrides the derived slug verbatim. Non-space punctuation common in
+        // ticket / story keys — '/', ':', '.' — must survive untouched (they ride
+        // through Gherkin tag values the same way; see RunUtilsTest).
+        Path feature = tempDir.resolve("stable-id.feature");
+        Files.writeString(feature, """
+            Feature: stable id
+
+            Scenario: with def id
+            * def __id = 'ID:plain.1'
+
+            Scenario: without id
+            * def x = 1
+
+            Scenario Outline: ordered
+            * def y = 1
+
+            Examples:
+              | __id        |
+              | ORD-001/2.1 |
+              | ORD-002.3   |
+            """);
+
+        Path reportDir = tempDir.resolve("reports");
+        Runner.path(feature.toString())
+                .workingDir(tempDir)
+                .outputDir(reportDir)
+                .outputJsonLines(true)
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        List<String> slugs = scenarioExitSlugs(reportDir);
+
+        // __id from a `* def` step wins verbatim — ':' and '.' preserved.
+        assertTrue(slugs.contains("ID:plain.1"),
+                "`* def __id` should override the slug verbatim: " + slugs);
+        // __id from an Examples: column wins verbatim — '/' and '.' preserved.
+        assertTrue(slugs.contains("ORD-001/2.1"),
+                "Examples: __id column should override the slug verbatim: " + slugs);
+        assertTrue(slugs.contains("ORD-002.3"),
+                "Examples: __id column should override the slug verbatim: " + slugs);
+        // No __id → derived feature-path:name slug stands as the fallback.
+        assertTrue(slugs.stream().anyMatch(s -> s.endsWith(":without id")),
+                "a scenario without __id must fall back to the derived slug: " + slugs);
+        // Outline-example fallback (<outline-slug>:<index>) must NOT appear — every
+        // example overrode its identity.
+        assertTrue(slugs.stream().noneMatch(s -> s.endsWith(":ordered:0") || s.endsWith(":ordered:1")),
+                "derived outline-example slugs should be fully overridden by __id: " + slugs);
+    }
+
+    /** All SCENARIO_EXIT slug fields from a run's JSONL, in stream order. */
+    private static List<String> scenarioExitSlugs(Path reportDir) throws Exception {
+        Path jsonlPath = reportDir.resolve(Suite.KARATE_JSON_SUBFOLDER).resolve("karate-events.jsonl");
+        String[] lines = Files.readString(jsonlPath).trim().split("\n");
+        List<String> slugs = new java.util.ArrayList<>();
+        for (String line : lines) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> envelope = (Map<String, Object>) Json.of(line).value();
+            if ("SCENARIO_EXIT".equals(envelope.get("type"))) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> data = (Map<String, Object>) envelope.get("data");
+                slugs.add((String) data.get("slug"));
+            }
+        }
+        return slugs;
+    }
+
+    @Test
+    void testJsonLinesOutlineEnterFiresOncePerOutline() throws Exception {
+        // Scenario Outline emits one OUTLINE_ENTER (with name/description/tags/
+        // numExamples) followed by N SCENARIO_ENTER/EXIT pairs, each carrying
+        // outlineSlug back to the parent so receivers can stitch.
+        Path feature = tempDir.resolve("outline.feature");
+        Files.writeString(feature, """
+            Feature: Outline JSONL Test
+
+            @smoke
+            Scenario Outline: lookup <key>
+            Lookup parameterised by key.
+            * def v = '<key>'
+            * match v == '<expected>'
+
+              Examples:
+                | key | expected |
+                | a   | a        |
+                | b   | b        |
+            """);
+
+        Path reportDir = tempDir.resolve("reports");
+        SuiteResult result = Runner.path(feature.toString())
+                .workingDir(tempDir)
+                .outputDir(reportDir)
+                .outputJsonLines(true)
+                .outputConsoleSummary(false)
+                .parallel(1);
+        assertTrue(result.isPassed());
+
+        Path jsonlPath = reportDir.resolve(Suite.KARATE_JSON_SUBFOLDER).resolve("karate-events.jsonl");
+        String[] lines = Files.readString(jsonlPath).trim().split("\n");
+
+        Map<String, Object> outlineEnter = null;
+        int outlineEnterCount = 0;
+        int outlineExampleScenarioCount = 0;
+        for (String line : lines) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> envelope = (Map<String, Object>) Json.of(line).value();
+            String type = (String) envelope.get("type");
+            @SuppressWarnings("unchecked")
+            Map<String, Object> data = (Map<String, Object>) envelope.get("data");
+            if ("OUTLINE_ENTER".equals(type)) {
+                outlineEnterCount++;
+                outlineEnter = data;
+            } else if ("SCENARIO_EXIT".equals(type) && Boolean.TRUE.equals(data.get("isOutlineExample"))) {
+                outlineExampleScenarioCount++;
+            }
+        }
+
+        assertEquals(1, outlineEnterCount, "OUTLINE_ENTER should fire exactly once per outline section");
+        assertNotNull(outlineEnter);
+        assertEquals("lookup <key>", outlineEnter.get("name"),
+                "outline name keeps placeholder tokens — template identity, not expanded");
+        assertEquals(2, outlineEnter.get("numExamples"));
+        assertNotNull(outlineEnter.get("slug"));
+        assertTrue(outlineEnter.get("description").toString().contains("Lookup parameterised by key"));
+
+        assertEquals(2, outlineExampleScenarioCount,
+                "each outline-example should fire its own SCENARIO_EXIT");
+    }
+
+    @Test
+    void testJsonLinesCalledFeatureCallDepth() throws Exception {
+        Path called = tempDir.resolve("called.feature");
+        Files.writeString(called, """
+            @ignore
+            Feature: Called Feature
+
+            Scenario: inner
+            * def result = 'called-result'
+            """);
+
+        Path caller = tempDir.resolve("caller.feature");
+        Files.writeString(caller, """
+            Feature: Caller Feature
+
+            Scenario: outer
+            * def response = call read('called.feature')
+            * match response.result == 'called-result'
+            """);
+
+        Path reportDir = tempDir.resolve("reports");
+
+        Runner.path(caller.toString())
+                .workingDir(tempDir)
+                .outputDir(reportDir)
+                .outputJsonLines(true)
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        Path jsonlPath = reportDir.resolve(Suite.KARATE_JSON_SUBFOLDER).resolve("karate-events.jsonl");
+        String[] lines = Files.readString(jsonlPath).trim().split("\n");
+
+        int topFeatureEnter = 0, calledFeatureEnter = 0;
+        int topFeatureExit = 0, calledFeatureExit = 0;
+        int topScenarioEnter = 0, calledScenarioEnter = 0;
+        int topScenarioExit = 0, calledScenarioExit = 0;
+        for (String line : lines) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> envelope = (Map<String, Object>) Json.of(line).value();
+            @SuppressWarnings("unchecked")
+            Map<String, Object> data = (Map<String, Object>) envelope.get("data");
+            String type = (String) envelope.get("type");
+            if (data == null || type == null || !type.startsWith("FEATURE_") && !type.startsWith("SCENARIO_")) {
+                continue;
+            }
+            assertTrue(data.containsKey("callDepth"),
+                    "callDepth field must be present on every feature/scenario event: " + type);
+            int depth = ((Number) data.get("callDepth")).intValue();
+            switch (type) {
+                case "FEATURE_ENTER" -> {
+                    if (depth == 0) topFeatureEnter++;
+                    else if (depth == 1) calledFeatureEnter++;
+                }
+                case "FEATURE_EXIT" -> {
+                    if (depth == 0) topFeatureExit++;
+                    else if (depth == 1) calledFeatureExit++;
+                }
+                case "SCENARIO_ENTER" -> {
+                    if (depth == 0) topScenarioEnter++;
+                    else if (depth == 1) calledScenarioEnter++;
+                }
+                case "SCENARIO_EXIT" -> {
+                    if (depth == 0) topScenarioExit++;
+                    else if (depth == 1) calledScenarioExit++;
+                }
+            }
+        }
+
+        assertEquals(1, topFeatureEnter, "exactly one top-level FEATURE_ENTER");
+        assertEquals(1, topFeatureExit, "exactly one top-level FEATURE_EXIT");
+        assertEquals(1, topScenarioEnter, "exactly one top-level SCENARIO_ENTER");
+        assertEquals(1, topScenarioExit, "exactly one top-level SCENARIO_EXIT");
+        assertEquals(1, calledFeatureEnter, "called feature must report callDepth=1 on FEATURE_ENTER");
+        assertEquals(1, calledFeatureExit, "called feature must report callDepth=1 on FEATURE_EXIT");
+        assertEquals(1, calledScenarioEnter, "called scenario must report callDepth=1 on SCENARIO_ENTER");
+        assertEquals(1, calledScenarioExit, "called scenario must report callDepth=1 on SCENARIO_EXIT");
+    }
+
+    @Test
+    void testJsonLinesNestedCallDepth() throws Exception {
+        Path inner = tempDir.resolve("inner.feature");
+        Files.writeString(inner, """
+            @ignore
+            Feature: Inner
+
+            Scenario: deepest
+            * def depth = 'inner'
+            """);
+
+        Path middle = tempDir.resolve("middle.feature");
+        Files.writeString(middle, """
+            @ignore
+            Feature: Middle
+
+            Scenario: middle
+            * call read('inner.feature')
+            """);
+
+        Path outer = tempDir.resolve("outer.feature");
+        Files.writeString(outer, """
+            Feature: Outer
+
+            Scenario: top
+            * call read('middle.feature')
+            """);
+
+        Path reportDir = tempDir.resolve("reports");
+
+        Runner.path(outer.toString())
+                .workingDir(tempDir)
+                .outputDir(reportDir)
+                .outputJsonLines(true)
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        Path jsonlPath = reportDir.resolve(Suite.KARATE_JSON_SUBFOLDER).resolve("karate-events.jsonl");
+        String[] lines = Files.readString(jsonlPath).trim().split("\n");
+
+        int[] featureEnterByDepth = new int[3];
+        int[] scenarioEnterByDepth = new int[3];
+        for (String line : lines) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> envelope = (Map<String, Object>) Json.of(line).value();
+            @SuppressWarnings("unchecked")
+            Map<String, Object> data = (Map<String, Object>) envelope.get("data");
+            String type = (String) envelope.get("type");
+            if (data == null || type == null) continue;
+            if (!"FEATURE_ENTER".equals(type) && !"SCENARIO_ENTER".equals(type)) continue;
+            int depth = ((Number) data.get("callDepth")).intValue();
+            assertTrue(depth >= 0 && depth < featureEnterByDepth.length, "unexpected depth: " + depth);
+            if ("FEATURE_ENTER".equals(type)) featureEnterByDepth[depth]++;
+            else scenarioEnterByDepth[depth]++;
+        }
+
+        assertEquals(1, featureEnterByDepth[0], "one outer feature");
+        assertEquals(1, featureEnterByDepth[1], "one middle feature");
+        assertEquals(1, featureEnterByDepth[2], "one inner feature");
+        assertEquals(1, scenarioEnterByDepth[0], "one outer scenario");
+        assertEquals(1, scenarioEnterByDepth[1], "one middle scenario");
+        assertEquals(1, scenarioEnterByDepth[2], "one inner scenario");
+    }
+
+    @Test
+    void testHtmlReportGeneratedWithJsonLines() throws Exception {
+        Path feature = tempDir.resolve("test.feature");
+        Files.writeString(feature, """
+            Feature: HTML With JSON Lines Test
+            Scenario: Test
+            * def a = 1
+            """);
+
+        Path reportDir = tempDir.resolve("reports");
+
+        Runner.path(feature.toString())
+                .workingDir(tempDir)
+                .outputDir(reportDir)
+                .outputHtmlReport(true)
+                .outputJsonLines(true)  // opt-in to JSON Lines alongside HTML
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        // Verify both JSON Lines and HTML reports exist when both are enabled
+        assertTrue(Files.exists(reportDir.resolve(Suite.KARATE_JSON_SUBFOLDER).resolve("karate-events.jsonl")));
+        assertTrue(Files.exists(reportDir.resolve("karate-summary.html")));
+        assertTrue(Files.exists(reportDir.resolve("index.html")));
+    }
+
+}

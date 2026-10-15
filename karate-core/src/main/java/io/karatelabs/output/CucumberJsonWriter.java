@@ -1,0 +1,479 @@
+/*
+ * The MIT License
+ *
+ * Copyright 2025 Karate Labs Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package io.karatelabs.output;
+
+import io.karatelabs.common.Json;
+import io.karatelabs.core.FeatureResult;
+import io.karatelabs.core.ScenarioResult;
+import io.karatelabs.core.StepResult;
+import io.karatelabs.gherkin.Feature;
+import io.karatelabs.gherkin.Scenario;
+import io.karatelabs.gherkin.Step;
+import io.karatelabs.gherkin.Tag;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Generates Cucumber JSON reports compatible with third-party tools (Allure, ReportPortal, etc.).
+ * <p>
+ * Output follows the standard Cucumber JSON schema:
+ * <pre>
+ * [
+ *   {
+ *     "id": "feature-id",
+ *     "uri": "path/to/feature.feature",
+ *     "name": "Feature Name",
+ *     "keyword": "Feature",
+ *     "elements": [
+ *       {
+ *         "start_timestamp": "2026-09-16T14:52:02.919Z",
+ *         "id": "feature-id;scenario-id",
+ *         "name": "Scenario Name",
+ *         "keyword": "Scenario",
+ *         "type": "scenario",
+ *         "steps": [
+ *           {
+ *             "keyword": "Given ",
+ *             "name": "step text",
+ *             "result": { "status": "passed", "duration": 12345678 }
+ *           }
+ *         ]
+ *       }
+ *     ]
+ *   }
+ * ]
+ * </pre>
+ */
+public final class CucumberJsonWriter {
+
+    private static final Logger logger = LoggerFactory.getLogger("karate.runtime");
+
+    // Always three fraction digits, unlike ISO_INSTANT which drops a zero millisecond part
+    private static final DateTimeFormatter START_TIMESTAMP_FORMAT = DateTimeFormatter
+            .ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'")
+            .withZone(ZoneOffset.UTC);
+
+    private CucumberJsonWriter() {
+    }
+
+    /**
+     * Write Cucumber JSON report for a single feature.
+     * <p>
+     * Output file is named {@code {packageQualifiedName}.json} and contains
+     * an array with a single feature object (Cucumber JSON format).
+     *
+     * @param result    the feature result to convert
+     * @param outputDir the directory to write the report
+     */
+    /**
+     * Serialize a feature result to its JSON text.
+     *
+     * <p>Separated from the file write so a listener can do this <em>synchronously</em>,
+     * while the result is still whole. The suite releases nested {@code karate.call()}
+     * trees once a feature's listeners have returned, and this output flattens called
+     * features' steps into its own — so serializing on a background thread would silently
+     * drop them.
+     */
+    public static String serializeFeature(FeatureResult result) {
+        return featureToJson(result);
+    }
+
+    /** File name this feature's output is written under. */
+    public static String fileNameFor(FeatureResult result) {
+        return result.getFeature().getResource().getPackageQualifiedName() + ".json";
+    }
+
+    /** Write pre-serialized content. Safe after the source result has been released. */
+    public static void writeSerialized(String fileName, String content, Path outputDir) {
+        try {
+            if (!Files.exists(outputDir)) {
+                Files.createDirectories(outputDir);
+            }
+            Files.writeString(outputDir.resolve(fileName), content);
+        } catch (Exception e) {
+            logger.warn("Failed to write json for {}: {}", fileName, e.getMessage());
+        }
+    }
+
+    public static void writeFeature(FeatureResult result, Path outputDir) {
+        try {
+            if (!Files.exists(outputDir)) {
+                Files.createDirectories(outputDir);
+            }
+
+            String fileName = result.getFeature().getResource().getPackageQualifiedName() + ".json";
+            Path jsonPath = outputDir.resolve(fileName);
+            String json = featureToJson(result);
+            Files.writeString(jsonPath, json);
+            logger.debug("Cucumber JSON written: {}", jsonPath);
+        } catch (Exception e) {
+            logger.warn("Failed to write Cucumber JSON for {}: {}", result.getDisplayName(), e.getMessage());
+        }
+    }
+
+    /**
+     * Convert a single feature result to Cucumber JSON string.
+     * <p>
+     * Returns a JSON array containing a single feature object.
+     *
+     * @param result the feature result
+     * @return JSON string
+     */
+    public static String featureToJson(FeatureResult result) {
+        List<Map<String, Object>> features = Collections.singletonList(featureToMap(result));
+        return Json.of(features).toStringPretty();
+    }
+
+    private static Map<String, Object> featureToMap(FeatureResult fr) {
+        Map<String, Object> map = new LinkedHashMap<>();
+        Feature feature = fr.getFeature();
+
+        // Feature ID (uri-based, lowercase, hyphens)
+        String id = toId(feature.getName());
+        String uri = feature.getResource().getRelativePath();
+
+        map.put("id", id);
+        map.put("uri", uri);
+        map.put("name", feature.getName() != null ? feature.getName() : "");
+        map.put("description", feature.getDescription() != null ? feature.getDescription() : "");
+        map.put("keyword", "Feature");
+        map.put("line", feature.getLine());
+
+        // Feature tags
+        List<Tag> tags = feature.getTags();
+        if (tags != null && !tags.isEmpty()) {
+            map.put("tags", tagsToList(tags, feature.getLine()));
+        }
+
+        // Elements (scenarios)
+        List<Map<String, Object>> elements = new ArrayList<>();
+        for (ScenarioResult sr : fr.getScenarioResults()) {
+            elements.add(scenarioToMap(sr, id));
+        }
+        map.put("elements", elements);
+
+        return map;
+    }
+
+    private static Map<String, Object> scenarioToMap(ScenarioResult sr, String featureId) {
+        Map<String, Object> map = new LinkedHashMap<>();
+        Scenario scenario = sr.getScenario();
+
+        String scenarioId = toId(scenario.getName());
+        String fullId = featureId + ";" + scenarioId;
+
+        // Cucumber JSON carries the scenario start as an ISO-8601 UTC instant; report
+        // consumers (cucumber-reporting, Allure, ReportPortal) derive suite timing from it,
+        // and without it they fall back to "now" and mis-compute the run duration.
+        long startTime = sr.getStartTime();
+        if (startTime > 0) {
+            map.put("start_timestamp", START_TIMESTAMP_FORMAT.format(Instant.ofEpochMilli(startTime)));
+        }
+        map.put("id", fullId);
+        map.put("name", scenario.getName() != null ? scenario.getName() : "");
+        map.put("description", scenario.getDescription() != null ? scenario.getDescription() : "");
+        map.put("keyword", scenario.isOutlineExample() ? "Scenario Outline" : "Scenario");
+        map.put("line", scenario.getLine());
+        map.put("type", "scenario");
+
+        // Scenario tags
+        List<Tag> tags = scenario.getTags();
+        if (tags != null && !tags.isEmpty()) {
+            map.put("tags", tagsToList(tags, scenario.getLine()));
+        }
+
+        // Steps — @report=false: emit empty steps list so step text and logs don't
+        // leak into the JSON artifact. Failure status is preserved on each scenario
+        // entry via the steps' aggregate; we add a single redacted-failure marker.
+        List<Map<String, Object>> steps = new ArrayList<>();
+        if (sr.isReportDisabled()) {
+            if (sr.isFailed()) {
+                Map<String, Object> redacted = new LinkedHashMap<>();
+                Map<String, Object> result = new LinkedHashMap<>();
+                result.put("status", "failed");
+                result.put("error_message", ScenarioResult.SUPPRESSED_FAILURE_MESSAGE);
+                redacted.put("keyword", "* ");
+                redacted.put("name", ScenarioResult.SUPPRESSED_FAILURE_MESSAGE);
+                redacted.put("line", scenario.getLine());
+                redacted.put("result", result);
+                steps.add(redacted);
+            }
+        } else {
+            for (StepResult stepResult : sr.getStepResults()) {
+                steps.add(stepToMap(stepResult));
+                // Cucumber JSON has no native "nested call" concept, so flatten any
+                // called sub-feature's steps into this scenario's steps[] using v1's
+                // `>`-prefixed keyword convention. This is what cucumber-reporting and
+                // similar consumers already understand (a v1 power user noticed sub-
+                // feature steps missing in v2 — issue surfaced in maintainer feedback).
+                appendCallResultSteps(steps, stepResult, 1);
+            }
+        }
+        map.put("steps", steps);
+
+        return map;
+    }
+
+    /**
+     * Recursively inline a step's called sub-features as additional flat entries
+     * in the parent scenario's steps[]. Mirrors v1's ScenarioResult.recurse():
+     * <ul>
+     *   <li>For each FeatureResult in {@code parent.getCallResults()}, emit a synthetic
+     *       header row with keyword {@code "> "} (or {@code ">> "} at depth 2, etc.)
+     *       and name = the called feature's display path (+ {@code [loopIdx]} if looped).</li>
+     *   <li>Then emit each step from the called feature's scenarios, with the original
+     *       keyword prefixed by {@code "> "} × depth (so {@code "Given "} becomes
+     *       {@code "> Given "} at depth 1).</li>
+     *   <li>Recurse for steps that themselves had nested call results.</li>
+     * </ul>
+     */
+    private static void appendCallResultSteps(List<Map<String, Object>> steps, StepResult parent, int depth) {
+        if (!parent.hasCallResults()) {
+            return;
+        }
+        String marker = ">".repeat(depth) + " "; // ">" × depth + space
+        int parentLine = parent.getStep() != null ? parent.getStep().getLine() : 0;
+        for (FeatureResult fr : parent.getCallResults()) {
+            // Synthetic header for the called feature
+            Map<String, Object> header = new LinkedHashMap<>();
+            header.put("keyword", marker);
+            header.put("name", callNameForReport(fr));
+            header.put("line", parentLine);
+            Map<String, Object> headerResult = new LinkedHashMap<>();
+            headerResult.put("status", "passed");
+            headerResult.put("duration", 0L);
+            header.put("result", headerResult);
+            steps.add(header);
+
+            // Steps of every scenario in the called feature
+            for (ScenarioResult childScenario : fr.getScenarioResults()) {
+                for (StepResult childStep : childScenario.getStepResults()) {
+                    Map<String, Object> childMap = stepToMap(childStep);
+                    Object originalKeyword = childMap.get("keyword");
+                    childMap.put("keyword", marker + (originalKeyword == null ? "" : originalKeyword));
+                    steps.add(childMap);
+                    appendCallResultSteps(steps, childStep, depth + 1);
+                }
+            }
+        }
+    }
+
+    /**
+     * Build the displayName used in the synthetic call header.
+     * v1 parity: prefix with {@code "[loopIndex] "} when the call ran inside a loop.
+     */
+    private static String callNameForReport(FeatureResult fr) {
+        String name = fr.getDisplayName();
+        int loopIndex = fr.getLoopIndex();
+        return loopIndex < 0 ? name : "[" + loopIndex + "] " + name;
+    }
+
+    private static Map<String, Object> stepToMap(StepResult sr) {
+        Map<String, Object> map = new LinkedHashMap<>();
+        Step step = sr.getStep();
+
+        // Synthetic step results (lifecycle hooks, @fail tag, scenario init failures)
+        // have a null Step — emit a "* <hookName-or-message>" placeholder so the writer
+        // doesn't NPE and so the artifact still records what happened.
+        if (step == null) {
+            map.put("keyword", "* ");
+            String name;
+            if (sr.isHook()) {
+                name = sr.getHookName();
+            } else if (sr.getSyntheticText() != null) {
+                // A synthetic step's display text is kept separate from its log — use it as the step
+                // name rather than dumping the raw log (which stays available as the step's output).
+                name = sr.getSyntheticText();
+            } else if (sr.getLog() != null && !sr.getLog().isEmpty()) {
+                name = Console.stripAnsi(sr.getLog()).trim();
+            } else {
+                name = "";
+            }
+            map.put("name", name);
+            map.put("line", 0);
+        } else {
+            // Cucumber keyword format includes trailing space (e.g., "Given ")
+            map.put("keyword", mapToCucumberKeyword(step.getPrefix()));
+            // Name includes both Karate keyword and text (e.g., "def a = 1" not just "a = 1")
+            map.put("name", buildStepName(step));
+            map.put("line", step.getLine());
+
+            // Doc string
+            if (step.getDocString() != null) {
+                Map<String, Object> docString = new LinkedHashMap<>();
+                docString.put("value", step.getDocString());
+                docString.put("content_type", "");
+                docString.put("line", step.getLine() + 1);
+                map.put("doc_string", docString);
+            }
+
+            // Data table
+            if (step.getTable() != null) {
+                map.put("rows", tableToRows(step.getTable(), step.getLine()));
+            }
+        }
+
+        // Result
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("status", mapStatus(sr.getStatus()));
+        result.put("duration", sr.getDurationNanos());
+
+        if (sr.isFailed() && sr.getError() != null) {
+            result.put("error_message", sr.getError().getMessage());
+        }
+
+        map.put("result", result);
+
+        // Embeddings (from logs and embeds)
+        List<Map<String, Object>> embeddings = new ArrayList<>();
+
+        // Add log as text/plain embedding if present (strip ANSI escape codes — consumers choke on them)
+        if (sr.getLog() != null && !sr.getLog().isEmpty()) {
+            Map<String, Object> logEmbed = new LinkedHashMap<>();
+            logEmbed.put("mime_type", "text/plain");
+            logEmbed.put("data", Base64.getEncoder().encodeToString(Console.stripAnsi(sr.getLog()).getBytes()));
+            embeddings.add(logEmbed);
+        }
+
+        // Add actual embeds. Cucumber JSON is an external spec: one {mime_type, data}
+        // entry per inline asset. url-only parts (ext-written) have no inline bytes to
+        // embed and are skipped — Cucumber JSON can't reference an external file.
+        if (sr.getEmbeds() != null) {
+            for (StepResult.Embed embed : sr.getEmbeds()) {
+                for (StepResult.Part part : embed.getParts()) {
+                    if (part.getData() == null) {
+                        continue;
+                    }
+                    Map<String, Object> embedMap = new LinkedHashMap<>();
+                    embedMap.put("mime_type", part.getMime());
+                    embedMap.put("data", Base64.getEncoder().encodeToString(part.getData()));
+                    if (embed.getName() != null) {
+                        embedMap.put("name", embed.getName());
+                    }
+                    embeddings.add(embedMap);
+                }
+            }
+        }
+
+        if (!embeddings.isEmpty()) {
+            map.put("embeddings", embeddings);
+        }
+
+        return map;
+    }
+
+    private static List<Map<String, Object>> tagsToList(List<Tag> tags, int line) {
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (Tag tag : tags) {
+            Map<String, Object> tagMap = new LinkedHashMap<>();
+            tagMap.put("name", tag.toString());
+            tagMap.put("line", line);
+            result.add(tagMap);
+        }
+        return result;
+    }
+
+    private static List<Map<String, Object>> tableToRows(io.karatelabs.gherkin.Table table, int startLine) {
+        List<Map<String, Object>> rows = new ArrayList<>();
+        List<List<String>> data = table.getRows();
+        int line = startLine + 1;
+
+        for (List<String> row : data) {
+            Map<String, Object> rowMap = new LinkedHashMap<>();
+            rowMap.put("cells", row);
+            rowMap.put("line", line++);
+            rows.add(rowMap);
+        }
+        return rows;
+    }
+
+    /**
+     * Build the step name including the Karate keyword and text.
+     * E.g., "def a = 1" for a step like "* def a = 1".
+     */
+    private static String buildStepName(Step step) {
+        String keyword = step.getKeyword();
+        String text = step.getText();
+        if (keyword != null && !keyword.isEmpty()) {
+            return keyword + " " + (text != null ? text : "");
+        }
+        return text != null ? text : "";
+    }
+
+    /**
+     * Map Karate step prefix to Cucumber keyword format (with trailing space).
+     * Cucumber expects keywords like "Given ", "When ", "Then ", "And ", "But ", "* ".
+     */
+    private static String mapToCucumberKeyword(String prefix) {
+        if (prefix == null) {
+            return "* ";
+        }
+        // Karate uses "*" prefix but stores keywords like "def", "match", etc.
+        // For Cucumber compatibility, we map based on prefix
+        return switch (prefix) {
+            case "Given" -> "Given ";
+            case "When" -> "When ";
+            case "Then" -> "Then ";
+            case "And" -> "And ";
+            case "But" -> "But ";
+            default -> "* ";
+        };
+    }
+
+    /**
+     * Map Karate status to Cucumber status string.
+     */
+    private static String mapStatus(StepResult.Status status) {
+        return switch (status) {
+            case PASSED -> "passed";
+            case FAILED -> "failed";
+            case SKIPPED -> "skipped";
+        };
+    }
+
+    /**
+     * Convert a name to a Cucumber-style ID (lowercase, spaces to hyphens).
+     */
+    private static String toId(String name) {
+        if (name == null || name.isEmpty()) {
+            return "unknown";
+        }
+        return name.toLowerCase()
+                .replaceAll("[^a-z0-9]+", "-")
+                .replaceAll("^-|-$", "");
+    }
+
+}

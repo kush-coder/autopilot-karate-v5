@@ -1,0 +1,1260 @@
+/*
+ * The MIT License
+ *
+ * Copyright 2025 Karate Labs Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package io.karatelabs.core;
+
+import io.karatelabs.test.LogSilencer;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+import static io.karatelabs.core.TestUtils.*;
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Tests for karate-config.js loading.
+ */
+class ScenarioConfigTest {
+
+    @TempDir
+    Path tempDir;
+
+    @Test
+    void testConfigLoadsVariables() throws Exception {
+        // Create a karate-config.js
+        Path configFile = tempDir.resolve("karate-config.js");
+        Files.writeString(configFile, """
+            function fn() {
+              return {
+                baseUrl: 'http://localhost:8080',
+                timeout: 5000
+              };
+            }
+            fn();
+            """);
+
+        // Create a simple feature file
+        Path featureFile = tempDir.resolve("test.feature");
+        Files.writeString(featureFile, """
+            Feature: Config Test
+            Scenario: Use config variables
+            * def url = baseUrl
+            * match url == 'http://localhost:8080'
+            * match timeout == 5000
+            """);
+
+        // Run with config
+        SuiteResult result = Runner.builder()
+                .path(featureFile.toString())
+                .workingDir(tempDir)
+                .configDir(configFile.toString())
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                .backupOutputDir(false)
+                .parallel(1);
+
+        assertEquals(1, result.getScenarioCount());
+        assertEquals(1, result.getScenarioPassedCount());
+        assertEquals(0, result.getScenarioFailedCount());
+    }
+
+    @Test
+    void testAnonymousFunctionConfig() throws Exception {
+        Path featureFile = tempDir.resolve("test.feature");
+        Files.writeString(featureFile, """
+            Feature: Config Test
+            Scenario: Use config variables
+            * match baseUrl == 'http://localhost:8080'
+            """);
+        for (String config : new String[]{
+                "function() { return { baseUrl: 'http://localhost:8080' } }",
+                "// config\nfunction(){ return { baseUrl: 'http://localhost:8080' } }\n"}) {
+            Files.writeString(tempDir.resolve("karate-config.js"), config);
+            SuiteResult result = runTestSuite(tempDir, featureFile.toString());
+            assertTrue(result.isPassed(), config + ": " + result.getErrors());
+        }
+    }
+
+    @Test
+    void testAnonymousFunctionConfigAfterPreambleStatementFails() throws Exception {
+        Path featureFile = tempDir.resolve("test.feature");
+        Files.writeString(featureFile, """
+            Feature: Config Test
+            Scenario: Use config variables
+            * match baseUrl == 'http://localhost:8080'
+            """);
+        // the leading-function convention applies only at token position 0
+        Files.writeString(tempDir.resolve("karate-config.js"),
+                "var base = 'http://localhost:8080';\nfunction() { return { baseUrl: base } }\n");
+        SuiteResult result = runTestSuite(tempDir, featureFile.toString());
+        assertFalse(result.isPassed());
+        assertTrue(String.join("\n", result.getErrors()).contains("a function declaration requires a name"),
+                String.join("\n", result.getErrors()));
+    }
+
+    @Test
+    void testEnvSpecificConfig() throws Exception {
+        // Create base config
+        Path configFile = tempDir.resolve("karate-config.js");
+        Files.writeString(configFile, """
+            function fn() {
+              return {
+                baseUrl: 'http://localhost:8080',
+                env: karate.env
+              };
+            }
+            fn();
+            """);
+
+        // Create env-specific config
+        Path devConfigFile = tempDir.resolve("karate-config-dev.js");
+        Files.writeString(devConfigFile, """
+            function fn() {
+              return {
+                baseUrl: 'http://dev.example.com'
+              };
+            }
+            fn();
+            """);
+
+        // Create a feature file
+        Path featureFile = tempDir.resolve("test.feature");
+        Files.writeString(featureFile, """
+            Feature: Env Config Test
+            Scenario: Check env config
+            * match baseUrl == 'http://dev.example.com'
+            * match env == 'dev'
+            """);
+
+        // Run with env=dev
+        SuiteResult result = Runner.builder()
+                .path(featureFile.toString())
+                .workingDir(tempDir)
+                .configDir(configFile.toString())
+                .karateEnv("dev")
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                .backupOutputDir(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed(), "Suite should pass");
+        assertEquals(1, result.getScenarioPassedCount());
+    }
+
+    @Test
+    void testMissingConfigIsIgnored() throws Exception {
+        // Create a feature file that doesn't need config
+        Path featureFile = tempDir.resolve("test.feature");
+        Files.writeString(featureFile, """
+            Feature: No Config Test
+            Scenario: Simple test
+            * def a = 1 + 2
+            * match a == 3
+            """);
+
+        // Run without config file (missing config should be ignored)
+        SuiteResult result = Runner.builder()
+                .path(featureFile.toString())
+                .workingDir(tempDir)
+                .configDir(tempDir.resolve("nonexistent-config.js").toString())
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                .backupOutputDir(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed());
+    }
+
+    @Test
+    void testConfigVariablesAvailableInFeature() throws Exception {
+        // Create config that returns object
+        Path configFile = tempDir.resolve("karate-config.js");
+        Files.writeString(configFile, """
+            ({
+              appName: 'TestApp',
+              version: '1.0'
+            })
+            """);
+
+        // Create feature
+        Path featureFile = tempDir.resolve("test.feature");
+        Files.writeString(featureFile, """
+            Feature: Config Variables
+            Scenario: Access config vars
+            * match appName == 'TestApp'
+            * match version == '1.0'
+            """);
+
+        SuiteResult result = Runner.builder()
+                .path(featureFile.toString())
+                .workingDir(tempDir)
+                .configDir(configFile.toString())
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                .backupOutputDir(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed());
+    }
+
+    // ========== Working Directory Fallback Tests (V2 Enhancement) ==========
+
+    @Test
+    void testConfigFromWorkingDirectory() throws Exception {
+        // Create karate-config.js in the working directory (tempDir)
+        // This simulates a user running Karate from a directory without classpath setup
+        Path configFile = tempDir.resolve("karate-config.js");
+        Files.writeString(configFile, """
+            function fn() {
+              return {
+                fromWorkingDir: true,
+                baseUrl: 'http://workingdir.example.com'
+              };
+            }
+            """);
+
+        // Create a feature file
+        Path featureFile = tempDir.resolve("test.feature");
+        Files.writeString(featureFile, """
+            Feature: Working Dir Config Test
+            Scenario: Config loaded from working directory
+            * match fromWorkingDir == true
+            * match baseUrl == 'http://workingdir.example.com'
+            """);
+
+        // Run WITHOUT specifying configPath - should use default 'classpath:karate-config.js'
+        // which won't be found on classpath, but will be found in working directory
+        SuiteResult result = runTestSuite(tempDir, featureFile.toString());
+
+        assertTrue(result.isPassed(), "Config should be loaded from working directory");
+    }
+
+    @Test
+    void testCallFeatureFromConfigV1Style() throws Exception {
+        // This tests the V1 karate-config.js pattern where the function is defined
+        // but NOT called at the end - V2 should detect and invoke it automatically
+        Path utilsFeature = tempDir.resolve("utils.feature");
+        Files.writeString(utilsFeature, """
+            @ignore
+            Feature:
+            Scenario:
+            * def hello = function(){ return { helloVar: 'hello world' } }
+            """);
+
+        // V1-style config: function fn() defined but not called
+        Path configFile = tempDir.resolve("karate-config.js");
+        Files.writeString(configFile, """
+            function fn() {
+              var config = {
+                configUtils: karate.call('utils.feature')
+              };
+              return config;
+            }
+            """);
+
+        Path featureFile = tempDir.resolve("test.feature");
+        Files.writeString(featureFile, """
+            Feature: V1-style Config Test
+            Scenario: Call function from config-loaded feature
+            * call configUtils.hello
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, featureFile.toString());
+
+        assertTrue(result.isPassed(), "V1-style config with karate.call should work");
+    }
+
+    @Test
+    void testCallFeatureFromConfig() throws Exception {
+        // Create a reusable feature that defines functions
+        Path utilsFeature = tempDir.resolve("utils.feature");
+        Files.writeString(utilsFeature, """
+            @ignore
+            Feature:
+            Scenario:
+            * def hello = function(){ return { helloVar: 'hello world' } }
+            """);
+
+        // Create karate-config.js that calls the utils feature
+        Path configFile = tempDir.resolve("karate-config.js");
+        Files.writeString(configFile, """
+            function fn() {
+              return {
+                configUtils: karate.call('utils.feature')
+              };
+            }
+            """);
+
+        // Create a feature that uses the config-loaded utils
+        Path featureFile = tempDir.resolve("test.feature");
+        Files.writeString(featureFile, """
+            Feature: Config Utils Test
+            Scenario: Call function from config-loaded feature
+            * call configUtils.hello
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, featureFile.toString());
+
+        assertTrue(result.isPassed(), "Config with karate.call should work");
+    }
+
+    @Test
+    void testScenarioPropertyFromConfig() throws Exception {
+        // V1 pattern: access karate.scenario in config
+        Path configFile = tempDir.resolve("karate-config.js");
+        Files.writeString(configFile, """
+            function fn() {
+              var config = {};
+              config.data = karate.scenario;
+              return config;
+            }
+            """);
+
+        Path featureFile = tempDir.resolve("test.feature");
+        Files.writeString(featureFile, """
+            Feature: Scenario Property Test
+            Scenario: my test scenario
+            * match karate.scenario.name == 'my test scenario'
+            * match data.sectionIndex == 0
+            * match data.exampleIndex == -1
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, featureFile.toString());
+
+        assertTrue(result.isPassed(), "karate.scenario property should work in config");
+    }
+
+    @Test
+    void testCallonceFromConfig() throws Exception {
+        // V1 pattern: karate.callonce() in config to load utils once
+        Path utilsFeature = tempDir.resolve("utils.feature");
+        Files.writeString(utilsFeature, """
+            @ignore
+            Feature:
+            Scenario:
+            * def hello = function(name){ return 'hello ' + name }
+            """);
+
+        // Config that uses karate.callonce to load utils
+        Path configFile = tempDir.resolve("karate-config.js");
+        Files.writeString(configFile, """
+            function fn() {
+              var config = karate.callonce('utils.feature');
+              return config;
+            }
+            """);
+
+        Path featureFile = tempDir.resolve("test.feature");
+        Files.writeString(featureFile, """
+            Feature: Callonce Config Test
+            Scenario: Use function from callonce-loaded feature
+            * def result = hello('world')
+            * match result == 'hello world'
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, featureFile.toString());
+
+        assertTrue(result.isPassed(), "karate.callonce() in config should work");
+    }
+
+    @Test
+    void testEnvConfigFromWorkingDirectory() throws Exception {
+        // Create base karate-config.js in working directory
+        Path configFile = tempDir.resolve("karate-config.js");
+        Files.writeString(configFile, """
+            function fn() {
+              return {
+                env: karate.env,
+                baseUrl: 'http://default.example.com'
+              };
+            }
+            """);
+
+        // Create env-specific config in working directory
+        Path devConfig = tempDir.resolve("karate-config-staging.js");
+        Files.writeString(devConfig, """
+            function fn() {
+              return {
+                baseUrl: 'http://staging.example.com'
+              };
+            }
+            """);
+
+        // Create a feature file
+        Path featureFile = tempDir.resolve("test.feature");
+        Files.writeString(featureFile, """
+            Feature: Env Config from Working Dir
+            Scenario: Both configs loaded from working directory
+            * match env == 'staging'
+            * match baseUrl == 'http://staging.example.com'
+            """);
+
+        // Run with env=staging, no explicit configPath
+        SuiteResult result = Runner.builder()
+                .path(featureFile.toString())
+                .workingDir(tempDir)
+                .karateEnv("staging")
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                .backupOutputDir(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed(), "Base and env configs should load from working directory");
+    }
+
+    // ========== karate-base.js Tests ==========
+
+    @Test
+    void testKarateBaseJsDefinesSharedFunctions() throws Exception {
+        // Create karate-base.js that defines a shared function
+        Path baseFile = tempDir.resolve("karate-base.js");
+        Files.writeString(baseFile, """
+            function fn() {
+              return {
+                functionFromKarateBase: function() { return 'fromKarateBase' }
+              };
+            }
+            """);
+
+        // Create karate-config.js that uses the function from karate-base.js
+        Path configFile = tempDir.resolve("karate-config.js");
+        Files.writeString(configFile, """
+            function fn() {
+              return {
+                variableFromKarateBase: functionFromKarateBase()
+              };
+            }
+            """);
+
+        // Create a feature file that verifies the variable
+        Path featureFile = tempDir.resolve("test.feature");
+        Files.writeString(featureFile, """
+            Feature: karate-base.js Test
+            Scenario: Variable from karate-base.js function
+            * match variableFromKarateBase == 'fromKarateBase'
+            """);
+
+        // Run with configs from working directory
+        SuiteResult result = runTestSuite(tempDir, featureFile.toString());
+
+        assertTrue(result.isPassed(), "karate-base.js function should be available to karate-config.js");
+    }
+
+    @Test
+    void testKarateBaseJsWithEnvConfig() throws Exception {
+        // Create karate-base.js with shared utility function
+        Path baseFile = tempDir.resolve("karate-base.js");
+        Files.writeString(baseFile, """
+            function fn() {
+              return {
+                getEnvUrl: function(env) {
+                  if (env == 'dev') return 'http://dev.example.com';
+                  if (env == 'staging') return 'http://staging.example.com';
+                  return 'http://localhost:8080';
+                }
+              };
+            }
+            """);
+
+        // Create karate-config.js that uses the shared function
+        Path configFile = tempDir.resolve("karate-config.js");
+        Files.writeString(configFile, """
+            function fn() {
+              return {
+                baseUrl: getEnvUrl(karate.env)
+              };
+            }
+            """);
+
+        // Create a feature file
+        Path featureFile = tempDir.resolve("test.feature");
+        Files.writeString(featureFile, """
+            Feature: karate-base.js with Env
+            Scenario: Shared function works with env
+            * match baseUrl == 'http://dev.example.com'
+            """);
+
+        // Run with env=dev
+        SuiteResult result = Runner.builder()
+                .path(featureFile.toString())
+                .workingDir(tempDir)
+                .karateEnv("dev")
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                .backupOutputDir(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed(), "karate-base.js functions should work with env config");
+    }
+
+    // ========== karate.configure() from JavaScript Tests ==========
+
+    @Test
+    void testConfigureFromJs() throws Exception {
+        // Test that karate.configure() can be called from JavaScript (eval block)
+        // This is the V1 pattern for programmatic configuration
+        Path featureFile = tempDir.resolve("test.feature");
+        Files.writeString(featureFile, """
+            Feature: Configure from JS
+            Scenario: Call karate.configure from eval block
+            * eval
+            \"\"\"
+            var config = {
+              proxy: { uri: 'http://my-proxy.com:3128', nonProxyHosts: ['my-api.com'] }
+            };
+            karate.configure('proxy', config.proxy);
+            \"\"\"
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, featureFile.toString());
+
+        assertTrue(result.isPassed(), "karate.configure() should work from JavaScript eval block");
+    }
+
+    // ========== Debug Support Tests ==========
+
+    @Test
+    void testConfigResourcePathForDebugging() throws Exception {
+        // Test that config JS resources preserve their path for debugging
+        Path configFile = tempDir.resolve("karate-config.js");
+        Files.writeString(configFile, """
+            function fn() {
+              return { foo: 'bar' };
+            }
+            """);
+
+        Path featureFile = tempDir.resolve("test.feature");
+        Files.writeString(featureFile, """
+            Feature: Debug Path Test
+            Scenario: Simple test
+            * match foo == 'bar'
+            """);
+
+        // Collect debug points
+        var debugPoints = new java.util.ArrayList<String>();
+
+        // Create a mock interceptor to capture debug point source paths
+        io.karatelabs.js.RunInterceptor<Object> interceptor = new io.karatelabs.js.RunInterceptor<>() {
+            @Override
+            public Action beforeExecute(Object point) {
+                return Action.PROCEED;
+            }
+
+            @Override
+            public void afterExecute(Object point, Object result, Throwable error) {
+            }
+
+            @Override
+            public Action waitForResume() {
+                return Action.PROCEED;
+            }
+        };
+
+        io.karatelabs.js.DebugPointFactory<Object> factory = (type, line, sourcePath, source, jsContext) -> {
+            debugPoints.add("type=" + type + ", line=" + line + ", sourcePath=" + sourcePath);
+            return new Object(); // dummy point
+        };
+
+        // Run with debug support
+        SuiteResult result = Runner.builder()
+                .path(featureFile.toString())
+                .workingDir(tempDir)
+                .debugSupport(interceptor, factory)
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                .backupOutputDir(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed());
+
+        // Verify that at least one debug point has the config file path
+        boolean foundConfigPath = debugPoints.stream()
+                .anyMatch(dp -> dp.contains("karate-config.js"));
+        assertTrue(foundConfigPath, "Debug points should include karate-config.js source path. Points: " + debugPoints);
+    }
+
+    // ========== toLocaleDateString in config ==========
+
+    @Test
+    void testToLocaleDateStringInConfig() throws Exception {
+        // This is the exact pattern that was failing silently
+        Path configFile = tempDir.resolve("karate-config.js");
+        Files.writeString(configFile, """
+            function fn() {
+              var config = {
+                simpleStuff: 'Hello World'
+              };
+              var t = new Date();
+              var tx = t.toLocaleDateString('en-NZ');
+              config.dateString = tx;
+              return config;
+            }
+            """);
+
+        Path featureFile = tempDir.resolve("test.feature");
+        Files.writeString(featureFile, """
+            Feature: config with toLocaleDateString
+            Scenario: Config with toLocaleDateString
+            * match simpleStuff == 'Hello World'
+            * match dateString != null
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, featureFile.toString());
+
+        assertTrue(result.isPassed(), "Config with toLocaleDateString should not fail silently");
+        assertEquals(1, result.getScenarioPassedCount());
+    }
+
+    // ========== abortSuiteOnFailure Tests ==========
+
+    @Test
+    void testAbortSuiteOnFailure() throws Exception {
+        // Feature 1: fails and has abortSuiteOnFailure = true
+        Path feature1 = tempDir.resolve("fail.feature");
+        Files.writeString(feature1, """
+            Feature: Failing Feature
+            Scenario: This will fail
+            * configure abortSuiteOnFailure = true
+            * match 1 == 2
+            """);
+
+        // Feature 2: should be skipped due to abort
+        Path feature2 = tempDir.resolve("pass.feature");
+        Files.writeString(feature2, """
+            Feature: Passing Feature
+            Scenario: This should be skipped
+            * match 1 == 1
+            """);
+
+        SuiteResult result = Runner.builder()
+                .path(feature1.toString(), feature2.toString())
+                .workingDir(tempDir)
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                .backupOutputDir(false)
+                .parallel(1);
+
+        assertFalse(result.isPassed());
+        assertEquals(1, result.getScenarioFailedCount());
+        // The second scenario should have been skipped (not run)
+        assertEquals(1, result.getScenarioCount());
+    }
+
+    @Test
+    void testAbortSuiteOnFailureFromConfig() throws Exception {
+        // Set abortSuiteOnFailure in karate-config.js
+        Path configFile = tempDir.resolve("karate-config.js");
+        Files.writeString(configFile, """
+            function fn() {
+              karate.configure('abortSuiteOnFailure', true);
+              return {};
+            }
+            """);
+
+        // Feature 1: fails
+        Path feature1 = tempDir.resolve("fail.feature");
+        Files.writeString(feature1, """
+            Feature: Failing Feature
+            Scenario: This will fail
+            * match 1 == 2
+            """);
+
+        // Feature 2: should be skipped due to abort
+        Path feature2 = tempDir.resolve("pass.feature");
+        Files.writeString(feature2, """
+            Feature: Passing Feature
+            Scenario: This should be skipped
+            * match 1 == 1
+            """);
+
+        SuiteResult result = Runner.builder()
+                .path(feature1.toString(), feature2.toString())
+                .workingDir(tempDir)
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                .backupOutputDir(false)
+                .parallel(1);
+
+        assertFalse(result.isPassed());
+        assertEquals(1, result.getScenarioFailedCount());
+        assertEquals(1, result.getScenarioCount());
+    }
+
+    @Test
+    void testAbortSuiteOnFailureParallel() throws Exception {
+        // Config sets abortSuiteOnFailure
+        Path configFile = tempDir.resolve("karate-config.js");
+        Files.writeString(configFile, """
+            function fn() {
+              karate.configure('abortSuiteOnFailure', true);
+              return {};
+            }
+            """);
+
+        // Feature that fails immediately
+        Path feature1 = tempDir.resolve("fail-fast.feature");
+        Files.writeString(feature1, """
+            Feature: Fail Fast
+            Scenario: Instant failure
+            * match 1 == 2
+            """);
+
+        // Feature with many steps - should be interrupted between steps
+        Path feature2 = tempDir.resolve("long-running.feature");
+        Files.writeString(feature2, """
+            Feature: Long Running
+            Scenario: Many steps
+            * def a = 1
+            * def b = 2
+            * def c = 3
+            * def d = 4
+            * def e = 5
+            * def f = 6
+            * def g = 7
+            * def h = 8
+            * def i = 9
+            * def j = 10
+            """);
+
+        SuiteResult result = Runner.builder()
+                .path(feature1.toString(), feature2.toString())
+                .workingDir(tempDir)
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                .backupOutputDir(false)
+                .parallel(2);
+
+        assertFalse(result.isPassed());
+        assertEquals(1, result.getScenarioFailedCount());
+    }
+
+    @Test
+    void testConfigErrorNotSwallowed() throws Exception {
+        // Verify that a genuine JS error in config is reported as a failure, not swallowed
+        Path configFile = tempDir.resolve("karate-config.js");
+        Files.writeString(configFile, """
+            function fn() {
+              var config = {};
+              config.value = nonExistentVariable.someMethod();
+              return config;
+            }
+            """);
+
+        Path featureFile = tempDir.resolve("test.feature");
+        Files.writeString(featureFile, """
+            Feature: Config Error Test
+            Scenario: Should fail due to config error
+            * match value == 'something'
+            """);
+
+        SuiteResult result = LogSilencer.silenced("karate.runtime", () ->
+                LogSilencer.silenced("karate.scenario", () ->
+                        runTestSuite(tempDir, featureFile.toString())));
+
+        // The scenario should fail (not pass silently with missing config vars)
+        assertFalse(result.isPassed(), "Config with JS errors should cause scenario failure");
+        assertEquals(1, result.getScenarioFailedCount());
+    }
+
+    // ========== variables from Background call not visible in Scenario ==========
+
+    @Test
+    void testBackgroundCallVar_plain() throws Exception {
+        // Baseline: define testData directly in Background (no call). Expected to pass.
+        Path feature = tempDir.resolve("testData-plain.feature");
+        Files.writeString(feature, """
+            Feature: testData test
+              Background:
+                * def testData = { foo: 1234, bar: 1234 }
+              Scenario: Dummy Test
+                * match testData.foo == testData.bar
+            """);
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+        assertTrue(result.isPassed(), "plain pattern should pass");
+    }
+
+    @Test
+    void testBackgroundCallVar_predefined() throws Exception {
+        // Pre-define testData = {} then call a reusable feature which redefines it.
+        Path reusable = tempDir.resolve("testData-direct.reusable.feature");
+        Files.writeString(reusable, """
+            @ignore
+            Feature: A simple reusable Karate feature
+              Scenario:
+                * def testData = { foo: 1234, bar: 1234 }
+            """);
+        Path feature = tempDir.resolve("testData-predefined.feature");
+        Files.writeString(feature, """
+            Feature: testData test
+              Background:
+                * def testData = {}
+                * call read('testData-direct.reusable.feature')
+              Scenario: Dummy Test
+                * match testData.foo == testData.bar
+            """);
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+        assertTrue(result.isPassed(), "predefined pattern should pass");
+    }
+
+    @Test
+    void testBackgroundCallVar_direct() throws Exception {
+        // Reusable feature uses `def` to create testData - caller does NOT pre-define it.
+        // V1 behavior: the call in Background merges variables into caller scope.
+        Path reusable = tempDir.resolve("testData-direct.reusable.feature");
+        Files.writeString(reusable, """
+            @ignore
+            Feature: A simple reusable Karate feature
+              Scenario:
+                * def testData = { foo: 1234, bar: 1234 }
+            """);
+        Path feature = tempDir.resolve("testData-direct.feature");
+        Files.writeString(feature, """
+            Feature: testData test
+              Background:
+                * call read('testData-direct.reusable.feature')
+              Scenario: Dummy Test
+                * match testData.foo == testData.bar
+            """);
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+        assertTrue(result.isPassed(), "direct-def-via-call pattern should pass");
+    }
+
+    @Test
+    void testBackgroundCallVar_karate() throws Exception {
+        // Reusable feature uses `karate.set()` to create testData - caller does NOT pre-define it.
+        // V1 behavior: the call in Background merges variables into caller scope.
+        Path reusable = tempDir.resolve("testData-karate.reusable.feature");
+        Files.writeString(reusable, """
+            @ignore
+            Feature: A simple reusable Karate feature
+              Scenario:
+                * karate.set('testData', { foo: 1234, bar: 1234 })
+            """);
+        Path feature = tempDir.resolve("testData-karate.feature");
+        Files.writeString(feature, """
+            Feature: testData test
+              Background:
+                * call read('testData-karate.reusable.feature')
+              Scenario: Dummy Test
+                * match testData.foo == testData.bar
+            """);
+        SuiteResult result = runTestSuite(tempDir, feature.toString());
+        assertTrue(result.isPassed(), "karate.set-via-call pattern should pass");
+    }
+
+    // Same as above, but running via scenario-name filter (simulates IDE "run single scenario").
+    // This is the path that actually fails when running a single scenario.
+
+    @Test
+    void testBackgroundCallVar_direct_singleScenario() throws Exception {
+        Path reusable = tempDir.resolve("testData-direct.reusable.feature");
+        Files.writeString(reusable, """
+            @ignore
+            Feature: A simple reusable Karate feature
+              Scenario:
+                * def testData = { foo: 1234, bar: 1234 }
+            """);
+        Path feature = tempDir.resolve("testData-direct.feature");
+        Files.writeString(feature, """
+            Feature: testData test
+              Background:
+                * call read('testData-direct.reusable.feature')
+              Scenario: Dummy Test
+                * match testData.foo == testData.bar
+            """);
+        SuiteResult result = Runner.builder()
+                .path(feature.toString())
+                .workingDir(tempDir)
+                .scenarioName("Dummy Test")
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                .backupOutputDir(false)
+                .parallel(1);
+        assertTrue(result.isPassed(), "direct-def-via-call should pass when running single scenario by name");
+    }
+
+    @Test
+    void testBackgroundCallVar_karate_singleScenario() throws Exception {
+        Path reusable = tempDir.resolve("testData-karate.reusable.feature");
+        Files.writeString(reusable, """
+            @ignore
+            Feature: A simple reusable Karate feature
+              Scenario:
+                * karate.set('testData', { foo: 1234, bar: 1234 })
+            """);
+        Path feature = tempDir.resolve("testData-karate.feature");
+        Files.writeString(feature, """
+            Feature: testData test
+              Background:
+                * call read('testData-karate.reusable.feature')
+              Scenario: Dummy Test
+                * match testData.foo == testData.bar
+            """);
+        SuiteResult result = Runner.builder()
+                .path(feature.toString())
+                .workingDir(tempDir)
+                .scenarioName("Dummy Test")
+                .outputConsoleSummary(false)
+                .outputHtmlReport(false)
+                .backupOutputDir(false)
+                .parallel(1);
+        assertTrue(result.isPassed(), "karate.set-via-call should pass when running single scenario by name");
+    }
+
+    // ========== functions from karate-config.js not available in called feature ==========
+
+    @Test
+    void testConfigFunctionsInCalledFeature_callonceInBackground() throws Exception {
+        // karate-config.js defines a variable AND a function
+        Path configFile = tempDir.resolve("karate-config.js");
+        Files.writeString(configFile, """
+            function fn() {
+              return {
+                foo: 'str',
+                bar: function () { return 'baz' }
+              };
+            }
+            """);
+
+        // Called feature uses both `foo` (string) and `bar()` (function) from global config
+        Path fooFeature = tempDir.resolve("foo.feature");
+        Files.writeString(fooFeature, """
+            @ignore
+            Feature: Foo
+              Scenario: Print global foo and return value of bar()
+                * match foo == 'str'
+                * def baz = bar()
+                * match baz == 'baz'
+            """);
+
+        // Caller uses callonce to invoke foo.feature
+        Path callerFeature = tempDir.resolve("bar_calls_foo.feature");
+        Files.writeString(callerFeature, """
+            Feature: Bar
+              Background:
+                * def fooFeature = callonce read('foo.feature')
+              Scenario: Fails but is expected to work
+                * match foo == 'str'
+                * def baz = bar()
+                * match baz == 'baz'
+                * match fooFeature.baz == 'baz'
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+        assertTrue(result.isPassed(), "callonce of feature should inherit functions from karate-config.js");
+    }
+
+    @Test
+    void testConfigFunctionsInCalledFeature_callInBackground() throws Exception {
+        // Same as above but using plain `call` instead of `callonce`
+        Path configFile = tempDir.resolve("karate-config.js");
+        Files.writeString(configFile, """
+            function fn() {
+              return {
+                foo: 'str',
+                bar: function () { return 'baz' }
+              };
+            }
+            """);
+
+        Path fooFeature = tempDir.resolve("foo.feature");
+        Files.writeString(fooFeature, """
+            @ignore
+            Feature: Foo
+              Scenario:
+                * match foo == 'str'
+                * def baz = bar()
+                * match baz == 'baz'
+            """);
+
+        Path callerFeature = tempDir.resolve("caller.feature");
+        Files.writeString(callerFeature, """
+            Feature: Caller
+              Background:
+                * def fooFeature = call read('foo.feature')
+              Scenario:
+                * match fooFeature.baz == 'baz'
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, callerFeature.toString());
+        assertTrue(result.isPassed(), "call of feature should inherit functions from karate-config.js");
+    }
+
+    @Test
+    void aConfigFailureInTheSetupRuntimeIsReportedAtItsCause() throws Exception {
+        // karate.setup() builds a second runtime, which re-evaluates config. If that evaluation fails
+        // its variables are empty, and without surfacing the cause the run dies much later with a
+        // "not defined" for whatever the setup was supposed to provide. Config here succeeds on the
+        // first evaluation (the main scenario's) and fails on the second (the setup runtime's).
+        io.karatelabs.core.parallel.CallOnceCounter.reset();
+        Path configFile = tempDir.resolve("karate-config.js");
+        Files.writeString(configFile, """
+            function fn() {
+              var Counter = Java.type('io.karatelabs.core.parallel.CallOnceCounter');
+              if (Counter.incrementAndGet() > 1) {
+                throw 'config is broken on re-evaluation';
+              }
+              return {};
+            }
+            """);
+
+        Path featureFile = tempDir.resolve("test.feature");
+        Files.writeString(featureFile, """
+            Feature: setup with a failing config re-eval
+
+              @setup
+              Scenario:
+                * def token = 'from-setup'
+
+              Scenario: uses setup
+                * def s = karate.setup()
+                * match s.token == 'from-setup'
+            """);
+
+        SuiteResult result = LogSilencer.silenced("karate.runtime",
+                () -> runTestSuite(tempDir, featureFile.toString()));
+
+        assertTrue(result.isFailed(), "a config failure in the setup runtime must not pass silently");
+        String message = result.getErrors().toString();
+        assertTrue(message.contains("Config evaluation failed"),
+                "the config error should be the reported cause, got: " + message);
+        assertFalse(message.contains("token is not defined"),
+                "the config error must not surface as a downstream symptom: " + message);
+    }
+
+    @Test
+    void testConfigEvaluatesPerScenarioThoughParsedOnce() throws Exception {
+        // The Suite parses each config source once and every scenario evaluates that same AST.
+        // Parsing is the part that is shared; EVALUATION must stay per-scenario, or config that
+        // reads karate.scenario / mints per-scenario state silently starts leaking one scenario's
+        // values into the next. The counter is the assertion: one increment per scenario.
+        io.karatelabs.core.parallel.CallOnceCounter.reset();
+        Path configFile = tempDir.resolve("karate-config.js");
+        Files.writeString(configFile, """
+            function fn() {
+              var Counter = Java.type('io.karatelabs.core.parallel.CallOnceCounter');
+              return { evalCount: Counter.incrementAndGet(), scenarioName: karate.scenario.name };
+            }
+            """);
+
+        Path featureFile = tempDir.resolve("test.feature");
+        Files.writeString(featureFile, """
+            Feature: config evaluates per scenario
+
+              Scenario: first
+                * match scenarioName == 'first'
+
+              Scenario: second
+                * match scenarioName == 'second'
+
+              Scenario: third
+                * match scenarioName == 'third'
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, featureFile.toString());
+
+        assertTrue(result.isPassed(), "config should evaluate freshly for each scenario");
+        assertEquals(3, io.karatelabs.core.parallel.CallOnceCounter.get(),
+                "config must be evaluated once per scenario, not once per suite");
+    }
+
+    @Test
+    void testSelfInvokingConfigShapeSurvivesAcrossScenarios() throws Exception {
+        // The declarations-plus-helper shape cannot be parenthesized, so it takes the fallback
+        // (direct) parse rather than the wrapped one. That choice is now made once for the Suite,
+        // so the second scenario is the one that would break if the cached decision were wrong.
+        Path configFile = tempDir.resolve("karate-config.js");
+        Files.writeString(configFile, """
+            function helper(x) { return 'helper-' + x; }
+            function fn() {
+              return { greeting: helper('hello') };
+            }
+            """);
+
+        Path featureFile = tempDir.resolve("test.feature");
+        Files.writeString(featureFile, """
+            Feature: fallback config shape
+
+              Scenario: first
+                * match greeting == 'helper-hello'
+
+              Scenario: second
+                * match greeting == 'helper-hello'
+            """);
+
+        SuiteResult result = runTestSuite(tempDir, featureFile.toString());
+
+        assertTrue(result.isPassed(), "a config needing the direct-parse fallback should work for every scenario");
+    }
+
+    /**
+     * A config that throws must fail the scenario, whichever shape the throw takes to get out of
+     * {@code fn()}. It did not: when the failing call sat in a {@code return} expression — a helper
+     * throwing, {@code fn} returning its result, the shape most real configs take — the throw was
+     * erased by the return itself and config simply contributed no variables. The suite then passed
+     * outright if nothing referenced a config variable, and otherwise died much later with a
+     * "not defined" naming the wrong thing entirely.
+     *
+     * <p>Every row here is a config that fails, and every row must be reported as a config failure.
+     * The two shapes at the end are the ones that already worked and are kept so a future change
+     * cannot fix one arm by breaking the other.</p>
+     */
+    @Test
+    void testEveryShapeOfFailingConfigIsReportedAsAConfigFailure() throws Exception {
+        String[][] shapes = {
+                {"a helper called from fn's return",
+                        "function boom() { throw 'exploded'; }\nfunction fn() { return boom(); }\n"},
+                {"an immediately invoked function in fn's return",
+                        "function fn() { return (function() { throw 'exploded'; })(); }\n"},
+                {"a throw in fn's own body, alongside a helper",
+                        "function helper() { return 1; }\nfunction fn() { throw 'exploded'; }\n"},
+                {"a throw in fn's own body",
+                        "function fn() { throw 'exploded'; }\n"},
+                {"the self-invoking shape",
+                        "function fn() { throw 'exploded'; }\nfn();\n"},
+        };
+        Path featureFile = tempDir.resolve("test.feature");
+        Files.writeString(featureFile, """
+            Feature: config failure
+              Scenario: one
+                * def ignored = 1
+            """);
+        for (String[] shape : shapes) {
+            Files.writeString(tempDir.resolve("karate-config.js"), shape[1]);
+            SuiteResult result = LogSilencer.silenced("karate.runtime",
+                    () -> LogSilencer.silenced("karate.scenario",
+                            () -> runTestSuite(tempDir, featureFile.toString())));
+            assertTrue(result.isFailed(), "a config failing via " + shape[0] + " must fail the suite");
+            String message = result.getErrors().toString();
+            assertTrue(message.contains("Config evaluation failed"),
+                    "the config failure should be named as one for " + shape[0] + ", got: " + message);
+            assertTrue(message.contains("exploded"),
+                    "the config's own cause should survive for " + shape[0] + ", got: " + message);
+        }
+    }
+
+    /**
+     * The Suite parses karate-config.js once and hands the same AST to every scenario, so under a
+     * parallel suite many threads are now evaluating one shared parse tree. Nothing enforces that
+     * a {@code Node} stays read-only — it is a property of today's interpreter, and this is the
+     * test that would notice it stopping being true.
+     *
+     * <p>The config is deliberately the awkward shape: a top-level function declaration, which
+     * cannot be parenthesized and so takes the direct-parse fallback, plus a closure minted per
+     * evaluation that captures it. The assertion is per-scenario identity — every scenario must
+     * see a label built from <em>its own</em> name — because the failure mode of a shared parse
+     * tree being mutated, or of an evaluation leaking across threads, is one scenario reading
+     * another's value rather than an exception.</p>
+     */
+    @Test
+    void testTheSharedConfigAstEvaluatesCorrectlyUnderParallelScenarios() throws Exception {
+        Path configFile = tempDir.resolve("karate-config.js");
+        Files.writeString(configFile, """
+            function tag(name) { return 'v-' + name; }
+            function fn() {
+              var Counter = Java.type('io.karatelabs.core.parallel.CallOnceCounter');
+              Counter.incrementAndGet();
+              var label = function(suffix) { return tag(karate.scenario.name) + '-' + suffix; };
+              return { label: label('ok') };
+            }
+            """);
+
+        int scenarios = 64;
+        StringBuilder feature = new StringBuilder("Feature: a shared config ast under parallel scenarios\n");
+        for (int i = 0; i < scenarios; i++) {
+            feature.append("\n  Scenario: s").append(i)
+                    .append("\n    * match label == 'v-s").append(i).append("-ok'\n");
+        }
+        Path featureFile = tempDir.resolve("test.feature");
+        Files.writeString(featureFile, feature.toString());
+
+        // Three passes, because a race that survives one run of 64 scenarios is not evidence of
+        // anything and the whole test costs well under a second.
+        for (int pass = 0; pass < 3; pass++) {
+            io.karatelabs.core.parallel.CallOnceCounter.reset();
+            SuiteResult result = testBuilder()
+                    .path(featureFile.toString())
+                    .workingDir(tempDir)
+                    .parallel(8);
+            assertTrue(result.isPassed(), "pass " + pass + " failed: " + result.getErrors());
+            assertEquals(scenarios, result.getScenarioPassedCount());
+            assertEquals(scenarios, io.karatelabs.core.parallel.CallOnceCounter.get(),
+                    "config must still be evaluated once per scenario when the parse is shared");
+        }
+    }
+
+    /**
+     * The other half of the same sharing: the error-location path. The Suite parses the config
+     * once as {@code (source)} into an in-memory resource, and every scenario's copy of a function
+     * that config contributed carries tokens pointing back at <em>that one object</em>. When such a
+     * function fails, the renderer asks it for the source line to print — and it splits its lines
+     * lazily, on first ask, from whichever thread got there first. So this drives many threads at
+     * one lazily populated array, which is the shape where a plain-published array is readable as
+     * non-null with its elements not yet visible. Every scenario must see the real line, never a
+     * blank one.
+     */
+    @Test
+    void testAnErrorInSharedConfigCodeRendersTheSameLocationOnEveryThread() throws Exception {
+        Path configFile = tempDir.resolve("karate-config.js");
+        Files.writeString(configFile, """
+            function fn() {
+              return {
+                explode: function(what) { return what.missing.deeper; }
+              };
+            }
+            """);
+
+        int scenarios = 32;
+        StringBuilder feature = new StringBuilder("Feature: an error raised in shared config code\n");
+        for (int i = 0; i < scenarios; i++) {
+            feature.append("\n  Scenario: s").append(i)
+                    .append("\n    * def ignored = explode('s").append(i).append("')\n");
+        }
+        Path featureFile = tempDir.resolve("test.feature");
+        Files.writeString(featureFile, feature.toString());
+
+        SuiteResult result = LogSilencer.silenced("karate.runtime",
+                () -> LogSilencer.silenced("karate.scenario", () -> testBuilder()
+                        .path(featureFile.toString())
+                        .workingDir(tempDir)
+                        .parallel(8)));
+
+        assertTrue(result.isFailed(), "code contributed by config that throws must fail its scenario");
+        assertEquals(scenarios, result.getScenarioFailedCount(),
+                "every scenario calls it, so every scenario must fail");
+        // The rendered "Code:" line is Resource.getLine on the shared config resource. Assert the
+        // real text, on every one of them: a stale read of the lazily split array would show up as
+        // a blank line here, and asserting only that the error exists would miss it.
+        String expected = "Code: explode: function(what) { return what.missing.deeper; }";
+        for (Object error : result.getErrors()) {
+            String message = error.toString();
+            assertTrue(message.contains("Line: 3, Col: 30"),
+                    "the location should point into the config, got: " + message);
+            assertTrue(message.contains(expected),
+                    "the source line should come back intact from the shared resource, got: " + message);
+        }
+    }
+
+}

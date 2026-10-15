@@ -1,0 +1,204 @@
+/*
+ * The MIT License
+ *
+ * Copyright 2024 Karate Labs Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package io.karatelabs.js;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+
+/**
+ * Singleton prototype for Function instances.
+ * Contains instance methods like call, apply, bind.
+ * Inherits from JsObjectPrototype.
+ */
+class JsFunctionPrototype extends Prototype {
+
+    static final JsFunctionPrototype INSTANCE = new JsFunctionPrototype();
+
+    private JsFunctionPrototype() {
+        super(JsObjectPrototype.INSTANCE);
+        install("call", 1, this::callMethod);
+        install("apply", 2, this::applyMethod);
+        install("bind", 1, this::bindMethod);
+        install("toString", 0, this::toStringMethod);
+        installConstructor("Function");
+    }
+
+    // Helper to get JsCallable from this context (accepts both JsFunction and JsCallable)
+    private static JsCallable asCallable(Context context) {
+        Object thisObj = context.getThisObject();
+        if (thisObj instanceof JsCallable callable) {
+            return callable;
+        }
+        return null;
+    }
+
+    private static class ThisArgs {
+        final Object thisObject;
+        final List<Object> args;
+
+        @SuppressWarnings("unchecked")
+        ThisArgs(Object[] args, boolean apply) {
+            List<Object> list = new ArrayList<>(Arrays.asList(args));
+            if (!list.isEmpty()) {
+                thisObject = list.removeFirst();
+            } else {
+                thisObject = Terms.UNDEFINED;
+            }
+            if (apply) {
+                if (list.isEmpty()) {
+                    this.args = list;
+                } else {
+                    Object first = list.getFirst();
+                    if (first instanceof List) {
+                        this.args = ((List<Object>) first);
+                    } else {
+                        this.args = new ArrayList<>();
+                    }
+                }
+            } else {
+                this.args = list;
+            }
+        }
+
+        // an apply() array list is the JsArray's own backing list, so a
+        // sparse array's holes must read as undefined here as they do for spread
+        Object[] argArray() {
+            Object[] out = args.toArray(new Object[0]);
+            for (int i = 0; i < out.length; i++) {
+                out[i] = JsArray.unwrapHole(out[i]);
+            }
+            return out;
+        }
+    }
+
+    private Object callMethod(Context context, Object[] args) {
+        JsCallable callable = asCallable(context);
+        if (callable == null) {
+            throw JsErrorException.typeError("Function.prototype.call called on non-callable");
+        }
+        ThisArgs thisArgs = new ThisArgs(args, false);
+        if (context instanceof CoreContext cc) {
+            cc.thisObject = bindForCall(callable, thisArgs.thisObject, cc);
+        }
+        return callable.call(context, forwardArgs(callable, thisArgs.argArray()));
+    }
+
+    // forwarding paths bypass Interpreter.invokeCallable, so the boundary
+    // marshalling has to happen here for a Java target; on a copy, since a
+    // bound function reached from Java is handed the host's own array
+    private static Object[] forwardArgs(JsCallable callable, Object[] args) {
+        if (!callable.isExternal()) {
+            return args;
+        }
+        Object[] copy = Arrays.copyOf(args, args.length, Object[].class);
+        Interpreter.marshalExternalArgs(copy);
+        return copy;
+    }
+
+    // Spec OrdinaryCallBindThis (§9.2.1.2): the null/undefined → globalThis
+    // substitution applies to sloppy-mode user-defined functions only.
+    // Built-in methods and strict-mode user fns see the raw thisArg —
+    // required for e.g. Object.prototype.toString.call(null) returning
+    // "[object Null]" and for RequireObjectCoercible-gated built-ins to throw
+    // TypeError on null/undefined receivers.
+    private static Object bindForCall(JsCallable callable, Object thisObject, CoreContext cc) {
+        if (callable instanceof JsBuiltinMethod) {
+            return thisObject;
+        }
+        boolean strict = callable instanceof JsFunctionNode jfn && jfn.strict;
+        return Interpreter.bindThisForCall(thisObject, cc, strict);
+    }
+
+    private Object applyMethod(Context context, Object[] args) {
+        JsCallable callable = asCallable(context);
+        if (callable == null) {
+            throw JsErrorException.typeError("Function.prototype.apply called on non-callable");
+        }
+        ThisArgs thisArgs = new ThisArgs(args, true);
+        if (context instanceof CoreContext cc) {
+            cc.thisObject = bindForCall(callable, thisArgs.thisObject, cc);
+        }
+        return callable.call(context, forwardArgs(callable, thisArgs.argArray()));
+    }
+
+    // Spec: Function.prototype.bind(thisArg, ...preBound) returns a new callable
+    // that, when invoked, calls the target with `this` set to thisArg and
+    // arguments = preBound concat actualArgs. Pre-bound args win in order.
+    // Per §20.2.3.2 the bound function's `length` is
+    // max(0, target.length - preBound.length).
+    private Object bindMethod(Context context, Object[] args) {
+        Object thisObj = context.getThisObject();
+        if (!(thisObj instanceof JsCallable target)) {
+            throw JsErrorException.typeError("Function.prototype.bind called on non-callable");
+        }
+        Object boundThis = args.length > 0 ? args[0] : Terms.UNDEFINED;
+        Object[] preBound = args.length > 1
+                ? Arrays.copyOfRange(args, 1, args.length)
+                : new Object[0];
+        JsFunction bound = new JsFunction() {
+            @Override
+            public Object call(Context ctx, Object[] callArgs) {
+                Object[] all;
+                if (preBound.length == 0) {
+                    all = callArgs;
+                } else {
+                    all = new Object[preBound.length + callArgs.length];
+                    System.arraycopy(preBound, 0, all, 0, preBound.length);
+                    System.arraycopy(callArgs, 0, all, preBound.length, callArgs.length);
+                }
+                if (ctx instanceof CoreContext cc) {
+                    cc.thisObject = boundThis;
+                }
+                return target.call(ctx, forwardArgs(target, all));
+            }
+        };
+        // Spec: bound function's name is "bound " + target.name
+        if (target instanceof JsFunction tf) {
+            bound.name = tf.name != null ? "bound " + tf.name : "bound";
+            bound.length = Math.max(0, tf.length - preBound.length);
+        } else {
+            bound.name = "bound";
+        }
+        return bound;
+    }
+
+    private Object toStringMethod(Context context, Object[] args) {
+        Object thisObj = context.getThisObject();
+        if (thisObj instanceof JsFunction fn) {
+            // getSource() is virtual: JsFunctionNode returns the user source,
+            // JsFunctionWrapper delegates to its inner JsFunction, built-ins
+            // return null. Routing through it (vs. an `instanceof JsFunctionNode`
+            // branch) keeps wrapped user functions stringifying as source.
+            String source = fn.getSource();
+            if (source != null) {
+                return source;
+            }
+            String fnName = fn.name != null ? fn.name : "";
+            return "function " + fnName + "() { [native code] }";
+        }
+        return "[object Function]";
+    }
+
+}

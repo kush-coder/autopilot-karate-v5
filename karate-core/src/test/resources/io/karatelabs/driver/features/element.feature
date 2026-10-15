@@ -1,0 +1,507 @@
+Feature: Element Tests
+  Element operations, inputs, clicks, selects, and waits
+
+  Background:
+    * configure driver = driverConfig
+    * driver serverUrl + '/input'
+
+  # ========== Basic Element State ==========
+
+  Scenario: Element exists check
+    * match exists('#username') == true
+    * match exists('#email') == true
+    * match exists('#nonexistent') == false
+
+  Scenario: Text content
+    * def text = text('h1')
+    * match text == 'Input Test Page'
+
+  Scenario: HTML content
+    * def html = html('h1')
+    * match html contains 'Input Test Page'
+    * match html contains '<h1'
+
+  Scenario: Get attribute
+    * def placeholder = attribute('#username', 'placeholder')
+    * match placeholder == 'Enter username'
+
+  Scenario: Get property
+    * def type = script("document.getElementById('email').type")
+    * match type == 'email'
+
+  Scenario: Script with arrow function
+    * waitFor('h1')
+    * def fn = () => document.title
+    * def title = script(fn)
+    * match title == 'Input Test'
+
+  Scenario: Script with arrow function returning expression
+    * def fn = () => document.querySelectorAll('input').length
+    * def count = script(fn)
+    * assert count >= 3
+
+  Scenario: Element enabled check
+    * match enabled('#username') == true
+    * match enabled('#submit-btn') == true
+
+  # ========== Input Operations ==========
+
+  Scenario: Input text
+    * input('#username', 'testuser')
+    * def value = value('#username')
+    * match value == 'testuser'
+
+  Scenario: Clear input
+    * input('#username', 'initial')
+    * clear('#username')
+    * def value = value('#username')
+    * match value == ''
+
+  Scenario: Input multiple fields
+    * input('#username', 'john_doe')
+    * input('#email', 'john@example.com')
+    * input('#password', 'secret123')
+    * match value('#username') == 'john_doe'
+    * match value('#email') == 'john@example.com'
+    * match value('#password') == 'secret123'
+
+  Scenario: Input time field
+    * input('#meeting-time', '14:30')
+    * match value('#meeting-time') == '14:30'
+
+  Scenario: Input date field
+    * input('#birthday', '2026-03-05')
+    * match value('#birthday') == '2026-03-05'
+
+  Scenario: Input textarea
+    * input('#bio', 'This is my biography.')
+    * def value = value('#bio')
+    * match value contains 'biography'
+
+  Scenario: Input triggers DOM events
+    # Clear event log
+    * script('window.inputEvents = []')
+    # Type into the field
+    * input('#username', 'test')
+    # Verify value is set
+    * match value('#username') == 'test'
+    # Verify input events were triggered (React/Vue compatibility)
+    * def events = script('window.inputEvents')
+    * assert events.length > 0
+    # Check that at least one input event was fired for the username field
+    * def inputEvents = events.filter(e => e.type == 'input' && e.target == 'username')
+    * assert inputEvents.length > 0
+
+  # ========== Click Operations ==========
+
+  Scenario: Click button
+    * input('#username', 'clicktest')
+    * click('#submit-btn')
+    * def output = text('#form-output')
+    * match output contains 'clicktest'
+
+  Scenario: Click clear button
+    * input('#username', 'tobecleared')
+    * click('#clear-btn')
+    * def output = text('#form-output')
+    * match output contains 'cleared'
+
+  # ========== Select Operations ==========
+
+  Scenario: Select by value
+    * select('#country', 'us')
+    * def selected = value('#country')
+    * match selected == 'us'
+
+  Scenario: Select by exact text
+    * select('#country', '{}United Kingdom')
+    * def selected = value('#country')
+    * match selected == 'uk'
+
+  Scenario: Select by text contains
+    * select('#country', '{^}Austr')
+    * def selected = value('#country')
+    * match selected == 'au'
+
+  Scenario: Select by index
+    # Index 0 is "Select a country", index 1 is "United States"
+    * select('#country', 1)
+    * def selected = value('#country')
+    * match selected == 'us'
+
+  Scenario: Select by text fallback (no prefix)
+    # When value doesn't match, should fall back to text match
+    * select('#country', 'United States')
+    * def selected = value('#country')
+    * match selected == 'us'
+
+  @cdp
+  Scenario: Select triggers change event with bubbles
+    # Register a listener to verify bubbling works
+    * script("window.selectChanged = false; document.addEventListener('change', function(e) { if(e.target.id === 'country') window.selectChanged = true; })")
+    * select('#country', 'uk')
+    * def changed = script("window.selectChanged")
+    * match changed == true
+
+  @cdp
+  Scenario: Select commits a field that validates on blur (enterprise lazy-commit, e.g. Guidewire)
+    # #state stays "required" until it commits, and it commits ONLY on blur — NOT on change. A select
+    # that fired just input+change would leave it stale; select() fires the full real-selection sequence
+    # (input, change, blur, focusout), so the field commits at select time. Regression for Locators
+    # .commitFieldEventsJs — without the blur pair this scenario fails ("required" never clears).
+    * match script("document.getElementById('state-status').textContent") == 'required'
+    * select('#state', 'Kentucky')
+    * match value('#state') == 'KY'
+    * match script("window.stateCommitted") == 'KY'
+    * match script("document.getElementById('state-status').textContent") == 'committed'
+    * match script("document.getElementById('state-committed').textContent") == 'KY'
+    # the blur + focusout events actually fired on the select (the commit triggers)
+    * def fired = script("window.inputEvents.filter(function(e){return e.target==='state'}).map(function(e){return e.type})")
+    * match fired contains 'change'
+    * match fired contains 'blur'
+    * match fired contains 'focusout'
+
+  # ========== Checkbox Operations ==========
+
+  Scenario: Checkbox click
+    # Initially unchecked
+    * def checked = script("document.getElementById('agree').checked")
+    * match checked == false
+    # Click to check
+    * click('#agree')
+    * def checked = script("document.getElementById('agree').checked")
+    * match checked == true
+    # Click to uncheck
+    * click('#agree')
+    * def checked = script("document.getElementById('agree').checked")
+    * match checked == false
+
+  # ========== Element Class ==========
+
+  Scenario: Locate element
+    * def element = locate('#username')
+    * match element.exists() == true
+    * match element.getLocator() == '#username'
+
+  Scenario: Locate non-existent element
+    * def element = locate('#nonexistent')
+    * match element.exists() == false
+
+  Scenario: Element chaining
+    * def element = locate('#username').clear().input('chained').focus()
+    * match element.value() == 'chained'
+
+  Scenario: Optional element
+    * def exists = optional('#username')
+    * match exists.isPresent() == true
+    * def notExists = optional('#nonexistent')
+    * match notExists.isPresent() == false
+
+  Scenario: Optional element present is a property not a method
+    * match optional('#username').present == true
+    * match optional('#nonexistent').present == false
+    * if (optional('#nonexistent').present) karate.fail('present must be false')
+
+  Scenario: Optional element actions are no-ops when it does not exist
+    * optional('#nonexistent').click()
+    * optional('#nonexistent').input('x')
+    * optional('#nonexistent').clear()
+    * match optional('#nonexistent').text() == null
+    * match optional('#username').isPresent() == true
+
+  Scenario: Optional element retry is a no-op when it does not exist
+    * optional('#nonexistent').retry().click()
+    * optional('#nonexistent').retry(2, 100).input('x')
+    * match optional('#username').isPresent() == true
+
+  # ========== LocateAll ==========
+
+  Scenario: Locate all elements
+    * def inputs = locateAll("input[type='text'], input[type='email'], input[type='password']")
+    * assert inputs.length >= 3
+
+  Scenario: Locate all options
+    * def options = locateAll('#country option')
+    * match options.length == 5
+
+  # ========== Element Object API ==========
+
+  Scenario: locate() scopes a child lookup and locateAll() enumerates children
+    * def child = locate('#test-form').locate('#username')
+    * match child.getLocator() == '#test-form #username'
+    * match child.exists() == true
+    * def options = locate('#country').locateAll('option')
+    * match options.length == 5
+
+  Scenario: script(), innerHtml(), attribute() and property() read through the element
+    * match locate('#username').script('_.tagName') == 'INPUT'
+    * match locate('#test-form').innerHtml() contains 'Enter username'
+    * match locate('#username').attribute('id') == 'username'
+    * match locate('#username').property('tagName') == 'INPUT'
+
+  Scenario: value() on the element is both setter and getter
+    * def el = locate('#username').value('set-directly')
+    * match el.value() == 'set-directly'
+
+  Scenario: select() on the element selects an option
+    * def el = locate('#country').select('ca')
+    * match el.value() == 'ca'
+
+  Scenario: focus(), scroll(), highlight() chain and position() returns coordinates
+    * def el = locate('#email').focus().scroll().highlight()
+    * match script('document.activeElement.id') == 'email'
+    * def pos = el.position()
+    * match pos.x == '#number'
+    * match pos.y == '#number'
+
+  # ========== Element Navigation (closest / matches) ==========
+
+  Scenario: closest finds the nearest matching ancestor
+    * def form = locate('#username').closest('form')
+    * match form.exists() == true
+    * match form.attribute('id') == 'test-form'
+
+  Scenario: closest matches the element itself when it matches
+    * def self = locate('#username').closest('input')
+    * match self.exists() == true
+    * match self.attribute('id') == 'username'
+
+  Scenario: closest returns no match when no ancestor matches
+    * def none = locate('#username').closest('.does-not-exist')
+    * match none.exists() == false
+
+  Scenario: closest supports attribute selectors
+    * def labelled = locate('#username').closest('[id=test-form]')
+    * match labelled.exists() == true
+    * match labelled.attribute('id') == 'test-form'
+
+  Scenario: closest chains with locateAll for sibling-style walks
+    # v2 replacement for the v1 pattern e.parent.children — find row, enumerate cells
+    * def inputs = locate('#username').closest('form').locateAll('input')
+    * assert inputs.length >= 3
+
+  Scenario: matches returns true when selector matches
+    * match locate('#username').matches('input[type=text]') == true
+    * match locate('#submit-btn').matches('button[type=submit]') == true
+
+  Scenario: matches returns false when selector does not match
+    * match locate('#username').matches('button') == false
+    * match locate('#username').matches('.does-not-exist') == false
+
+  Scenario: matches pairs with closest for conditional walks
+    * def form = locate('#username').closest('form')
+    * match form.matches('#test-form') == true
+
+  # ========== script() and scriptAll() behaviors ==========
+  # Regression: plain strings passed to script() must reach the browser
+  # unchanged — no implicit parenthesization that would break void method calls,
+  # statements, or the comma operator.
+
+  Scenario: Script all elements
+    * def values = scriptAll('#country option', '_.value')
+    * match values contains 'us'
+    * match values contains 'uk'
+    * match values contains 'ca'
+    * match values contains 'au'
+
+  Scenario: script() with void .click() on an element
+    # .click() returns undefined; must not be invoked as a function
+    * script("document.getElementById('submit-btn').click()")
+
+  Scenario: script() with void .focus()
+    * script("document.getElementById('username').focus()")
+    * match script("document.activeElement.id") == 'username'
+
+  Scenario: script() with void .scrollIntoView()
+    * script("document.getElementById('bio').scrollIntoView()")
+
+  Scenario: script() with void .dispatchEvent()
+    * script("document.getElementById('username').dispatchEvent(new Event('focus'))")
+
+  Scenario: script() with void sessionStorage.setItem()
+    * script("sessionStorage.setItem('scriptKey', 'scriptValue')")
+    * match script("sessionStorage.getItem('scriptKey')") == 'scriptValue'
+
+  Scenario: script() with semicolon-separated statements
+    * script("window.__stmt1 = 1; window.__stmt2 = 2")
+    * match script("window.__stmt1") == 1
+    * match script("window.__stmt2") == 2
+
+  Scenario: script() with var declaration
+    * script("var x = 42; window.__fromVar = x")
+    * match script("window.__fromVar") == 42
+
+  Scenario: script() with let declaration
+    * script("let x = 43; window.__fromLet = x")
+    * match script("window.__fromLet") == 43
+
+  Scenario: script() with const declaration
+    * script("const x = 44; window.__fromConst = x")
+    * match script("window.__fromConst") == 44
+
+  Scenario: script() with comma operator in parens returns last expression
+    # Must NOT be interpreted as multiple arguments to an outer call
+    * def result = script("(1, 2, 3)")
+    * match result == 3
+
+  Scenario: script() with a self-invoking arrow function
+    # already invoked — wrapping it again would call its result
+    * def actual = driver.script('(() => { return true; })()')
+    * match actual == true
+
+  Scenario: script() with a self-invoking arrow function returning an object
+    * def actual = driver.script('(() => { return {value: 42}; })()')
+    * match actual == { value: 42 }
+
+  Scenario: script() with a self-invoking function expression
+    * def actual = driver.script('(function(){ return true; })()')
+    * match actual == true
+
+  Scenario: script() returns value for value-producing expressions
+    * def result = script("document.title")
+    * match result == 'Input Test'
+
+  Scenario: script() returns null for void expressions (undefined)
+    # v1 behaviour: .click() returns undefined which surfaces as null in Karate
+    * def result = script("document.getElementById('submit-btn').click()")
+    * match result == null
+
+  # ========== Position ==========
+
+  Scenario: Get element position
+    * def pos = position('#username')
+    * match pos.x != null
+    * match pos.y != null
+    * match pos.width != null
+    * match pos.height != null
+    * assert pos.width > 0
+    * assert pos.height > 0
+
+  # ========== Wait Methods ==========
+
+  Scenario: Wait for element
+    * def element = waitFor('#username')
+    * match element.exists() == true
+
+  Scenario: Wait for text
+    * def element = waitForText('h1', 'Input Test')
+    * match element.exists() == true
+
+  Scenario: Wait for enabled
+    * def element = waitForEnabled('#submit-btn')
+    * match element.enabled() == true
+
+  Scenario: Wait until element condition
+    * input('#username', 'waited')
+    * def element = waitUntil('#username', "_.value === 'waited'")
+    * match element.value() == 'waited'
+
+  Scenario: Wait until expression
+    * script('window.testFlag = true')
+    * def result = waitUntil('window.testFlag === true')
+    * match result == true
+
+  Scenario: Wait for result count
+    * def elements = waitForResultCount('.form-group', 9)
+    * match elements.length == 9
+
+  # ========== Scroll and Highlight ==========
+
+  Scenario: Scroll to element
+    * scroll('#bio')
+
+  Scenario: Highlight element
+    * highlight('#username')
+
+  # ========== Focus ==========
+
+  Scenario: Focus element
+    * focus('#email')
+    * def activeId = script('document.activeElement.id')
+    * match activeId == 'email'
+
+  # ========== Highlight & HighlightAll ==========
+
+  Scenario: highlight() smoke (no exception, returns Element)
+    * def el = highlight('#username')
+    * match el.exists() == true
+
+  Scenario: highlight() honours custom millis duration
+    # 50ms = restore the original style almost immediately;
+    # we only assert the call is bound and chains correctly.
+    * def el = highlight('#username', 50)
+    * match el.exists() == true
+
+  Scenario: highlightAll() targets every match
+    # All <input> elements get the temporary highlight style
+    * highlightAll('input[type=text]')
+    # No assertion on persistent style — restoration is async, but the call
+    # must be bound at the JS root.
+
+  Scenario: highlightAll() with custom duration
+    * highlightAll('input', 50)
+
+  # ========== Property accessor (read JS property, not attribute) ==========
+
+  Scenario: property() reads a live JS property, not the attribute
+    * input('#username', 'live-value')
+    # value attribute stays empty in HTML, but property reflects current state
+    * match property('#username', 'value') == 'live-value'
+
+  Scenario: property() of a select element
+    # selectedIndex is a live property
+    * select('#country', 'us')
+    * def idx = property('#country', 'selectedIndex')
+    * assert idx >= 0
+
+  # ========== Input array form (mixed text + special keys) ==========
+
+  Scenario: input() accepts an array with literal text and Key.ENTER
+    * input('#username', ['hello', Key.ENTER])
+    * match value('#username') contains 'hello'
+
+  # ========== timeout() bare-keyword global ==========
+
+  Scenario: timeout() returns current value
+    * def t = timeout()
+    * assert t > 0
+
+  # ========== waitForAny() bare-keyword global ==========
+
+  Scenario: waitForAny matches whichever locator resolves first
+    * def el = waitForAny('#nonexistent', '#username')
+    * match el.exists() == true
+
+  Scenario: waitForAny accepts an array argument
+    * def el = waitForAny(['#nonexistent', '#email'])
+    * match el.exists() == true
+
+  # ========== XPath and Wildcard Locators ==========
+
+  Scenario: XPath locator
+    * def text = text('//h1')
+    * match text == 'Input Test Page'
+
+  Scenario: Wildcard locator exact match
+    * def text = text('{h1}Input Test Page')
+    * match text == 'Input Test Page'
+
+  Scenario: Wildcard locator contains
+    * def element = locate('{^button}Submit')
+    * match element.exists() == true
+
+  # ========== Full Form Submission ==========
+
+  Scenario: Complete form submission
+    * input('#username', 'johndoe')
+    * input('#email', 'john@example.com')
+    * input('#password', 'secret123')
+    * select('#country', 'us')
+    * input('#bio', 'Test biography')
+    * click('#agree')
+    * click('#submit-btn')
+    * def output = text('#form-output')
+    * match output contains 'johndoe'
+    * match output contains 'john@example.com'
+    * match output contains 'secret123'
+    * match output contains 'us'

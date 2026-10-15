@@ -1,0 +1,169 @@
+/*
+ * karate-image report ext styles — hand-authored, scoped under .k-image-ext so ext styles
+ * never collide with core's Tailwind utilities (the ext ships its own CSS, immune to core's
+ * Tailwind build — see EXT.md § Report assets). Single-stage lightbox: one image stage + a
+ * Tune drawer (view modes / re-diff options / ignore boxes).
+ */
+
+/* ---- thumbnail card ---- */
+.k-image-ext.ki-card {
+    display: inline-flex; flex-direction: column; gap: 6px;
+    border: 1px solid var(--ki-border, #cbd5e1); border-left-width: 4px; border-radius: 6px;
+    padding: 8px; background: var(--ki-surface, #f8fafc); max-width: 240px;
+}
+.k-image-ext.ki-pass { border-left-color: #16a34a; }
+.k-image-ext.ki-fail { border-left-color: #dc2626; }
+.k-image-ext.ki-established { border-left-color: #60a5fa; }
+[data-theme="dark"] .k-image-ext.ki-card { --ki-border: #334155; --ki-surface: rgba(30, 41, 59, .5); color: #e2e8f0; }
+
+.k-image-ext .ki-thumb { padding: 0; border: 0; background: transparent; cursor: zoom-in; line-height: 0; }
+.k-image-ext .ki-thumb img { max-width: 100%; max-height: 160px; height: auto; border-radius: 4px; transition: opacity .15s; }
+.k-image-ext .ki-thumb:hover img { opacity: .9; }
+.k-image-ext .ki-noimg { font-size: 12px; color: #94a3b8; }
+.k-image-ext .ki-meta { display: flex; flex-direction: column; gap: 2px; }
+.k-image-ext .ki-name { font-size: 12px; font-weight: 600; }
+.k-image-ext .ki-sub { font-size: 11px; color: #64748b; }
+[data-theme="dark"] .k-image-ext .ki-sub { color: #94a3b8; }
+.k-image-ext .ki-expand {
+    align-self: flex-start; margin-top: 4px; font: inherit; font-size: 11px; font-weight: 600;
+    padding: 3px 10px; border: 1px solid #cbd5e1; border-radius: 6px; background: #f1f5f9;
+    color: #0f172a; cursor: pointer;
+}
+.k-image-ext .ki-expand:hover { background: #e2e8f0; border-color: #94a3b8; }
+[data-theme="dark"] .k-image-ext .ki-expand { border-color: #334155; background: #1e293b; color: #e2e8f0; }
+[data-theme="dark"] .k-image-ext .ki-expand:hover { background: #334155; }
+.k-image-ext .ki-badge { align-self: flex-start; font-size: 11px; font-weight: 600; padding: 1px 8px; border-radius: 9999px; color: #fff; }
+.k-image-ext .ki-badge-pass { background: #16a34a; }
+.k-image-ext .ki-badge-fail { background: #dc2626; }
+.k-image-ext .ki-badge-established { background: #2563eb; }
+
+/* ---- lightbox dialog ---- */
+.k-image-ext.ki-dialog {
+    width: min(94vw, 1100px); max-width: 94vw; max-height: 92vh; border: 0; border-radius: 8px;
+    padding: 0; background: #fff; color: #0f172a; box-shadow: 0 20px 60px rgba(0, 0, 0, .35);
+    /* live-resizable: drag the corner to resize the dialog — the "Fit" image rescales with it
+       (the 100% toggle still controls 1:1). overflow:auto is what enables the resize handle. */
+    resize: both; overflow: auto; min-width: 360px; min-height: 260px;
+}
+[data-theme="dark"] .k-image-ext.ki-dialog { background: #0f172a; color: #e2e8f0; }
+.k-image-ext.ki-dialog::backdrop { background: rgba(0, 0, 0, .6); }
+
+.k-image-ext .ki-head {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 10px 14px;
+    border-bottom: 1px solid #e2e8f0; position: sticky; top: 0; background: inherit; z-index: 1;
+}
+[data-theme="dark"] .k-image-ext .ki-head { border-bottom-color: #334155; }
+/* the right-aligned control group: one container pushed right (survives wrapping) */
+.k-image-ext .ki-right { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; }
+/* a CSS `display` beats the [hidden] attribute, so restore it for our scoped elements
+   (e.g. the Opacity slider is display:inline-flex and would otherwise always show) */
+.k-image-ext [hidden] { display: none !important; }
+
+/* toolbar + drawer buttons */
+.k-image-ext .ki-toggle, .k-image-ext .ki-zoom, .k-image-ext .ki-act,
+.k-image-ext .ki-mini, .k-image-ext .ki-vbtn, .k-image-ext .ki-copy-btn, .k-image-ext .ki-sidebtn {
+    font: inherit; font-size: 12px; padding: 4px 10px; border: 1px solid #cbd5e1;
+    border-radius: 6px; background: #f1f5f9; color: #0f172a; cursor: pointer;
+}
+[data-theme="dark"] .k-image-ext .ki-toggle, [data-theme="dark"] .k-image-ext .ki-zoom,
+[data-theme="dark"] .k-image-ext .ki-act, [data-theme="dark"] .k-image-ext .ki-mini,
+[data-theme="dark"] .k-image-ext .ki-vbtn, [data-theme="dark"] .k-image-ext .ki-copy-btn,
+[data-theme="dark"] .k-image-ext .ki-sidebtn {
+    border-color: #334155; background: #1e293b; color: #e2e8f0;
+}
+.k-image-ext .ki-toggle.ki-on,
+.k-image-ext .ki-vbtn.ki-on,
+.k-image-ext .ki-sidebtn.ki-on,
+[data-theme="dark"] .k-image-ext .ki-toggle.ki-on,
+[data-theme="dark"] .k-image-ext .ki-vbtn.ki-on,
+[data-theme="dark"] .k-image-ext .ki-sidebtn.ki-on {
+    background: #2563eb; border-color: #2563eb; color: #fff; font-weight: 600;
+}
+.k-image-ext .ki-close { font-size: 22px; line-height: 1; border: 0; background: transparent; color: inherit; cursor: pointer; padding: 0 4px; }
+
+/* view toggles live in the header */
+.k-image-ext .ki-views { display: inline-flex; gap: 4px; flex-wrap: wrap; }
+
+/* Advanced = one class on the dialog reveals every .ki-adv element (edit bar, Show
+   options / Rebase). No per-element JS toggling. */
+.k-image-ext.ki-dialog:not(.ki-advanced) .ki-adv { display: none !important; }
+
+/* ---- edit bar (Advanced only) ---- */
+.k-image-ext .ki-bar {
+    position: relative;   /* anchors the .ki-copy command popover */
+    display: flex; flex-direction: column; align-items: flex-start; gap: 8px; padding: 8px 14px;
+    border-bottom: 1px solid #e2e8f0; font-size: 12px;
+}
+[data-theme="dark"] .k-image-ext .ki-bar { border-bottom-color: #334155; }
+.k-image-ext .ki-bar-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.k-image-ext .ki-bar select {
+    font: inherit; font-size: 12px; padding: 2px 6px; border: 1px solid #cbd5e1; border-radius: 4px; background: #fff; color: #0f172a;
+}
+[data-theme="dark"] .k-image-ext .ki-bar select { background: #1e293b; color: #e2e8f0; border-color: #475569; color-scheme: dark; }
+.k-image-ext .ki-swatch { width: 18px; height: 18px; border: 1px solid #94a3b8; border-radius: 3px; cursor: pointer; padding: 0; }
+.k-image-ext .ki-pink { background: #ff00ff; }
+.k-image-ext .ki-yellow { background: #ffff00; }
+.k-image-ext .ki-color { width: 24px; height: 22px; padding: 0; border: 1px solid #94a3b8; border-radius: 3px; background: none; cursor: pointer; vertical-align: middle; }
+.k-image-ext .ki-range { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; }
+.k-image-ext .ki-hint { font-size: 11px; color: #94a3b8; }
+.k-image-ext .ki-notice:not(:empty) {
+    flex-basis: 100%; font-size: 11px; line-height: 1.4; color: #92400e; background: #fffbeb;
+    border: 1px solid #fde68a; border-radius: 4px; padding: 6px 8px;
+}
+[data-theme="dark"] .k-image-ext .ki-notice:not(:empty) { color: #fcd34d; background: rgba(120, 53, 15, .3); border-color: #78350f; }
+
+/* ---- the stage: a primary slot + an optional baseline/latest aside (Side by side) ---- */
+.k-image-ext .ki-body { padding: 14px; overflow: auto; }
+.k-image-ext .ki-stage { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-start; }
+.k-image-ext .ki-primary {
+    position: relative; flex: 1 1 320px; min-width: 0; max-height: 72vh; overflow: auto;
+    border: 1px solid #e2e8f0; border-radius: 4px;
+    background: repeating-conic-gradient(#e2e8f0 0% 25%, #fff 0% 50%) 50% / 16px 16px;
+}
+[data-theme="dark"] .k-image-ext .ki-primary { border-color: #334155; }
+.k-image-ext .ki-aside { flex: 1 1 240px; display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-start; }
+.k-image-ext .ki-fig { margin: 0; text-align: center; flex: 1 1 200px; min-width: 0; }
+.k-image-ext .ki-fig figcaption { font-size: 12px; margin-top: 4px; color: #64748b; }
+
+.k-image-ext .ki-canvas { position: relative; display: inline-block; line-height: 0; }
+.k-image-ext .ki-canvas-wipe { cursor: ew-resize; touch-action: none; }
+.k-image-ext .ki-img { display: block; height: auto; max-width: 100%; -webkit-user-drag: none; user-select: none; }
+.k-image-ext .ki-stage-full .ki-primary .ki-img { max-width: none; }   /* 1:1 — primary scrolls */
+.k-image-ext .ki-layer-top { position: absolute; inset: 0; width: 100%; height: 100%; max-width: none; }
+.k-image-ext .ki-missing { font-size: 12px; color: #94a3b8; padding: 24px; border: 1px dashed #cbd5e1; border-radius: 4px; }
+
+.k-image-ext .ki-divider { position: absolute; top: 0; bottom: 0; width: 2px; left: 50%; background: #2563eb; pointer-events: none; transform: translateX(-1px); }
+.k-image-ext .ki-grip {
+    position: absolute; top: 50%; left: 50%; width: 22px; height: 22px; transform: translate(-50%, -50%);
+    background: #2563eb; border: 2px solid #fff; border-radius: 50%; box-shadow: 0 1px 4px rgba(0, 0, 0, .4);
+}
+.k-image-ext .ki-grip::before { content: '\2194'; position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 12px; line-height: 1; }
+
+/* ---- ignore boxes ---- */
+.k-image-ext .ki-boxlayer { position: absolute; inset: 0; pointer-events: auto; cursor: crosshair; }
+.k-image-ext .ki-box { position: absolute; pointer-events: auto; cursor: move; border: 2px solid #2563eb; background: rgba(37, 99, 235, .15); box-sizing: border-box; }
+.k-image-ext .ki-h { position: absolute; width: 10px; height: 10px; background: #2563eb; border: 1px solid #fff; box-sizing: border-box; }
+.k-image-ext .ki-h-nw { left: -5px; top: -5px; cursor: nwse-resize; }
+.k-image-ext .ki-h-ne { right: -5px; top: -5px; cursor: nesw-resize; }
+.k-image-ext .ki-h-sw { left: -5px; bottom: -5px; cursor: nesw-resize; }
+.k-image-ext .ki-h-se { right: -5px; bottom: -5px; cursor: nwse-resize; }
+.k-image-ext .ki-boxlist { list-style: none; margin: 0; padding: 0; display: inline-flex; flex-wrap: wrap; gap: 6px; }
+.k-image-ext .ki-boxitem { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; border: 1px solid #e2e8f0; border-radius: 4px; padding: 2px 6px; }
+[data-theme="dark"] .k-image-ext .ki-boxitem { border-color: #334155; }
+.k-image-ext .ki-boxitem button { font: inherit; font-size: 11px; border: 0; background: transparent; color: #dc2626; cursor: pointer; padding: 0; }
+
+/* ---- command popover (Show options / Rebase) ---- */
+/* a floating panel anchored to the edit bar, parked on the RIGHT (over where the side-by-side
+   aside sits) so it doesn't cover the diff. Draggable by its header, resizable from the corner,
+   and visible the instant a button is clicked regardless of image height. */
+.k-image-ext .ki-copy {
+    position: absolute; top: 100%; right: 14px; left: auto; z-index: 5; margin-top: -4px;
+    width: min(440px, 46%); min-width: 240px; max-height: 60vh; overflow: auto; resize: both; padding: 10px 14px;
+    background: #fff; border: 1px solid #cbd5e1; border-radius: 6px; box-shadow: 0 12px 32px rgba(0, 0, 0, .28);
+}
+[data-theme="dark"] .k-image-ext .ki-copy { background: #1e293b; border-color: #334155; }
+.k-image-ext .ki-copy-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; cursor: move; touch-action: none; user-select: none; }
+.k-image-ext .ki-copy-title { font-size: 12px; font-weight: 600; }
+.k-image-ext .ki-copy-btn.ki-copied { background: #16a34a; border-color: #16a34a; color: #fff; }
+.k-image-ext .ki-copy-x { margin-left: auto; border: 0; background: transparent; font-size: 18px; line-height: 1; cursor: pointer; color: inherit; }
+.k-image-ext .ki-copy-pre { margin: 0; padding: 8px; font-size: 12px; white-space: pre-wrap; word-break: break-all; background: #0f172a; color: #e2e8f0; border-radius: 4px; }

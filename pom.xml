@@ -1,0 +1,298 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>io.karatelabs</groupId>
+    <artifactId>karate-parent</artifactId>
+    <version>2.1.4.RC1</version>
+    <packaging>pom</packaging>
+
+    <name>${project.artifactId}</name>
+    <description>Test Automation Made Simple</description>
+    <url>https://github.com/karatelabs/karate</url>
+    <licenses>
+        <license>
+            <name>MIT License</name>
+            <url>https://www.opensource.org/licenses/mit-license.php</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+    <scm>
+        <url>https://github.com/karatelabs/karate</url>
+        <connection>scm:git:git://github.com/karatelabs/karate.git</connection>
+        <developerConnection>scm:git:git@github.com:karatelabs/karate.git</developerConnection>
+    </scm>
+    <developers>
+        <developer>
+            <name>Peter Thomas</name>
+            <id>ptrthomas</id>
+            <organization>Karate Labs Inc.</organization>
+            <organizationUrl>https://karatelabs.io</organizationUrl>
+        </developer>
+    </developers>
+    
+    <properties>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <java.compiler.version>24</java.compiler.version>
+        <java.release.version>21</java.release.version>
+        <maven.compiler.version>3.16.0</maven.compiler.version>
+        <netty.version>4.2.19.Final</netty.version>
+        <jackson.version>2.22.3</jackson.version>
+        <junit.version>6.1.3</junit.version>
+        <slf4j.version>2.0.20</slf4j.version>
+        <logback.version>1.6.5</logback.version>
+        <testcontainers.version>1.21.4</testcontainers.version>
+        <maven.javadoc.version>3.12.0</maven.javadoc.version>
+        <central.publishing.maven.plugin.version>0.11.0</central.publishing.maven.plugin.version>
+    </properties>
+    
+	<modules>
+        <module>karate-js</module>
+		<module>karate-core</module>
+		<module>karate-junit6</module>
+		<module>karate-gatling</module>
+		<module>karate-profiling</module>
+		<module>karate-image</module>
+		<module>karate-js-test262</module>
+	</modules>
+
+    <dependencyManagement>
+        <dependencies>
+            <!-- Pin every netty artifact (incl. transitive epoll / io_uring
+                 transports pulled by gatling-netty-util) to ${netty.version}.
+                 Without this, Gatling's older netty-transport-* slips in via
+                 transitive resolution and trips OWASP dep-check CVEs. -->
+            <dependency>
+                <groupId>io.netty</groupId>
+                <artifactId>netty-bom</artifactId>
+                <version>${netty.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <!-- Same story as netty, one module over: gatling drags in jackson, and the
+                 2.21.3 it resolves to carries the PolymorphicTypeValidator bypass pair
+                 (CVE-2026-54512 / -54513, both CVSS 8.1), fixed in 2.21.4. Nothing here
+                 declares jackson directly - karate-core has none of it - so pin the bom
+                 rather than a lone databind, keeping databind/core/annotations on one
+                 version. Drop this once gatling ships a jackson past the fix. -->
+            <dependency>
+                <groupId>com.fasterxml.jackson</groupId>
+                <artifactId>jackson-bom</artifactId>
+                <version>${jackson.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>${slf4j.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+            <version>${logback.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter-api</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter-params</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>${maven.compiler.version}</version>
+                <configuration>
+                    <encoding>UTF-8</encoding>
+                    <source>${java.compiler.version}</source>
+                    <target>${java.compiler.version}</target>
+                    <release>${java.release.version}</release>
+                    <compilerArgs>
+                        <arg>-Werror</arg>
+                        <arg>-Xlint:deprecation</arg>
+                    </compilerArgs>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.6.0</version>
+                <configuration>
+                    <systemPropertyVariables>
+                        <user.timezone>UTC</user.timezone>
+                    </systemPropertyVariables>
+                    <!-- Exclude testcontainers E2E tests by default (require Docker) -->
+                    <!-- Also exclude OAuth callback tests — synchronous port-release waits add ~45s locally -->
+                    <excludes>
+                        <exclude>**/e2e/**</exclude>
+                        <exclude>**/LocalCallbackServerTest.java</exclude>
+                        <exclude>**/AuthorizationCodeAuthHandlerTest.java</exclude>
+                    </excludes>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-resources-plugin</artifactId>
+                <version>3.5.0</version>
+                <configuration>
+                    <propertiesEncoding>UTF-8</propertiesEncoding>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-source-plugin</artifactId>
+                <version>3.4.0</version>
+                <executions>
+                    <execution>
+                        <id>attach-sources</id>
+                        <goals>
+                            <goal>jar-no-fork</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
+    <profiles>
+        <!-- OWASP dependency-check: activate with -Pdepcheck -->
+        <!-- Pass NVD API key via -DnvdApiKey=... for faster scans -->
+        <profile>
+            <id>depcheck</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.owasp</groupId>
+                        <artifactId>dependency-check-maven</artifactId>
+                        <version>13.0.0</version>
+                        <configuration>
+                            <dataDirectory>${user.home}/.dependency-check/data</dataDirectory>
+                            <!-- absolute: a relative path resolves against each module's basedir -->
+                            <suppressionFiles>
+                                <suppressionFile>${session.executionRootDirectory}/etc/cve-suppressions.xml</suppressionFile>
+                            </suppressionFiles>
+                            <skipProvidedScope>true</skipProvidedScope>
+                            <skipTestScope>true</skipTestScope>
+                            <nvdApiDelay>3000</nvdApiDelay>
+                            <ossindexAnalyzerEnabled>false</ossindexAnalyzerEnabled>
+                            <formats>
+                                <format>JSON</format>
+                            </formats>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        <!-- CI/CD profile - runs testcontainers E2E tests and Gatling tests -->
+        <profile>
+            <id>cicd</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <version>3.6.0</version>
+                        <configuration>
+                            <!-- Include e2e tests but exclude W3C (slow Selenium containers) -->
+                            <excludes combine.self="override">
+                                <exclude>**/e2e/W3c*</exclude>
+                            </excludes>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        <profile>
+            <!-- W3C WebDriver tests — run separately: mvn verify -Pw3c -->
+            <!-- Uses Selenium standalone containers, slow on ARM (Apple Silicon) -->
+            <!-- Intended for GitHub CI (x86) where containers run natively -->
+            <id>w3c</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <version>3.6.0</version>
+                        <configuration>
+                            <excludes combine.self="override"/>
+                            <includes>
+                                <include>**/e2e/W3c*</include>
+                            </includes>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        <profile>
+            <id>release</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-javadoc-plugin</artifactId>
+                        <version>${maven.javadoc.version}</version>
+                        <executions>
+                            <execution>
+                                <id>attach-javadocs</id>
+                                <goals>
+                                    <goal>jar</goal>
+                                </goals>
+                                <configuration>
+                                    <doclint>none</doclint>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-gpg-plugin</artifactId>
+                        <version>3.2.8</version>
+                        <executions>
+                            <execution>
+                                <id>sign-artifacts</id>
+                                <phase>verify</phase>
+                                <goals>
+                                    <goal>sign</goal>
+                                </goals>
+                                <configuration>
+                                    <gpgArguments>
+                                        <arg>--pinentry-mode</arg>
+                                        <arg>loopback</arg>
+                                    </gpgArguments>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.sonatype.central</groupId>
+                        <artifactId>central-publishing-maven-plugin</artifactId>
+                        <version>${central.publishing.maven.plugin.version}</version>
+                        <extensions>true</extensions>
+                        <configuration>
+                            <publishingServerId>central</publishingServerId>
+                            <autoPublish>true</autoPublish>
+                            <waitUntil>published</waitUntil>
+                            <waitMaxTime>7200</waitMaxTime>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
+
+</project>

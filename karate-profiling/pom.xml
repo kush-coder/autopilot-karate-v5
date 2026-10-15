@@ -1,0 +1,181 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.karatelabs</groupId>
+        <artifactId>karate-parent</artifactId>
+        <version>2.1.4.RC1</version>
+    </parent>
+
+    <artifactId>karate-profiling</artifactId>
+    <packaging>jar</packaging>
+    <name>${project.artifactId}</name>
+    <description>JFR-based profiling harness for karate-core</description>
+
+    <!--
+      This module is an internal profiling harness. It must NOT be published to
+      Maven Central when running the release workflow (see
+      .github/workflows/maven-release.yml). Same treatment as karate-js-test262.
+    -->
+    <properties>
+        <maven.deploy.skip>true</maven.deploy.skip>
+        <maven.install.skip>false</maven.install.skip>
+        <maven.javadoc.skip>true</maven.javadoc.skip>
+        <maven.source.skip>true</maven.source.skip>
+        <gpg.skip>true</gpg.skip>
+        <skipPublishing>true</skipPublishing>
+        <!-- Default main class for `mvn exec:java`. Property substitution here is
+             what makes a `-Dexec.mainClass=...` CLI override take effect — a bare
+             POM-literal would not. -->
+        <exec.mainClass>io.karatelabs.profiling.Profiler</exec.mainClass>
+    </properties>
+
+    <build>
+        <plugins>
+            <!-- Belt-and-braces: explicitly skip the source-attach execution
+                 inherited from the parent pom for this internal module. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-source-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>attach-sources</id>
+                        <phase>none</phase>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+                <version>3.6.4</version>
+                <configuration>
+                    <mainClass>${exec.mainClass}</mainClass>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+    <dependencies>
+        <dependency>
+            <groupId>io.karatelabs</groupId>
+            <artifactId>karate-core</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <!-- SLF4J binding. Workload logging is pinned to WARN via
+             src/main/resources/logback.xml — a profiling run that spends its time
+             formatting log lines is measuring the logger, not Karate. -->
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+            <version>${logback.version}</version>
+            <scope>runtime</scope>
+        </dependency>
+    </dependencies>
+
+    <profiles>
+        <!--
+          The Gatling-parity workloads. Kept behind a profile because Gatling and
+          its Scala runtime are ~40 MB of classpath that every other workload has
+          no use for, and because a profiling harness for karate-core should still
+          build when karate-gatling does not.
+
+          They live in their own source root rather than src/main/java: the module
+          must compile without this profile, and code that imports io.gatling
+          cannot. The registry finds them reflectively (see Workloads), so nothing
+          in the default build references them.
+
+          Simulations are launched programmatically from the forked child, so this
+          module needs neither scala-maven-plugin nor gatling-maven-plugin —
+          karate-gatling already provides the Scala bits.
+        -->
+        <profile>
+            <id>gatling</id>
+            <dependencies>
+                <dependency>
+                    <groupId>io.karatelabs</groupId>
+                    <artifactId>karate-gatling</artifactId>
+                    <version>${project.version}</version>
+                </dependency>
+            </dependencies>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>build-helper-maven-plugin</artifactId>
+                        <version>3.6.2</version>
+                        <executions>
+                            <execution>
+                                <id>add-gatling-sources</id>
+                                <phase>generate-sources</phase>
+                                <goals>
+                                    <goal>add-source</goal>
+                                </goals>
+                                <configuration>
+                                    <sources>
+                                        <source>src/gatling/java</source>
+                                    </sources>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        <!--
+          The R1 rhino-best arm (PROFILING.md §9). Behind a profile for the same reason as
+          Gatling: the default build must not carry a competitor engine on every child
+          classpath, and code that imports org.mozilla cannot compile without it. The
+          version is THE pin — RhinoBest verifies the runtime implementation version
+          against it at startup and refuses to run on a mediated substitute.
+        -->
+        <profile>
+            <id>rhino</id>
+            <dependencies>
+                <dependency>
+                    <groupId>org.mozilla</groupId>
+                    <artifactId>rhino</artifactId>
+                    <version>1.9.1</version>
+                </dependency>
+            </dependencies>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>build-helper-maven-plugin</artifactId>
+                        <version>3.6.2</version>
+                        <executions>
+                            <execution>
+                                <id>add-rhino-sources</id>
+                                <phase>generate-sources</phase>
+                                <goals>
+                                    <goal>add-source</goal>
+                                </goals>
+                                <configuration>
+                                    <sources>
+                                        <source>src/rhino/java</source>
+                                    </sources>
+                                </configuration>
+                            </execution>
+                            <execution>
+                                <id>add-rhino-test-sources</id>
+                                <phase>generate-test-sources</phase>
+                                <goals>
+                                    <goal>add-test-source</goal>
+                                </goals>
+                                <configuration>
+                                    <sources>
+                                        <source>src/rhino/test/java</source>
+                                    </sources>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
+
+</project>

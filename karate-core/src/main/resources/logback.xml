@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+
+    <!-- Suppress logback's internal status messages -->
+    <statusListener class="ch.qos.logback.core.status.NopStatusListener" />
+
+    <!-- Console appender that writes to stderr (not stdout) for CLI compatibility -->
+    <appender name="STDERR" class="ch.qos.logback.core.ConsoleAppender">
+        <target>System.err</target>
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- Parents only: the karate.* categories (runtime, http, scenario, mock, server, console)
+         inherit INFO, which for karate.http is the one-line request summary the docs describe
+         as the default. Pin a child yourself to change one category. -->
+    <logger name="karate" level="INFO"/>
+    <logger name="io.karatelabs" level="INFO"/>
+
+    <!-- Suppress noisy logs -->
+    <logger name="io.netty" level="WARN"/>
+    <logger name="ch.qos.logback" level="WARN"/>
+
+    <root level="WARN">
+        <appender-ref ref="STDERR" />
+    </root>
+
+</configuration>

@@ -1,0 +1,509 @@
+/*
+ * The MIT License
+ *
+ * Copyright 2025 Karate Labs Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package io.karatelabs.http;
+
+import io.netty.bootstrap.Bootstrap;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.*;
+import io.netty.channel.nio.NioIoHandler;
+import io.netty.channel.socket.nio.NioSocketChannel;
+import io.netty.handler.codec.http.DefaultHttpHeaders;
+import io.netty.handler.codec.http.HttpClientCodec;
+import io.netty.handler.codec.http.HttpHeaders;
+import io.netty.handler.codec.http.HttpObjectAggregator;
+import io.netty.handler.codec.http.websocketx.*;
+import io.netty.handler.codec.http.websocketx.extensions.compression.WebSocketClientCompressionHandler;
+import io.karatelabs.common.KarateLifecycle;
+import io.karatelabs.common.Stoppable;
+import io.karatelabs.common.ThreadUtils;
+import io.netty.handler.ssl.SslContext;
+import io.netty.handler.ssl.SslContextBuilder;
+import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.net.ssl.SSLException;
+import java.net.URI;
+import java.util.ArrayDeque;
+import java.util.List;
+import java.util.Map;
+import java.util.Queue;
+import java.util.concurrent.*;
+import java.util.function.Consumer;
+
+/**
+ * Protocol-agnostic WebSocket client built on Netty.
+ */
+public class WsClient implements Stoppable {
+
+    private static final Logger logger = LoggerFactory.getLogger(WsClient.class);
+
+    private static final ExecutorService CALLBACK_EXECUTOR =
+            Executors.newCachedThreadPool(ThreadUtils.daemonFactory("ws-callback-"));
+
+    /** Connected clients that have not cleaned up — the registry is the single source of truth,
+     *  see {@link KarateLifecycle} for the ecosystem-wide version of this. */
+    private static List<WsClient> active() {
+        return KarateLifecycle.running().stream()
+                .filter(WsClient.class::isInstance)
+                .map(WsClient.class::cast)
+                .toList();
+    }
+
+    public static void closeAll() {
+        List<WsClient> clients = active();
+        if (clients.isEmpty()) {
+            return;
+        }
+        logger.info("closing {} active websocket client(s)", clients.size());
+        for (WsClient client : clients) {
+            client.closeNow();
+        }
+    }
+
+    /**
+     * Shut down the callback pool shared by every client that did not supply its own.
+     * Deliberately <b>not</b> a {@link KarateLifecycle} registrant: the pool is process-wide and
+     * outlives any one client, so draining it from a generic shutdown would silently drop the
+     * callbacks of clients connected afterwards. Its threads are daemons, so leaving it running
+     * never holds up JVM exit — call this only when no further websocket use is expected.
+     */
+    public static void shutdownCallbackExecutor() {
+        CALLBACK_EXECUTOR.shutdown();
+    }
+
+    // Factory methods
+
+    public static WsClient connect(String uri) {
+        return connect(WsClientOptions.builder(uri).build());
+    }
+
+    public static WsClient connect(URI uri) {
+        return connect(WsClientOptions.builder(uri).build());
+    }
+
+    public static WsClient connect(WsClientOptions options) {
+        WsClient client = new WsClient(options);
+        client.doConnect();
+        return client;
+    }
+
+    // Instance fields
+
+    private final WsClientOptions options;
+    private final ExecutorService callbackExecutor;
+    /** This connection's callbacks, serialised — see {@link SerialExecutor}. */
+    private final Executor callbacks;
+    private final List<Consumer<WsFrame>> messageListeners = new CopyOnWriteArrayList<>();
+    private final List<Runnable> closeListeners = new CopyOnWriteArrayList<>();
+    private final List<Consumer<Throwable>> errorListeners = new CopyOnWriteArrayList<>();
+
+    private EventLoopGroup group;
+    private Channel channel;
+    private volatile boolean open;
+    private String negotiatedSubprotocol;
+    private ScheduledFuture<?> pingTask;
+
+    private WsClient(WsClientOptions options) {
+        this.options = options;
+        this.callbackExecutor = options.getCallbackExecutor() != null
+                ? options.getCallbackExecutor()
+                : CALLBACK_EXECUTOR;
+        // one queue per CONNECTION, so this socket's frames reach a listener in the order the wire
+        // delivered them — while still running off the event loop, so a slow listener never stalls I/O
+        this.callbacks = new SerialExecutor(this.callbackExecutor);
+        // options-registered listeners attach BEFORE the handshake so a server-speaks-first
+        // protocol (RFB/VNC) cannot race its opening frame past an empty listener list
+        if (options.getMessageListener() != null) {
+            messageListeners.add(options.getMessageListener());
+        }
+        if (options.getCloseListener() != null) {
+            closeListeners.add(options.getCloseListener());
+        }
+        if (options.getErrorListener() != null) {
+            errorListeners.add(options.getErrorListener());
+        }
+    }
+
+    private void doConnect() {
+        URI uri = options.getUri();
+        String scheme = uri.getScheme();
+        String host = options.getHost();
+        int port = options.getPort();
+
+        SslContext sslContext = null;
+        if (options.isSsl()) {
+            sslContext = options.getSslContext();
+            if (sslContext == null && options.isTrustAllCerts()) {
+                try {
+                    sslContext = SslContextBuilder.forClient()
+                            .trustManager(InsecureTrustManagerFactory.INSTANCE)
+                            .build();
+                } catch (SSLException e) {
+                    throw new WsException(WsException.Type.CONNECT_FAILED, "SSL context creation failed", e);
+                }
+            }
+        }
+
+        HttpHeaders headers = new DefaultHttpHeaders();
+        for (Map.Entry<String, String> entry : options.getHeaders().entrySet()) {
+            headers.add(entry.getKey(), entry.getValue());
+        }
+
+        WebSocketClientHandshaker handshaker = WebSocketClientHandshakerFactory.newHandshaker(
+                uri,
+                WebSocketVersion.V13,
+                options.getSubProtocol(),
+                options.isCompression(),
+                headers,
+                options.getMaxPayloadSize()
+        );
+
+        WsClientHandler handler = new WsClientHandler(this, handshaker);
+        SslContext finalSslContext = sslContext;
+
+        group = new MultiThreadIoEventLoopGroup(1, ThreadUtils.daemonFactory("ws-client-"), NioIoHandler.newFactory());
+
+        try {
+            Bootstrap bootstrap = new Bootstrap();
+            bootstrap.group(group)
+                    .channel(NioSocketChannel.class)
+                    .handler(new ChannelInitializer<>() {
+                        @Override
+                        protected void initChannel(Channel ch) {
+                            ChannelPipeline p = ch.pipeline();
+                            if (finalSslContext != null) {
+                                p.addLast(finalSslContext.newHandler(ch.alloc(), host, port));
+                            }
+                            p.addLast(new HttpClientCodec());
+                            p.addLast(new HttpObjectAggregator(options.getMaxPayloadSize()));
+                            if (options.isCompression()) {
+                                p.addLast(new WebSocketClientCompressionHandler(0));
+                            }
+                            p.addLast(handler);
+                        }
+                    });
+
+            channel = bootstrap.connect(host, port)
+                    .sync()
+                    .channel();
+
+            handler.getHandshakeFuture().await(options.getConnectTimeout().toMillis(), TimeUnit.MILLISECONDS);
+
+            if (!handler.getHandshakeFuture().isSuccess()) {
+                Throwable cause = handler.getHandshakeFuture().cause();
+                throw new WsException(WsException.Type.CONNECT_FAILED,
+                        "websocket handshake failed: " + (cause != null ? cause.getMessage() : "timeout"), cause);
+            }
+
+            open = true;
+            KarateLifecycle.register(this);
+            logger.debug("websocket connected: {}", uri);
+
+            // Start ping task if configured
+            if (options.getPingInterval() != null) {
+                long intervalMillis = options.getPingInterval().toMillis();
+                pingTask = channel.eventLoop().scheduleAtFixedRate(
+                        this::ping,
+                        intervalMillis,
+                        intervalMillis,
+                        TimeUnit.MILLISECONDS
+                );
+            }
+
+        } catch (WsException e) {
+            throw e;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new WsException(WsException.Type.CONNECT_FAILED, "connection interrupted", e);
+        } catch (Exception e) {
+            throw new WsException(WsException.Type.CONNECT_FAILED, "connection failed: " + e.getMessage(), e);
+        }
+    }
+
+    // Connection state
+
+    public boolean isOpen() {
+        return open && channel != null && channel.isActive();
+    }
+
+    public URI getUri() {
+        return options.getUri();
+    }
+
+    public String getNegotiatedSubprotocol() {
+        return negotiatedSubprotocol;
+    }
+
+    // Sending frames
+
+    public void send(String text) {
+        send(WsFrame.text(text));
+    }
+
+    public void send(byte[] binary) {
+        send(WsFrame.binary(binary));
+    }
+
+    public void send(WsFrame frame) {
+        if (!isOpen()) {
+            throw new WsException(WsException.Type.CONNECTION_CLOSED, "websocket is not open");
+        }
+        WebSocketFrame wsFrame = toNettyFrame(frame);
+        channel.writeAndFlush(wsFrame).addListener((ChannelFutureListener) future -> {
+            if (!future.isSuccess()) {
+                logger.error("send failed: {}", future.cause().getMessage());
+            }
+        });
+    }
+
+    public CompletableFuture<Void> sendAsync(WsFrame frame) {
+        if (!isOpen()) {
+            return CompletableFuture.failedFuture(
+                    new WsException(WsException.Type.CONNECTION_CLOSED, "websocket is not open"));
+        }
+        CompletableFuture<Void> future = new CompletableFuture<>();
+        WebSocketFrame wsFrame = toNettyFrame(frame);
+        channel.writeAndFlush(wsFrame).addListener((ChannelFutureListener) channelFuture -> {
+            if (channelFuture.isSuccess()) {
+                future.complete(null);
+            } else {
+                future.completeExceptionally(
+                        new WsException(WsException.Type.SEND_FAILED, "send failed", channelFuture.cause()));
+            }
+        });
+        return future;
+    }
+
+    private WebSocketFrame toNettyFrame(WsFrame frame) {
+        return switch (frame.getType()) {
+            case TEXT -> new TextWebSocketFrame(frame.getText());
+            case BINARY -> new BinaryWebSocketFrame(Unpooled.wrappedBuffer(frame.getBytes()));
+            case PING -> new PingWebSocketFrame();
+            case PONG -> new PongWebSocketFrame();
+            case CLOSE -> new CloseWebSocketFrame(frame.getCloseCode(), frame.getCloseReason());
+        };
+    }
+
+    // Listener registration
+
+    public void onMessage(Consumer<WsFrame> listener) {
+        messageListeners.add(listener);
+    }
+
+    public void onClose(Runnable listener) {
+        closeListeners.add(listener);
+    }
+
+    public void onError(Consumer<Throwable> listener) {
+        errorListeners.add(listener);
+    }
+
+    // Lifecycle
+
+    @Override
+    public String lifecycleName() {
+        return "ws-client:" + options.getUri();
+    }
+
+    @Override
+    public String lifecycleKind() {
+        return "ws-client";
+    }
+
+    /** The graceful stop is {@link #close()} — a close frame to the peer, then the event loop
+     *  wound down. Idempotent: a client already closed (or closed by the peer) does nothing. */
+    @Override
+    public void stop() {
+        close();
+    }
+
+    @Override
+    public void close() {
+        if (channel != null && channel.isOpen()) {
+            channel.writeAndFlush(new CloseWebSocketFrame())
+                    .addListener(ChannelFutureListener.CLOSE);
+        }
+        cleanup();
+    }
+
+    public void closeNow() {
+        if (channel != null) {
+            channel.close();
+        }
+        cleanup();
+    }
+
+    public void waitSync() {
+        if (channel != null) {
+            try {
+                channel.closeFuture().sync();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    private void cleanup() {
+        KarateLifecycle.unregister(this);
+        open = false;
+        if (pingTask != null) {
+            pingTask.cancel(false);
+            pingTask = null;
+        }
+        if (group != null) {
+            group.shutdownGracefully();
+        }
+    }
+
+    // Ping
+
+    public void ping() {
+        if (isOpen()) {
+            channel.writeAndFlush(new PingWebSocketFrame());
+        }
+    }
+
+    // Internal callbacks from handler
+
+    void handleFrame(WsFrame frame) {
+        for (Consumer<WsFrame> listener : messageListeners) {
+            dispatch(() -> {
+                try {
+                    listener.accept(frame);
+                } catch (Exception e) {
+                    logger.error("message listener error: {}", e.getMessage());
+                }
+            });
+        }
+    }
+
+    void handleDisconnect() {
+        open = false;
+        for (Runnable listener : closeListeners) {
+            dispatch(() -> {
+                try {
+                    listener.run();
+                } catch (Exception e) {
+                    logger.error("close listener error: {}", e.getMessage());
+                }
+            });
+        }
+        cleanup();
+    }
+
+    void handleError(Throwable cause) {
+        for (Consumer<Throwable> listener : errorListeners) {
+            dispatch(() -> {
+                try {
+                    listener.accept(cause);
+                } catch (Exception e) {
+                    logger.error("error listener error: {}", e.getMessage());
+                }
+            });
+        }
+    }
+
+    /**
+     * A caller-supplied callback executor is owned by the caller and may be shut
+     * down before Netty delivers the last frame / close callback — don't let the
+     * rejection propagate into the channel pipeline.
+     */
+    private void dispatch(Runnable task) {
+        try {
+            callbacks.execute(task);
+        } catch (RejectedExecutionException e) {
+            logger.debug("callback dropped, executor already shut down");
+        }
+    }
+
+    /**
+     * <b>One connection's callbacks, run one at a time and in submission order</b>, over a shared pool.
+     *
+     * <p>WebSocket delivers frames in order (RFC 6455 §1.5) and a listener is entitled to see them that way.
+     * Handing each frame straight to a cached thread pool discards that guarantee silently: two frames land
+     * on two pool threads and race, so a consumer collecting N messages can observe them shuffled, and a
+     * listener that mutates state per frame can interleave with itself. Both were live — a shuffled collect
+     * was written off as "interleaving under load", and an unsynchronised consumer lost messages outright.</p>
+     *
+     * <p>A dedicated thread per connection would also serialise, but costs a thread per socket. This queues
+     * instead and borrows a pool thread only while it has work, so callbacks stay <b>off the event loop</b>
+     * (a slow listener cannot stall Netty's I/O) without a per-connection thread. The trade is deliberate
+     * and is what ordering means: a listener that blocks holds up that connection's later frames — the same
+     * back-pressure a single-threaded consumer would have.</p>
+     */
+    private static final class SerialExecutor implements Executor {
+
+        private final Executor delegate;
+        private final Queue<Runnable> queue = new ArrayDeque<>();
+        private boolean draining;
+
+        private SerialExecutor(Executor delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public void execute(Runnable task) {
+            synchronized (this) {
+                queue.add(task);
+                if (draining) {
+                    return;         // the running drain will pick it up, in order
+                }
+                draining = true;
+            }
+            try {
+                drain();
+            } catch (RuntimeException e) {
+                // the pool is gone: stop claiming a drain is in flight, and let dispatch() log the drop
+                synchronized (this) {
+                    draining = false;
+                    queue.clear();
+                }
+                throw e;
+            }
+        }
+
+        private void drain() {
+            delegate.execute(() -> {
+                while (true) {
+                    Runnable next;
+                    synchronized (this) {
+                        next = queue.poll();
+                        if (next == null) {
+                            draining = false;
+                            return;
+                        }
+                    }
+                    try {
+                        next.run();
+                    } catch (Throwable t) {
+                        // one listener's failure must not strand the queue behind it
+                        logger.error("websocket callback error: {}", t.getMessage());
+                    }
+                }
+            });
+        }
+    }
+
+}
